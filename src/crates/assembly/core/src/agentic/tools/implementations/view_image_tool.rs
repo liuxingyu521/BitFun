@@ -407,9 +407,17 @@ impl Tool for ViewImageTool {
         }
         let mime_type = processed.mime_type.clone();
         let data_base64 = base64::engine::general_purpose::STANDARD.encode(&processed.data);
-        let summary = format!("Attached image: {}", path.display_path());
+        let display_path = path.display_path();
+        let summary = format!("Attached image: {}", display_path);
+        let label = std::path::Path::new(&display_path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("image");
+        let assistant_message = format!(
+            "Image attached for model vision.\n\nThe user cannot see this image yet. If they asked to view or show it, include in your final reply: ![{label}]({display_path})"
+        );
         let data = json!({
-            "path": path.display_path(),
+            "path": display_path,
             "mime_type": mime_type.clone(),
             "width": processed.width,
             "height": processed.height,
@@ -419,7 +427,7 @@ impl Tool for ViewImageTool {
 
         Ok(vec![ToolResult::ok_with_images(
             data,
-            Some("Image attached for model vision.".to_string()),
+            Some(assistant_message),
             vec![ToolImageAttachment {
                 mime_type,
                 data_base64,
@@ -583,6 +591,7 @@ mod tests {
         let ToolResult::Result {
             data,
             image_attachments,
+            result_for_assistant,
             ..
         } = &results[0]
         else {
@@ -593,6 +602,9 @@ mod tests {
         assert_eq!(attachments.len(), 1);
         assert_eq!(attachments[0].mime_type, "image/png");
         assert!(!attachments[0].data_base64.is_empty());
+        let assistant_message = result_for_assistant.as_deref().expect("assistant message");
+        assert!(assistant_message.contains("The user cannot see this image yet"));
+        assert!(assistant_message.contains("![pixel.png]"));
     }
 
     #[tokio::test]

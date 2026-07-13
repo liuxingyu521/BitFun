@@ -73,6 +73,8 @@ pub struct RuntimeContextNeeds {
     /// the prominent "Local BitFun client OS" block that belongs to desktop
     /// automation.
     pub control_hub: bool,
+    /// Tools that can create or reference workspace image files the user should see.
+    pub image_display: bool,
 }
 
 impl RuntimeContextNeeds {
@@ -88,6 +90,9 @@ impl RuntimeContextNeeds {
                 "Read" | "Write" | "Edit" | "Delete" | "LS" | "Grep" | "Glob" | "ExecCommand"
                 | "WriteStdin" | "ExecControl" => {
                     needs.workspace_tools = true;
+                    if tool_name == "Write" {
+                        needs.image_display = true;
+                    }
                     if tool_name == "ExecCommand" {
                         needs.exec_command = true;
                     }
@@ -97,9 +102,13 @@ impl RuntimeContextNeeds {
                 }
                 "ComputerUse" => {
                     needs.computer_use = true;
+                    needs.image_display = true;
                 }
                 "ControlHub" => {
                     needs.control_hub = true;
+                }
+                "view_image" | "analyze_image" => {
+                    needs.image_display = true;
                 }
                 _ => {}
             }
@@ -113,7 +122,17 @@ impl RuntimeContextNeeds {
             && !self.exec_control
             && !self.computer_use
             && !self.control_hub
+            && !self.image_display
     }
+}
+
+fn image_display_for_user_guidance() -> Vec<String> {
+    vec![
+        "- `view_image` attaches an image to your multimodal context only; the user does not see it until you include Markdown in your final reply.".to_string(),
+        "- When the user asks to generate, show, or view an image, or when displaying the image materially helps your answer, include it in your final reply using Markdown: `![short description](/absolute/path/to/image.png)`.".to_string(),
+        "- Use the absolute filesystem path from the tool result (for example `file_path` or `path`). The chat UI renders local image paths inline and supports lightbox zoom.".to_string(),
+        "- Skip the image when it is not relevant to the user's request; prefer text-only answers for incidental image files.".to_string(),
+    ]
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -224,6 +243,14 @@ pub fn render_runtime_context_reminder(facts: &RuntimeContextFacts) -> Option<St
                 control_hub_browser_text_only_guidance(),
             );
         }
+    }
+
+    if facts.needs.image_display {
+        push_runtime_context_section(
+            &mut lines,
+            "Image Display",
+            image_display_for_user_guidance(),
+        );
     }
 
     Some(lines.join("\n"))

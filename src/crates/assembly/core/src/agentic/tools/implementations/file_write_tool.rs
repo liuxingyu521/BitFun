@@ -165,7 +165,10 @@ impl FileWriteTool {
         mode: WriteLocalFileMode,
         outcome: WriteLocalFileOutcome,
     ) -> ToolResult {
-        let assistant_message = outcome.assistant_message;
+        let mut assistant_message = outcome.assistant_message.clone();
+        if let Some(hint) = Self::image_display_hint_for_path(logical_path) {
+            assistant_message.push_str(&hint);
+        }
         ToolResult::Result {
             data: json!({
                 "file_path": logical_path,
@@ -179,6 +182,34 @@ impl FileWriteTool {
             result_for_assistant: Some(assistant_message),
             image_attachments: None,
         }
+    }
+
+    fn is_image_file_path(file_path: &str) -> bool {
+        Path::new(file_path)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| {
+                matches!(
+                    ext.to_ascii_lowercase().as_str(),
+                    "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "avif" | "svg" | "ico"
+                )
+            })
+            .unwrap_or(false)
+    }
+
+    fn image_display_hint_for_path(file_path: &str) -> Option<String> {
+        if !Self::is_image_file_path(file_path) {
+            return None;
+        }
+
+        let label = Path::new(file_path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("image");
+
+        Some(format!(
+            "\n\nIf the user should see this image, include in your reply: ![{label}]({file_path})"
+        ))
     }
 
     fn input_schema() -> Value {
@@ -232,6 +263,9 @@ mod tests {
     use crate::agentic::tools::framework::{Tool, ToolResult, ToolUseContext};
     use crate::agentic::tools::ToolRuntimeRestrictions;
     use crate::agentic::WorkspaceBinding;
+    use tool_runtime::fs::{
+        write_same_content_outcome, WriteLocalFileMode,
+    };
     use serde_json::json;
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -425,6 +459,29 @@ mod tests {
             validation.message.as_deref(),
             Some("mode must be either 'w' (overwrite) or 'a' (append), got 'x'")
         );
+    }
+
+    #[test]
+    fn image_display_hint_appends_markdown_for_image_writes() {
+        let outcome = write_same_content_outcome("/workspace/output.png");
+        let result = FileWriteTool::write_success_result("/workspace/output.png", WriteLocalFileMode::Write, outcome);
+
+        let ToolResult::Result {
+            result_for_assistant,
+            ..
+        } = result
+        else {
+            panic!("expected result");
+        };
+
+        let message = result_for_assistant.expect("assistant message");
+        assert!(message.contains("![output.png](/workspace/output.png)"));
+    }
+
+    #[test]
+    fn image_display_hint_skips_non_image_paths() {
+        assert!(FileWriteTool::image_display_hint_for_path("notes.md").is_none());
+        assert!(FileWriteTool::image_display_hint_for_path("photo.PNG").is_some());
     }
 }
 

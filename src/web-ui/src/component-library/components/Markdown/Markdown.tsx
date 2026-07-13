@@ -4,6 +4,8 @@
  */
 
 import React, { useState, useMemo, useCallback, useEffect, useLayoutEffect, Component, type ReactNode } from 'react';
+import { createPortal } from 'react-dom';
+import { X } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeRaw from 'rehype-raw';
@@ -27,6 +29,11 @@ import {
   startupTrace,
 } from '@/shared/utils/startupTrace';
 import path from 'path-browserify';
+import type { PluggableList } from 'unified';
+import { normalizePath as normalizeFilesystemPath } from '@/shared/utils/pathUtils';
+import {
+  rehypeLocalImages,
+} from '@/tools/editor/meditor/utils/rehype-local-images';
 import './Markdown.scss';
 
 const log = createLogger('Markdown');
@@ -241,7 +248,21 @@ const sanitizeSchema = {
     code: [...(defaultSchema.attributes?.code || []), 'className'],
     div: [...(defaultSchema.attributes?.div || []), 'align'],
     details: [...(defaultSchema.attributes?.details || []), 'open'],
-    img: [...(defaultSchema.attributes?.img || []), 'src', 'alt', 'title', 'width', 'height', 'align'],
+    img: [
+      ...(defaultSchema.attributes?.img || []),
+      'src',
+      'alt',
+      'title',
+      'width',
+      'height',
+      'align',
+      'dataLocalImage',
+      'dataLocalPath',
+      'dataOriginalSrc',
+      'data-local-image',
+      'data-local-path',
+      'data-original-src',
+    ],
     input: [...(defaultSchema.attributes?.input || []), 'type', 'checked', 'disabled'],
     p: [...(defaultSchema.attributes?.p || []), 'align'],
     pre: [...(defaultSchema.attributes?.pre || []), 'className'],
@@ -418,7 +439,19 @@ function isLocalAssetPath(src: string): boolean {
     return false;
   }
 
-  return !/^(https?:|data:|asset:|tauri:)/i.test(src);
+  if (/^https?:\/\//i.test(src) && !/^https?:\/\/asset\.localhost\//i.test(src)) {
+    return false;
+  }
+
+  return !/^(data:|asset:|tauri:)/i.test(src);
+}
+
+function normalizeLocalImageReference(src: string): string {
+  if (!src) {
+    return src;
+  }
+
+  return normalizeFilesystemPath(src);
 }
 
 function normalizeExternalImageSrc(src: string): string {
@@ -479,49 +512,85 @@ async function getLocalImageDataUrl(localPath: string): Promise<string> {
 
 interface MarkdownImageProps extends React.ImgHTMLAttributes<HTMLImageElement> {
   basePath?: string;
+  dataLocalPath?: string;
+  dataOriginalSrc?: string;
 }
 
-const MarkdownImage: React.FC<MarkdownImageProps> = ({ src, alt, className, basePath, ...imgProps }) => {
+function resolveMarkdownImageLocalPath(
+  basePath: string | undefined,
+  dataLocalPath: string | undefined,
+  dataOriginalSrc: string | undefined,
+  rawSrc: string,
+): string | null {
+  if (dataLocalPath) {
+    return normalizeLocalImageReference(dataLocalPath);
+  }
+
+  const candidateSrc = normalizeLocalImageReference(dataOriginalSrc || rawSrc);
+  if (!candidateSrc || !isLocalAssetPath(candidateSrc)) {
+    return null;
+  }
+
+  return resolveBaseRelativePath(candidateSrc, basePath);
+}
+
+const MarkdownImage = React.memo<MarkdownImageProps>(({
+  src,
+  alt,
+  className,
+  basePath,
+  dataLocalPath,
+  dataOriginalSrc,
+  ...imgProps
+}) => {
+  const dataAttributes = imgProps as Record<string, unknown>;
+  const resolvedDataLocalPath = typeof dataLocalPath === 'string' && dataLocalPath
+    ? dataLocalPath
+    : (typeof dataAttributes['data-local-path'] === 'string'
+      ? dataAttributes['data-local-path'] as string
+      : undefined);
+  const resolvedDataOriginalSrc = typeof dataOriginalSrc === 'string' && dataOriginalSrc
+    ? dataOriginalSrc
+    : (typeof dataAttributes['data-original-src'] === 'string'
+      ? dataAttributes['data-original-src'] as string
+      : undefined);
   const rawSrc = typeof src === 'string' ? normalizeExternalImageSrc(src) : '';
-  const localPath = useMemo(() => {
-    if (!rawSrc || !isLocalAssetPath(rawSrc)) {
-      return null;
-    }
-
-    return resolveBaseRelativePath(rawSrc, basePath);
-  }, [basePath, rawSrc]);
-  const [resolvedSrc, setResolvedSrc] = useState(() => {
-    if (!localPath) {
-      return rawSrc;
-    }
-
-    return localImageDataUrlCache.get(localPath) || LOCAL_IMAGE_PLACEHOLDER;
-  });
+  const localPath = resolveMarkdownImageLocalPath(
+    basePath,
+    resolvedDataLocalPath,
+    resolvedDataOriginalSrc,
+    rawSrc,
+  );
+  const cachedDataUrl = localPath ? localImageDataUrlCache.get(localPath) : undefined;
+  const [asyncDataUrl, setAsyncDataUrl] = useState<string | null>(null);
   const [loadState, setLoadState] = useState<'idle' | 'loading' | 'loaded' | 'error'>(() => {
     if (!localPath) {
       return 'loaded';
     }
-
-    return localImageDataUrlCache.has(localPath) ? 'loaded' : 'idle';
+    if (localImageDataUrlCache.has(localPath)) {
+      return 'loaded';
+    }
+    if (localImageRequestCache.has(localPath)) {
+      return 'loading';
+    }
+    return 'idle';
   });
+  const [lightboxOpen, setLightboxOpen] = useState(false);
 
   useEffect(() => {
     if (!localPath) {
-      setResolvedSrc(rawSrc);
-      setLoadState('loaded');
       return;
     }
 
-    const cachedDataUrl = localImageDataUrlCache.get(localPath);
-    if (cachedDataUrl) {
-      setResolvedSrc(cachedDataUrl);
-      setLoadState('loaded');
+    const cached = localImageDataUrlCache.get(localPath);
+    if (cached) {
+      setAsyncDataUrl((current) => (current === cached ? current : cached));
+      setLoadState((current) => (current === 'loaded' ? current : 'loaded'));
       return;
     }
 
     let cancelled = false;
-    setResolvedSrc(LOCAL_IMAGE_PLACEHOLDER);
-    setLoadState('loading');
+    setLoadState((current) => (current === 'loading' ? current : 'loading'));
 
     void getLocalImageDataUrl(localPath)
       .then((dataUrl) => {
@@ -529,7 +598,7 @@ const MarkdownImage: React.FC<MarkdownImageProps> = ({ src, alt, className, base
           return;
         }
 
-        setResolvedSrc(dataUrl);
+        setAsyncDataUrl(dataUrl);
         setLoadState('loaded');
       })
       .catch((error) => {
@@ -538,29 +607,88 @@ const MarkdownImage: React.FC<MarkdownImageProps> = ({ src, alt, className, base
         }
 
         log.error('Failed to load local markdown image', { path: localPath, error });
-        setResolvedSrc(rawSrc);
+        setAsyncDataUrl(null);
         setLoadState('error');
       });
 
     return () => {
       cancelled = true;
     };
-  }, [localPath, rawSrc]);
+  }, [localPath]);
+
+  const resolvedSrc = useMemo(() => {
+    if (localPath) {
+      return cachedDataUrl ?? asyncDataUrl ?? LOCAL_IMAGE_PLACEHOLDER;
+    }
+
+    const fallbackSrc = normalizeLocalImageReference(resolvedDataOriginalSrc || rawSrc);
+    if (fallbackSrc && isLocalAssetPath(fallbackSrc)) {
+      return LOCAL_IMAGE_PLACEHOLDER;
+    }
+
+    return rawSrc;
+  }, [asyncDataUrl, cachedDataUrl, localPath, rawSrc, resolvedDataOriginalSrc]);
+
+  const imageClassName = [
+    className,
+    loadState === 'loading' ? 'markdown-image markdown-image--loading' : 'markdown-image',
+    loadState === 'error' ? 'markdown-image--error' : '',
+    loadState === 'loaded' ? 'markdown-image--interactive' : '',
+  ].filter(Boolean).join(' ');
+
+  const imageAlt = alt || 'Image';
+  const canOpenLightbox = loadState === 'loaded'
+    && Boolean(resolvedSrc)
+    && resolvedSrc !== LOCAL_IMAGE_PLACEHOLDER;
 
   return (
-    <img
-      {...imgProps}
-      alt={alt}
-      className={[
-        className,
-        loadState === 'loading' ? 'markdown-image markdown-image--loading' : '',
-        loadState === 'error' ? 'markdown-image markdown-image--error' : '',
-      ].filter(Boolean).join(' ')}
-      loading="lazy"
-      src={resolvedSrc}
-    />
+    <>
+      <img
+        {...imgProps}
+        alt={imageAlt}
+        className={imageClassName}
+        decoding="async"
+        loading={cachedDataUrl || asyncDataUrl ? 'eager' : 'lazy'}
+        src={resolvedSrc}
+        onClick={canOpenLightbox ? (event) => {
+          event.stopPropagation();
+          setLightboxOpen(true);
+        } : imgProps.onClick}
+        role={canOpenLightbox ? 'button' : undefined}
+        tabIndex={canOpenLightbox ? 0 : undefined}
+        onKeyDown={canOpenLightbox ? (event) => {
+          if (event.key === 'Enter' || event.key === ' ') {
+            event.preventDefault();
+            setLightboxOpen(true);
+          }
+        } : imgProps.onKeyDown}
+      />
+      {lightboxOpen && canOpenLightbox && createPortal(
+        <div
+          className="markdown-image-lightbox"
+          onClick={() => setLightboxOpen(false)}
+        >
+          <button
+            type="button"
+            className="markdown-image-lightbox__close"
+            onClick={() => setLightboxOpen(false)}
+            aria-label="Close"
+          >
+            <X size={20} />
+          </button>
+          <img
+            src={resolvedSrc}
+            alt={imageAlt}
+            onClick={(event) => event.stopPropagation()}
+          />
+        </div>,
+        document.body,
+      )}
+    </>
   );
-};
+});
+
+MarkdownImage.displayName = 'MarkdownImage';
 
 function isEditorOpenableFilePath(filePath: string): boolean {
   const normalizedPath = filePath.trim().replace(/[?#].*$/, '');
@@ -753,6 +881,30 @@ export interface MarkdownProps {
   traceContext?: MarkdownTraceContext;
 }
 
+function markdownTraceContextEqual(
+  prev?: MarkdownTraceContext,
+  next?: MarkdownTraceContext,
+): boolean {
+  if (prev === next) {
+    return true;
+  }
+  if (!prev || !next) {
+    return !prev && !next;
+  }
+  return prev.turnId === next.turnId
+    && prev.roundId === next.roundId
+    && prev.itemId === next.itemId;
+}
+
+function markdownPropsAreEqual(prev: MarkdownProps, next: MarkdownProps): boolean {
+  return prev.content === next.content
+    && prev.basePath === next.basePath
+    && prev.className === next.className
+    && prev.isStreaming === next.isStreaming
+    && prev.expandDetailsByDefault === next.expandDetailsByDefault
+    && markdownTraceContextEqual(prev.traceContext, next.traceContext);
+}
+
 export const Markdown = React.memo<MarkdownProps>(({ 
   content, 
   basePath,
@@ -840,6 +992,15 @@ export const Markdown = React.memo<MarkdownProps>(({
   const shouldUseMathRenderer = useMemo(
     () => mayContainMarkdownMath(markdownContent),
     [markdownContent],
+  );
+  const markdownImageBasePath = basePath || currentWorkspacePath;
+  const markdownRehypePlugins = useMemo<PluggableList>(
+    () => [
+      rehypeRaw,
+      [rehypeLocalImages, { basePath: markdownImageBasePath }],
+      [rehypeSanitize, sanitizeSchema],
+    ],
+    [markdownImageBasePath],
   );
 
   // Parse line ranges like #L42 / 1-20
@@ -1319,7 +1480,7 @@ export const Markdown = React.memo<MarkdownProps>(({
     },
 
     img({ node: _node, ...props }: any) {
-      return <MarkdownImage {...props} basePath={basePath || currentWorkspacePath} />;
+      return <MarkdownImage {...props} basePath={markdownImageBasePath} />;
     },
     
     blockquote({ children }: any) {
@@ -1364,6 +1525,7 @@ export const Markdown = React.memo<MarkdownProps>(({
     syntaxTheme,
     isLight,
     currentWorkspacePath,
+    markdownImageBasePath,
     traceContext,
   ]);
   
@@ -1371,7 +1533,7 @@ export const Markdown = React.memo<MarkdownProps>(({
   const basicMarkdownRenderer = (
     <ReactMarkdown
       remarkPlugins={[remarkGfm, remarkAutolinkComputerFileLinks]}
-      rehypePlugins={[rehypeRaw, [rehypeSanitize, sanitizeSchema]]}
+      rehypePlugins={markdownRehypePlugins}
       components={components}
     >
       {markdownContent}
@@ -1396,7 +1558,7 @@ export const Markdown = React.memo<MarkdownProps>(({
             <MarkdownMathRenderer
               markdownContent={markdownContent}
               components={components}
-              sanitizeSchema={sanitizeSchema}
+              rehypePlugins={markdownRehypePlugins}
               remarkAutolinkComputerFileLinks={remarkAutolinkComputerFileLinks}
             />
           </React.Suspense>
@@ -1411,4 +1573,4 @@ export const Markdown = React.memo<MarkdownProps>(({
       )}
     </div>
   );
-});
+}, markdownPropsAreEqual);

@@ -23,6 +23,22 @@
 
     font-size: var(--flowchat-font-size-base);
     line-height: var(--flowchat-text-line-height);
+
+    /* Inline assistant/user images: compact preview; lightbox keeps full size. */
+    --markdown-inline-image-max-width: min(360px, 100%);
+    --markdown-inline-image-max-height: 280px;
+  }
+
+  .markdown-renderer .markdown-image {
+    display: block;
+    margin: 0.5rem 0;
+    border: 1px solid var(--border-base);
+    background: var(--element-bg-soft);
+  }
+
+  .markdown-renderer .markdown-image--loading {
+    width: min(360px, 100%);
+    min-height: 120px;
   }
 
   /* Keep all rendered link variants (anchors and button-like local links) visibly link-blue. */

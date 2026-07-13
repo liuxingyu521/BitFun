@@ -252,3 +252,23 @@ fn workspace_and_user_context_renderers_preserve_section_shape() {
     assert!(user_context.contains("## Workspace Context"));
     assert!(user_context.contains("## Workspace Layout"));
 }
+
+#[test]
+fn runtime_context_includes_image_display_guidance_for_image_tools() {
+    let needs = RuntimeContextNeeds::from_tool_names(["Write", "view_image"]);
+    let rendered = render_runtime_context_reminder(&RuntimeContextFacts {
+        needs,
+        host_os: "macos".to_string(),
+        host_family: "unix".to_string(),
+        host_arch: "aarch64".to_string(),
+        remote_execution: None,
+        local_shell: None,
+        supports_image_understanding: Some(true),
+    })
+    .expect("runtime context should render");
+
+    assert!(rendered.contains("## Image Display"));
+    assert!(rendered.contains("![short description](/absolute/path/to/image.png)"));
+    assert!(rendered.contains("view_image` attaches an image to your multimodal context only"));
+    assert!(rendered.contains("Skip the image when it is not relevant"));
+}

@@ -441,11 +441,22 @@
 }
 
 /* inline-block so multiple badges / linked images can sit on one row (shields, etc.) */
-.markdown-renderer img,
-.markdown-renderer .markdown-image {
+.markdown-renderer img {
   display: inline-block;
   max-width: 100%;
   height: auto;
+  margin: 0.35rem 0.25rem;
+  vertical-align: middle;
+  border-radius: var(--flowchat-card-radius);
+}
+
+.markdown-renderer .markdown-image {
+  display: inline-block;
+  max-width: var(--markdown-inline-image-max-width, 100%);
+  max-height: var(--markdown-inline-image-max-height, none);
+  width: auto;
+  height: auto;
+  object-fit: contain;
   margin: 0.35rem 0.25rem;
   vertical-align: middle;
   border-radius: var(--flowchat-card-radius);
@@ -473,10 +484,59 @@
 
 .markdown-renderer .markdown-image--loading {
   opacity: 0.75;
+  background: color-mix(in srgb, var(--color-text-muted) 10%, transparent);
 }
 
 .markdown-renderer .markdown-image--error {
   outline: 1px dashed color-mix(in srgb, var(--color-error) 35%, transparent);
+}
+
+.markdown-renderer .markdown-image--interactive {
+  cursor: zoom-in;
+}
+
+.markdown-image-lightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 10000;
+  background: var(--color-overlay-black-80);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  animation: markdown-image-lightbox-fade-in 0.2s ease;
+
+  img {
+    max-width: 90vw;
+    max-height: 85vh;
+    border-radius: 8px;
+    box-shadow: 0 8px 32px var(--color-overlay-black-50);
+    object-fit: contain;
+  }
+}
+
+.markdown-image-lightbox__close {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  background: var(--color-overlay-white-15);
+  border: none;
+  border-radius: 50%;
+  width: 36px;
+  height: 36px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--color-static-white);
+  cursor: pointer;
+
+  &:hover {
+    background: rgba(var(--color-static-white-rgb), 0.3);
+  }
+}
+
+@keyframes markdown-image-lightbox-fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
 }
 
 .markdown-renderer .katex-display {

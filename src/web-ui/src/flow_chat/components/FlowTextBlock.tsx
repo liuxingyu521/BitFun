@@ -5,7 +5,7 @@
  * Supports a streaming cursor indicator.
  */
 
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
 import { MarkdownRenderer } from '@/component-library';
 import { DotMatrixLoader } from '@/component-library';
@@ -18,6 +18,43 @@ import './FlowTextBlock.scss';
 
 // Idle timeout (ms) after content stops growing.
 const CONTENT_IDLE_TIMEOUT = 500;
+
+type FlowTextTestAttributes = Record<string, string | number | boolean | undefined>;
+
+function flowTextTestAttributesEqual(
+  prev?: FlowTextTestAttributes,
+  next?: FlowTextTestAttributes,
+): boolean {
+  if (prev === next) {
+    return true;
+  }
+  if (!prev || !next) {
+    return !prev && !next;
+  }
+
+  const prevKeys = Object.keys(prev);
+  if (prevKeys.length !== Object.keys(next).length) {
+    return false;
+  }
+
+  return prevKeys.every((key) => prev[key] === next[key]);
+}
+
+function flowTextTraceContextEqual(
+  prev?: MarkdownTraceContext,
+  next?: MarkdownTraceContext,
+): boolean {
+  if (prev === next) {
+    return true;
+  }
+  if (!prev || !next) {
+    return !prev && !next;
+  }
+
+  return prev.turnId === next.turnId
+    && prev.roundId === next.roundId
+    && prev.itemId === next.itemId;
+}
 
 interface FlowTextBlockProps {
   textItem: FlowTextItem;
@@ -126,6 +163,11 @@ export const FlowTextBlock = React.memo<FlowTextBlockProps>(({
     (textItem.status === 'streaming' || textItem.status === 'running') &&
     isContentGrowing;
   const markdownTraceContext = isStartupRenderTraceEnabled() ? traceContext : undefined;
+  const handleOpenVisualization = useCallback((visualization: { type?: string; data?: unknown }) => {
+    if (typeof visualization?.type === 'string') {
+      onOpenVisualization?.(visualization.type, visualization.data);
+    }
+  }, [onOpenVisualization]);
 
   if (textItem.runtimeStatus) {
     return (
@@ -162,9 +204,7 @@ export const FlowTextBlock = React.memo<FlowTextBlockProps>(({
           onFileViewRequest={onFileViewRequest}
           onTabOpen={onTabOpen}
           onHttpLinkClick={onHttpLinkClick}
-          onOpenVisualization={(visualization) => {
-            onOpenVisualization?.(visualization?.type, visualization?.data);
-          }}
+          onOpenVisualization={handleOpenVisualization}
           traceContext={markdownTraceContext}
         />
       ) : (
@@ -184,8 +224,8 @@ export const FlowTextBlock = React.memo<FlowTextBlockProps>(({
     prev.status === next.status &&
     prevProps.className === nextProps.className &&
     prevProps.replayStreamingOnMount === nextProps.replayStreamingOnMount &&
-    prevProps.traceContext === nextProps.traceContext &&
+    flowTextTraceContextEqual(prevProps.traceContext, nextProps.traceContext) &&
     prevProps.testId === nextProps.testId &&
-    prevProps.testAttributes === nextProps.testAttributes
+    flowTextTestAttributesEqual(prevProps.testAttributes, nextProps.testAttributes)
   );
 });

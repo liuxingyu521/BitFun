@@ -247,8 +247,30 @@ describe('Markdown file links', () => {
 
     const image = container.querySelector<HTMLImageElement>('img[alt="ReLU 图像"]');
     expect(image).not.toBeNull();
-    expect(mocks.readFileContent).toHaveBeenCalledWith(`${EXAMPLE_WORKSPACE}/relu.png`);
+    expect(mocks.readFileContent).toHaveBeenCalledWith('C:/ExampleWorkspace/relu.png');
     expect(image?.src).toBe('data:image/png;base64,cmVsdS1wbmc=');
     expect(mocks.getCurrentWorkspacePath).not.toHaveBeenCalled();
+  });
+
+  it('loads absolute filesystem markdown images without turning them into http URLs', async () => {
+    const absolutePath = '/Users/dev/project/output.png';
+
+    await act(async () => {
+      root.render(
+        <Markdown
+          content={`![Generated image](${absolutePath})`}
+          onFileViewRequest={onFileViewRequest}
+        />,
+      );
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const image = container.querySelector<HTMLImageElement>('img[alt="Generated image"]');
+    expect(image).not.toBeNull();
+    expect(mocks.readFileContent).toHaveBeenCalledWith(absolutePath);
+    expect(image?.src).toBe('data:image/png;base64,cmVsdS1wbmc=');
+    expect(image?.src.startsWith('http://')).toBe(false);
+    expect(image?.src.startsWith('https://')).toBe(false);
   });
 });
