@@ -190,8 +190,10 @@ review-platform = [
     "chrono",
     "futures",
     "reqwest",
+    "sha2",
     "thiserror",
     "urlencoding",
+    "windows",
 ]
 workspace-search = [
     "async-trait",
@@ -228,3 +230,6 @@ tempfile = { workspace = true }
 [[test]]
 name = "debug_log_owner_contracts"
 required-features = ["debug-log"]
+
+[lints]
+workspace = true

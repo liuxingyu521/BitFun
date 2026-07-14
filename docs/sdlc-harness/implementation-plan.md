@@ -65,7 +65,7 @@
 | P-1 | 不作为用户发布；明确产品边界和技术跑道 | 策略对象、安全边界、事件 schema、阶段用例和指标口径 | LifecycleEvent、策略对象、配置优先级、测试桩、接口预设 | 能说明每个 P0/P1 切片服务的用户收益、降级解释和验收方法 |
 | P0 | 用户能低摩擦完成低风险任务，并看懂安全范围和未验证项 | 轻量项目理解、任务短摘要、安全确认、执行位置、主动配置发现、最小 QDP | 项目扫描、基础安全决策、事件记录、摘要视图、关键回放用例 | 普通任务可完成；安全越界不静默；低风险任务不被重流程拖慢 |
 | P1 | 风险、远程和不可支持状态变得可理解，用户知道该补什么验证 | 弱提示、推荐检查、远程/沙箱降级、Plugin Runtime Host availability/diagnostics 只读视图、证据引用摘要 | 风险分类器、提示降噪、sandbox capability 事件、产品架构 P0 插件诊断事实消费 | 高风险解释清楚；低风险仍快速；远程和不可支持状态有替代路径 |
-| P2 | 准备 PR 或进入团队规则时，用户获得可复制的协作摘要和规则说明 | PR 就绪度、团队规则折叠说明、风险接受、主动配置信任、工具复写接口 | 规则来源合成、PR 视图、风险接受记录、证据引用状态 | PR 摘要减少审查追问；团队规则来源可解释；强制项只在配置或确定性风险下出现 |
+| P2 | 准备或审查 PR 时，用户先获得目标正确的 Review，再获得可复制协作摘要和规则说明 | Review 目标证据、PR 单入口与结果投影、PR 就绪度、团队规则折叠说明、风险接受 | workspace/Git/provider PR target evidence、只读证据状态、PR 视图、规则来源合成、风险接受记录 | workspace/Git range/provider PR 共享同一 Review；强制项只在配置或确定性风险下出现 |
 | P3 | 受管项目的需求、开发、验证、审查和发布质量要求保持一致 | 路径级强策略、完整证据包视图、最小图谱、发布/事故链接、组织审计 | 图谱边状态、证据过期、受管配置、发布和事故事件 | 复杂项目可追溯；阻断/批准来源明确；快速路径仍保留 |
 | P4 | 用真实任务持续优化策略，淘汰无收益治理能力 | 轨迹回放、策略 A/B、评测卡、保留集、生态适配评估 | 回放环境、评测血缘、策略版本和成本采样 | 能用速度、质量、安全和成本联合评估治理策略 |
 
@@ -76,7 +76,7 @@
 | P-1 | PRD、设计、最小事件信封、策略对象、安全边界、测试夹具、指标口径 | 技术跑道清晰；P0/P1 的收益、降级和验收方法可解释 | 接口和 schema 过度设计导致后续实现被早期字段锁死；事件和策略对象未服务真实体验；测试夹具只覆盖理想路径 | 接口评审必须逐项映射 PRD、事件、用例和指标；新增字段要声明生产者、消费者、删除条件和进入用户路径的触发阶段 | 不设用户路径预算；限制设计期事件和指标数量，避免 P0 一开始背负遥测膨胀 |
 | P0 | 项目打开、项目上下文条、任务短摘要、安全确认、远程执行位置、主动配置发现、最小 QDP | 低风险任务能完成；用户看到已验证/未验证、安全范围、执行位置和下一步 | 默认体验被安全/摘要/扫描拖慢；项目扫描误判后形成强策略；安全确认过多；沙箱能力被夸大；主动配置发现误阻断普通任务 | 回放低风险任务、安全高敏动作、远程容器、主动配置发现；摘要必须包含未验证项；安全与质量事件分开审计 | 首次有用动作以 P0 基线为准；项目扫描分层、可取消、可延后；安全确认和摘要渲染不阻塞工具结果展示；QDP 只采最小事件 |
 | P1 | 风险提示、推荐检查、远程不可支持状态、沙箱降级说明、Plugin Runtime Host availability/diagnostics 只读视图、证据引用摘要 | 用户能理解风险和能力缺口，并知道补什么验证 | 风险提示泛化成噪音；推荐检查不可运行；远程缺口被本地验证掩盖；插件诊断视图被误认为 full runtime；证据引用缺少新鲜度 | 中/高风险用例必须说明原因、证据、建议和跳过后果；推荐检查要有不可运行分支；扩展候选不能写权威状态 | 风险分类和提示生成后台化；同类提示合并；扩展接口有 deadline、epoch、幂等键；证据引用只保存摘要和引用 |
-| P2 | PR 就绪度、团队规则来源、路径规则、风险接受、主动配置信任、工具复写接口 | PR 或团队场景可获得可复制摘要和规则说明；普通任务不被团队流程打断 | 团队规则冲突导致误阻断；PR 摘要生成过重；风险接受被滥用；工具复写绕过安全；未信任主动配置产生假通过 | PR/团队用例抽样验证规则来源、强制项、风险接受和撤销；风险接受必须记录范围、原因、操作者、期限；工具复写重新经过安全边界 | PR 视图按需生成；证据引用增量更新；团队规则读取缓存并可解释失效；不创建默认强制 GitHub 检查 |
+| P2 | Review 目标证据、PR 单入口与结果投影、PR 就绪度、团队规则来源、路径规则、风险接受 | PR 或团队场景可准确审查目标并获得可复制摘要和规则说明；普通任务不被团队流程打断 | 审错 base/head；provider diff 缺失；dirty workspace 污染；prepared diff 越界或超限；旧结果未过期；证据状态与建议混淆；团队规则冲突；PR 摘要过重 | workspace/range/provider PR 目标与失效用例、有界 diff、聚合预算、精确 PR/revision 关联、越界、fail-closed 报告、规则来源和风险接受测试 | 目标证据使用明确状态；PR 视图按需生成；不自动 Review/checkout；不创建默认强制检查 |
 | P3 | 路径级强策略、完整证据包视图、最小交付物图谱、需求/接口/架构影响候选、发布/事故事件 | 受管项目的需求、实现、验证、审查、发布和风险接受强度一致 | 图谱误关联造成错误责任链；证据过期未失效；需求质量很高但开发/验证仍低保障；发布阻断来源不清；普通任务被图谱拖慢 | 受管路径抽样检查质量一致性；图谱边必须有来源、新鲜度和确认状态；发布就绪区分事实、候选和风险接受 | 图谱和证据只在 PR、发布、事故、合规场景显露；增量计算优先；过期重算后台化；普通任务保留短摘要 |
 | P4 | 轨迹回放、评测卡、策略 A/B、保留集、成本采样、生态适配评估 | 策略能用真实任务持续优化，低价值治理能力可下线 | 评测集污染；只优化强管控任务；A/B 影响用户信任；成本指标压倒质量；插件生态评估反向推动不成熟运行时提前接入 | 每个评测任务有血缘、泄漏状态和判定标准；A/B 只在可回滚策略上运行；后验缺陷、审查阻塞和用户反馈共同校准 | 回放和评测离线或低优先级执行；token、墙钟耗时、工具调用和提示次数进入评测卡；生态适配默认不改变内核权威状态 |
 
@@ -187,12 +187,13 @@ P-1 是内部跑道，不应作为用户可见“新能力”发布。它的价�
 
 ### 8.1 阶段目标
 
-用户准备 PR、分享变更或命中团队规则时，BitFun 提供可复制的协作摘要、规则来源和风险接受入口，而不影响普通任务中间过程。
+用户准备或审查 PR、分享变更或命中团队规则时，BitFun 先确认当前工作区或明确 Git range 的 base/head 和 diff 完整度，再提供 Review、可复制协作摘要、规则来源和风险接受入口，而不影响普通任务中间过程。
 
 ### 8.2 交付件
 
 | 用户可见收益 | 必要实现 | 明确不做或延期 |
 |---|---|---|
+| Review 确实覆盖用户指定变更 | session-scoped target evidence：base/head、目标指纹、文件新旧路径与状态、完整度、workspace binding、PR provider identity、最终 evidence status；prepared target 只用有界 `GetFileDiff`，provider PR diff 按文件读取并复核 revision；`matching_clean` Git range 才保留普通只读仓库上下文 | 不增加 Reviewer Git 工具或逐调用全仓扫描；不让既有 Git 覆盖 prepared target 或扩大目标；不增加任意 shell；不自动 fetch/checkout/worktree；不建长期目标数据库或合成 diff refs |
 | PR 就绪度可复制 | 变更、验证、未验证项、风险、证据引用和复制到 PR 的 Markdown 块 | 不默认创建强制 GitHub 检查 |
 | 团队规则来源可解释 | AGENTS、CONTRIBUTING、CODEOWNERS、CI、`.github/instructions`、`.coderabbit.yaml`、`.gitlab/duo` 读取和来源展示 | 不让冲突规则静默生效 |
 | 受管路径有折叠说明 | 路径规则、审查强度、强制检查和冲突状态按需展示 | 不把所有团队配置变成默认首屏 |
@@ -202,12 +203,35 @@ P-1 是内部跑道，不应作为用户可见“新能力”发布。它的价�
 
 ### 8.3 验收成果
 
+- 当前工作区、显式 Git range 和 provider PR 的 base/head/diff 与用户目标一致；显式文件/目录范围不扩大；clean checkout、删除/重命名、二进制、超限和 provider 缺口不会被解释为无变更或完整覆盖。PR head 变化后旧结果明确过期。
+- Reviewer 不新增 Git 命令面，也不删除旧入口已有能力；prepared target 只消费禁用 external diff/textconv 的有界 exact diff。Review 父 turn 共享 240,000 返回字符预算且无硬调用次数限制；同 reviewer 重复页面在 Git IO 前返回短提示，超限返回结构化 limited evidence。rename 保留 old/new path；未跟踪内容取证受文件数和总字节预算约束并拒绝 symlink/reparse point。本地 head 不匹配或整个工作区不干净时，不使用 live repository context。
+- 显式 Git range 只有在证据完整、无遗漏且 workspace binding 为 matching_clean 时 evidence status 才可报告 `complete`；mutable workspace 始终为 `limited`。Evidence status 与模型 recommendation 独立，无效 summary 才整体 fail-close。
+- 启动消息结果不确定时保留 request-derived stable turn 和已创建的 Review 子会话，返回 explicit uncertain 状态且不自动重发，也不删除可能已开始执行的 backend session。
 - PR 摘要减少审查人追问，但不默认阻塞。
 - 团队能用仓库配置统一体验，个人一次性任务仍使用个人默认值。
 - 路径规则冲突能显示并要求确认。
 - 强制要求或阻断有明确来源，不由模型单独触发。
 - 工具复写接口不会跨项目生效，也不会绕过文件、shell、网络和凭据策略。
 - PR 就绪、受管路径、风险接受和主动配置信任用例可回放。
+
+### 8.4 Review 目标证据收敛计划
+
+当前只承诺一个产品目标：让 workspace / Git range / provider PR 从同一入口诚实地绑定并消费目标证据。后续能力不得以 schema 预留、隐藏设置或兼容分支的名义提前进入。
+
+#### 当前 PR：目标证据正确
+
+状态：PR2 实现和本地验证完成，待合入。合入后先观察目标解析失败率、provider diff 缺失率、limited evidence 比例、diff 预算耗尽率、Review 成功率和 token 变化；PR3 默认无范围。
+
+| 项 | 计划 |
+|---|---|
+| 用户收益 | 显式 Git range 和 provider PR 不再审错 revision；workspace 或 provider 无法完整取证时不会伪装成完整覆盖，并得到诚实覆盖说明 |
+| 必要实现 | 行为轻量的 target evidence contract；workspace/Git range 一次取证；provider PR 固定 identity/base/head 并按文件读取 diff；准确文件状态与完整度；精确 PR/revision 结果投影；跨 Review 子会话的目标上下文传播；独立 evidence status；prepared target/report fail-close；opaque cursor、父 Review turn 聚合字符预算和 provider diff acquisition 上限；仅 `matching_clean` Git range 保留普通 Read/Grep/Glob/LS 上下文 |
+| 兼容 | 现有工作区 Review 保持默认路径；历史 manifest 无 target evidence 时明确走 legacy workspace fallback，不伪装成精确 range/PR |
+| 风险前置 | 删除、重命名、二进制和超大文件；dirty workspace 污染；prepare 后工作区或 PR head 变化；provider diff 缺失/截断；文件名 prompt injection；Git 外部 diff/textconv 副作用 |
+| 验证 | Rust contract/tool policy tests；真实临时 Git 仓库的新增/删除/rename-with-edit/超限/分页/预算测试；`targetResolver` 当前修改/range/remote/显式文件和目录测试；越界路径不可达、fail-closed 报告、uncertain launch、普通 Agent 隔离测试；Web type-check 与 i18n audit |
+| 回退 | 目标不能证明时回退为明确的 `partial`/`unknown` 并阻止完整覆盖文案；不得回退到 Reviewer 猜 ref，也不得把既有 Git 当作 prepared target 的替代证据 |
+
+PR 面板的显式 Review 入口属于 PR2；自动 Review、跨 Review finding 生命周期、自动 checkout、Reviewer 命令执行、新结果动作和组织分析均不在当前计划内，需要时必须基于上线数据重新立项。
 
 ## 9. P3：受管项目一致治理
 

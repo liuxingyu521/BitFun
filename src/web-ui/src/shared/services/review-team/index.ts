@@ -22,7 +22,6 @@ import {
   DEFAULT_REVIEW_TEAM_CORE_ROLES,
   DEFAULT_REVIEW_TEAM_EXECUTION_POLICY,
   DEFAULT_REVIEW_TEAM_MODEL,
-  DEFAULT_REVIEW_TEAM_PROJECT_STRATEGY_OVERRIDES_CONFIG_PATH,
   DEFAULT_REVIEW_TEAM_RATE_LIMIT_STATUS_CONFIG_PATH,
   DEFAULT_REVIEW_TEAM_STRATEGY_LEVEL,
   DISALLOWED_REVIEW_TEAM_MEMBER_IDS,
@@ -39,10 +38,6 @@ import {
   REVIEW_STRATEGY_PROFILES,
 } from './strategy';
 import { buildPreReviewSummary } from './preReviewSummary';
-import {
-  buildIncrementalReviewCachePlan,
-  buildSharedContextCachePlan,
-} from './cachePlan';
 import { buildDeepReviewEvidencePack } from './evidencePack';
 import {
   applyTeamStrategyOverrideToMember,
@@ -59,7 +54,6 @@ import {
   buildTokenBudgetPlan,
 } from './tokenBudget';
 import {
-  buildWorkPackets,
   resolveChangeStats,
   resolveMaxExtraReviewers,
 } from './workPackets';
@@ -71,6 +65,7 @@ import type {
   ReviewStrategyLevel,
   ReviewStrategyProfile,
   ReviewStrategySource,
+  ReviewTargetEvidence,
   ReviewTeam,
   ReviewTeamChangeStats,
   ReviewTeamConcurrencyPolicy,
@@ -83,17 +78,18 @@ import type {
   ReviewTeamRateLimitStatus,
   ReviewTeamRunManifest,
   ReviewTeamStoredConfig,
+  ReviewTeamWorkPacket,
   ReviewTokenBudgetMode,
 } from './types';
 
 export * from './types';
 export * from './strategy';
+export * from './targetEvidence';
 export { buildReviewRiskFactors, recommendReviewStrategyForTarget } from './risk';
 export {
   DEFAULT_REVIEW_TEAM_ID,
   DEFAULT_REVIEW_TEAM_CONFIG_PATH,
   DEFAULT_REVIEW_TEAM_RATE_LIMIT_STATUS_CONFIG_PATH,
-  DEFAULT_REVIEW_TEAM_PROJECT_STRATEGY_OVERRIDES_CONFIG_PATH,
   DEFAULT_REVIEW_TEAM_MODEL,
   DEFAULT_REVIEW_TEAM_STRATEGY_LEVEL,
   DEFAULT_REVIEW_MEMBER_STRATEGY_LEVEL,
@@ -126,8 +122,6 @@ function isReviewStrategyProfile(value: unknown): value is ReviewStrategyProfile
     isReviewStrategyLevel(profile.level) &&
     typeof profile.label === 'string' &&
     typeof profile.summary === 'string' &&
-    typeof profile.tokenImpact === 'string' &&
-    typeof profile.runtimeImpact === 'string' &&
     (profile.defaultModelSlot === 'fast' || profile.defaultModelSlot === 'primary') &&
     typeof profile.promptDirective === 'string' &&
     Boolean(profile.roleDirectives) &&
@@ -285,42 +279,6 @@ function normalizeMemberStrategyOverrides(
     } else {
       console.warn(
         `[ReviewTeamService] Ignoring invalid strategy override for '${normalizedId}': expected one of ${REVIEW_STRATEGY_LEVELS.join(', ')}, got '${value}'`,
-      );
-    }
-    return result;
-  }, {});
-}
-
-function normalizeProjectStrategyOverrideKey(workspacePath?: string): string | undefined {
-  const normalized = workspacePath?.trim().replace(/\\/g, '/');
-  if (!normalized) {
-    return undefined;
-  }
-  if (normalized === '/' || /^[a-zA-Z]:\/$/.test(normalized)) {
-    return normalized.toLowerCase();
-  }
-  return normalized.replace(/\/+$/, '').toLowerCase();
-}
-
-function normalizeProjectStrategyOverrideStore(
-  raw: unknown,
-): Record<string, ReviewStrategyLevel> {
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
-    return {};
-  }
-
-  return Object.entries(raw as Record<string, unknown>).reduce<
-    Record<string, ReviewStrategyLevel>
-  >((result, [workspacePath, value]) => {
-    const key = normalizeProjectStrategyOverrideKey(workspacePath);
-    if (!key) {
-      return result;
-    }
-    if (isReviewStrategyLevel(value)) {
-      result[key] = value;
-    } else {
-      console.warn(
-        `[ReviewTeamService] Ignoring invalid project strategy override for '${key}': expected one of ${REVIEW_STRATEGY_LEVELS.join(', ')}, got '${value}'`,
       );
     }
     return result;
@@ -620,53 +578,6 @@ export async function loadReviewTeamRateLimitStatus(): Promise<ReviewTeamRateLim
     console.warn('[ReviewTeamService] Failed to load review team rate limit status', error);
     return null;
   }
-}
-
-export async function loadReviewTeamProjectStrategyOverride(
-  workspacePath?: string,
-): Promise<ReviewStrategyLevel | undefined> {
-  const key = normalizeProjectStrategyOverrideKey(workspacePath);
-  if (!key) {
-    return undefined;
-  }
-
-  try {
-    const raw = await configAPI.getConfig(
-      DEFAULT_REVIEW_TEAM_PROJECT_STRATEGY_OVERRIDES_CONFIG_PATH,
-      { skipRetryOnNotFound: true },
-    );
-    return normalizeProjectStrategyOverrideStore(raw)[key];
-  } catch (error) {
-    console.warn('[ReviewTeamService] Failed to load project review strategy override', error);
-    return undefined;
-  }
-}
-
-export async function saveReviewTeamProjectStrategyOverride(
-  workspacePath: string | undefined,
-  strategyLevel?: ReviewStrategyLevel,
-): Promise<void> {
-  const key = normalizeProjectStrategyOverrideKey(workspacePath);
-  if (!key) {
-    return;
-  }
-
-  const raw = await configAPI.getConfig(
-    DEFAULT_REVIEW_TEAM_PROJECT_STRATEGY_OVERRIDES_CONFIG_PATH,
-    { skipRetryOnNotFound: true },
-  ).catch(() => undefined);
-  const nextOverrides = normalizeProjectStrategyOverrideStore(raw);
-
-  if (strategyLevel) {
-    nextOverrides[key] = normalizeTeamStrategyLevel(strategyLevel);
-  } else {
-    delete nextOverrides[key];
-  }
-
-  await configAPI.setConfig(
-    DEFAULT_REVIEW_TEAM_PROJECT_STRATEGY_OVERRIDES_CONFIG_PATH,
-    nextOverrides,
-  );
 }
 
 export async function addDefaultReviewTeamMember(subagentId: string): Promise<void> {
@@ -1132,6 +1043,7 @@ interface ReviewTeamManifestOptions {
   maxCoreReviewers?: number;
   maxExtraReviewers?: number;
   includeQualityGate?: boolean;
+  targetEvidence?: ReviewTargetEvidence;
 }
 
 const REVIEW_WORK_PACKET_ALLOWED_TOOL_SET = new Set<string>(
@@ -1355,7 +1267,7 @@ export function buildEffectiveReviewTeamManifest(
     }),
     options.rateLimitStatus,
   );
-  const strategyLevel = options.qualityDecision?.strategyLevel ?? options.strategyOverride ?? team.strategyLevel;
+  const strategyLevel = options.strategyOverride ?? team.strategyLevel;
   const strategyBudget = REVIEW_STRATEGY_RUNTIME_BUDGETS[strategyLevel];
   const tokenBudgetMode = options.tokenBudgetMode ?? strategyBudget.tokenBudgetMode;
   const scopeProfile = buildDeepReviewScopeProfile(strategyLevel);
@@ -1420,35 +1332,34 @@ export function buildEffectiveReviewTeamManifest(
   const budgetLimitedExtraMembers = eligibleExtraMembers.slice(maxExtraReviewers);
   const enabledExtraReviewers = enabledExtraMembers
     .map((member) => toManifestMember(member));
-  const executionPolicy = buildEffectiveExecutionPolicy({
-    basePolicy: team.executionPolicy,
-    strategyLevel,
-    target,
-    changeStats,
-  });
-  const workPackets = buildWorkPackets({
-    reviewerMembers: [...coreReviewerMembers, ...enabledExtraMembers],
-    judgeMember: qualityGateReviewerMember,
-    target,
-    executionPolicy,
-    concurrencyPolicy,
-  });
+  const executionPolicy = {
+    ...buildEffectiveExecutionPolicy({
+      basePolicy: team.executionPolicy,
+      strategyLevel,
+      target,
+      changeStats,
+    }),
+    // A strict run is reviewed by the DeepReview agent itself. Specialist
+    // agents are optional fresh perspectives, not a pre-scheduled team.
+    reviewerFileSplitThreshold: 0,
+    maxSameRoleInstances: 1,
+    maxRetriesPerRole: 0,
+    maxReviewerCalls: 1,
+  };
+  const workPackets: ReviewTeamWorkPacket[] = [];
   const evidencePack = buildDeepReviewEvidencePack({
     target,
     changeStats,
     scopeProfile,
-    workPackets,
-  });
-  const sharedContextCache = buildSharedContextCachePlan(workPackets);
-  const incrementalReviewCache = buildIncrementalReviewCachePlan({
-    target,
-    changeStats,
-    strategyLevel,
+    targetEvidence: options.targetEvidence,
     workPackets,
   });
   const tokenBudget = buildTokenBudgetPlan({
     mode: tokenBudgetMode,
-    activeReviewerCalls: workPackets.length,
+    // One primary DeepReview agent execution is guaranteed. At most one
+    // specialist and one conditional quality-inspector execution may follow.
+    activeReviewerCalls: 1,
+    maxReviewerCalls: 3,
     eligibleExtraReviewerCount: eligibleExtraMembers.length,
     maxExtraReviewers,
     skippedReviewerIds: budgetLimitedExtraMembers.map((member) => member.subagentId),
@@ -1495,8 +1406,6 @@ export function buildEffectiveReviewTeamManifest(
     changeStats,
     preReviewSummary,
     evidencePack,
-    sharedContextCache,
-    incrementalReviewCache,
     tokenBudget,
     coreReviewers,
     ...(qualityGateReviewer ? { qualityGateReviewer } : {}),

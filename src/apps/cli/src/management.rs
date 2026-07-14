@@ -5,6 +5,9 @@ use std::time::Duration;
 use bitfun_core::agentic::get_agent_registry;
 use bitfun_core::agentic::persistence::PersistenceManager;
 use bitfun_core::infrastructure::try_get_path_manager_arc;
+use bitfun_core::plugin_runtime::{
+    preview_managed_plugin_activation, set_managed_plugin_activation, ManagedPluginActivationView,
+};
 use bitfun_core::plugin_source::{
     refresh_managed_plugin_sources, set_managed_plugin_trust, ManagedPluginSourceSnapshot,
     ManagedPluginTrustDecision, ManagedPluginTrustLevel,
@@ -24,7 +27,7 @@ async fn ensure_global_config_service(
         .context("Failed to get global config service")
 }
 
-pub async fn print_agents(workspace: Option<&Path>) -> Result<()> {
+pub(crate) async fn print_agents(workspace: Option<&Path>) -> Result<()> {
     let registry = get_agent_registry();
     let modes = registry.get_modes_info().await;
     let subagents = registry.get_subagents_info(workspace).await;
@@ -70,7 +73,7 @@ pub async fn print_agents(workspace: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
-pub async fn print_models() -> Result<()> {
+pub(crate) async fn print_models() -> Result<()> {
     let config_service = ensure_global_config_service().await?;
     let models = config_service.get_ai_models().await?;
     let global_config: bitfun_core::service::config::GlobalConfig =
@@ -111,7 +114,7 @@ pub async fn print_models() -> Result<()> {
     Ok(())
 }
 
-pub async fn print_mcp_servers() -> Result<()> {
+pub(crate) async fn print_mcp_servers() -> Result<()> {
     let config_service = ensure_global_config_service().await?;
     let mcp_service = bitfun_core::service::mcp::MCPService::new(config_service.clone())
         .map_err(|error| anyhow!(error.to_string()))?;
@@ -162,7 +165,7 @@ pub async fn print_mcp_servers() -> Result<()> {
     Ok(())
 }
 
-pub async fn set_default_model(model_id: &str) -> Result<()> {
+pub(crate) async fn set_default_model(model_id: &str) -> Result<()> {
     let config_service = ensure_global_config_service().await?;
     let agent_registry = get_agent_registry();
     let modes = agent_registry.get_modes_info().await;
@@ -179,7 +182,7 @@ pub async fn set_default_model(model_id: &str) -> Result<()> {
     Ok(())
 }
 
-pub async fn set_mcp_server_enabled(server_id: &str, enabled: bool) -> Result<()> {
+pub(crate) async fn set_mcp_server_enabled(server_id: &str, enabled: bool) -> Result<()> {
     let config_service = ensure_global_config_service().await?;
     let mcp_service = bitfun_core::service::mcp::MCPService::new(config_service.clone())
         .map_err(|error| anyhow!(error.to_string()))?;
@@ -202,7 +205,7 @@ pub async fn set_mcp_server_enabled(server_id: &str, enabled: bool) -> Result<()
     Ok(())
 }
 
-pub async fn print_mcp_json_config() -> Result<()> {
+pub(crate) async fn print_mcp_json_config() -> Result<()> {
     let config_service = ensure_global_config_service().await?;
     let mcp_service = bitfun_core::service::mcp::MCPService::new(config_service.clone())
         .map_err(|error| anyhow!(error.to_string()))?;
@@ -211,7 +214,7 @@ pub async fn print_mcp_json_config() -> Result<()> {
     Ok(())
 }
 
-pub async fn print_usage_report(session_id: Option<&str>) -> Result<()> {
+pub(crate) async fn print_usage_report(session_id: Option<&str>) -> Result<()> {
     let agentic_system = crate::agent::agentic_system::init_agentic_system_for_cli().await?;
     let path_manager = try_get_path_manager_arc().map_err(|error| anyhow!(error.to_string()))?;
     let persistence_manager =
@@ -246,7 +249,7 @@ pub async fn print_usage_report(session_id: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-pub async fn print_plugins() -> Result<()> {
+pub(crate) async fn print_plugins() -> Result<()> {
     let workspace = std::env::current_dir().context("Failed to resolve current directory")?;
     let path_manager = try_get_path_manager_arc().map_err(|error| anyhow!(error.to_string()))?;
     let snapshot = refresh_managed_plugin_sources(&workspace)
@@ -271,7 +274,7 @@ pub async fn print_plugins() -> Result<()> {
     Ok(())
 }
 
-pub async fn set_plugin_trust(
+pub(crate) async fn set_plugin_trust(
     package_id: &str,
     decision: ManagedPluginTrustDecision,
 ) -> Result<()> {
@@ -322,6 +325,126 @@ pub async fn set_plugin_trust(
     Ok(())
 }
 
+pub(crate) async fn activate_plugin(package_id: &str, confirm: Option<&str>) -> Result<()> {
+    let workspace = std::env::current_dir().context("Failed to resolve current directory")?;
+    let view = if let Some(content_hash) = confirm {
+        set_managed_plugin_activation(&workspace, package_id, true, Some(content_hash)).await
+    } else {
+        preview_managed_plugin_activation(&workspace, package_id).await
+    }
+    .map_err(|error| {
+        let diagnostic = crate::plugin_diagnostics::escape_terminal_text(&error.to_string());
+        if confirm.is_some() {
+            anyhow!(
+                "{}\nRe-run `bitfun-cli plugins activate {}` to preview the current content, then confirm with the new content hash.",
+                diagnostic,
+                crate::plugin_diagnostics::escape_terminal_text(package_id)
+            )
+        } else {
+            anyhow!(diagnostic)
+        }
+    })?;
+
+    print_plugin_activation(&view, confirm.is_none());
+    if confirm.is_none() {
+        println!();
+        println!(
+            "No activation state changed. Re-run `bitfun-cli plugins activate {} --confirm {}` to confirm this exact package content.",
+            crate::plugin_diagnostics::escape_terminal_text(package_id),
+            crate::plugin_diagnostics::escape_terminal_text(&view.content_hash)
+        );
+    }
+    Ok(())
+}
+
+pub(crate) async fn deactivate_plugin(package_id: &str) -> Result<()> {
+    let workspace = std::env::current_dir().context("Failed to resolve current directory")?;
+    let view = set_managed_plugin_activation(&workspace, package_id, false, None)
+        .await
+        .map_err(|error| {
+            anyhow!(crate::plugin_diagnostics::escape_terminal_text(
+                &error.to_string()
+            ))
+        })?;
+    println!(
+        "Plugin package {} is inactive.",
+        crate::plugin_diagnostics::escape_terminal_text(&view.package_id)
+    );
+    for diagnostic in &view.diagnostics {
+        println!(
+            "- [warning] {}",
+            crate::plugin_diagnostics::escape_terminal_text(diagnostic)
+        );
+    }
+    println!("No plugin code or candidate effect was executed.");
+    Ok(())
+}
+
+fn print_plugin_activation(view: &ManagedPluginActivationView, preview: bool) {
+    println!(
+        "Plugin activation {}",
+        if preview { "preview" } else { "result" }
+    );
+    println!();
+    println!(
+        "Package: {} {}",
+        crate::plugin_diagnostics::escape_terminal_text(&view.package_id),
+        crate::plugin_diagnostics::escape_terminal_text(&view.version)
+    );
+    println!(
+        "Adapter: {}",
+        crate::plugin_diagnostics::escape_terminal_text(&view.adapter)
+    );
+    println!("Content hash: {}", view.content_hash);
+    println!(
+        "Custom tool candidates: {}",
+        if view.provider_candidates_supported {
+            "supported"
+        } else {
+            "not found"
+        }
+    );
+    println!(
+        "Permission required before use: {}",
+        if view.permission_required {
+            "yes"
+        } else {
+            "no"
+        }
+    );
+    println!("Entries: {}", view.entry_ids.len());
+    for entry_id in &view.entry_ids {
+        println!(
+            "- {}",
+            crate::plugin_diagnostics::escape_terminal_text(entry_id)
+        );
+    }
+    println!(
+        "{}: {}",
+        if preview {
+            "Declared candidates requiring permission"
+        } else {
+            "Candidates requiring permission"
+        },
+        view.candidates.len()
+    );
+    for candidate in &view.candidates {
+        println!(
+            "- {} -> {} (risk: {})",
+            crate::plugin_diagnostics::escape_terminal_text(&candidate.entry_id),
+            crate::plugin_diagnostics::escape_terminal_text(&candidate.target),
+            candidate.risk_level
+        );
+    }
+    for diagnostic in &view.diagnostics {
+        println!(
+            "- [diagnostic] {}",
+            crate::plugin_diagnostics::escape_terminal_text(diagnostic)
+        );
+    }
+    println!("Plugin code was not executed and no tool was registered.");
+}
+
 fn print_plugin_snapshot(snapshot: &ManagedPluginSourceSnapshot) {
     let approved_count = snapshot
         .packages
@@ -366,7 +489,14 @@ fn print_plugin_snapshot(snapshot: &ManagedPluginSourceSnapshot) {
             crate::plugin_diagnostics::escape_terminal_text(&package.adapter)
         );
         println!("  Content hash: {}", package.content_hash);
-        println!("  Execution: unavailable; source review does not enable this package");
+        println!(
+            "  Activation: {}",
+            if package.activated {
+                "active for candidate projection; plugin code is not executed"
+            } else {
+                "inactive; source review does not activate this package"
+            }
+        );
     }
     for issue in &snapshot.issues {
         println!(
@@ -381,6 +511,13 @@ fn print_plugin_snapshot(snapshot: &ManagedPluginSourceSnapshot) {
         "{}",
         crate::plugin_diagnostics::render_source_review_epoch(snapshot.trust_epoch)
     );
+    println!(
+        "Activation epoch: {}",
+        snapshot
+            .activation_epoch
+            .map(|epoch| epoch.to_string())
+            .unwrap_or_else(|| "unavailable".to_string())
+    );
 }
 
 fn plugin_trust_label(trust_level: ManagedPluginTrustLevel) -> &'static str {
@@ -393,7 +530,7 @@ fn plugin_trust_label(trust_level: ManagedPluginTrustLevel) -> &'static str {
     }
 }
 
-pub async fn print_mcp_config_summary() -> Result<()> {
+pub(crate) async fn print_mcp_config_summary() -> Result<()> {
     let config_service = ensure_global_config_service().await?;
     let mcp_service = bitfun_core::service::mcp::MCPService::new(config_service)
         .map_err(|error| anyhow!(error.to_string()))?;
@@ -409,7 +546,7 @@ pub async fn print_mcp_config_summary() -> Result<()> {
     Ok(())
 }
 
-pub async fn print_doctor() -> Result<bool> {
+pub(crate) async fn print_doctor() -> Result<bool> {
     let workspace = std::env::current_dir().context("Failed to resolve current directory")?;
     let config_dir = crate::config::CliConfig::config_dir()?;
     let config_service = ensure_global_config_service().await?;
@@ -429,6 +566,11 @@ pub async fn print_doctor() -> Result<bool> {
         .packages
         .iter()
         .filter(|package| package.trust_level == ManagedPluginTrustLevel::SourceApproved)
+        .count();
+    let active_plugin_count = plugin_sources
+        .packages
+        .iter()
+        .filter(|package| package.activated)
         .count();
     let plugin_warning_count = plugin_sources
         .issues
@@ -463,6 +605,10 @@ pub async fn print_doctor() -> Result<bool> {
             plugin_warning_count,
             plugin_error_count,
         )
+    );
+    println!(
+        "[ok] Managed plugin source integrity checked; {} active. Candidate projection was not probed.",
+        active_plugin_count
     );
     for issue in plugin_sources.issues.iter().take(10) {
         println!(

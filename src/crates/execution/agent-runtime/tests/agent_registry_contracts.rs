@@ -40,7 +40,7 @@ fn availability_preserves_builtin_project_and_user_override_layering() {
             user_override: Some(SubagentOverrideState::Enabled),
         },
     );
-    assert_eq!(builtin.default_enabled, false);
+    assert!(!builtin.default_enabled);
     assert_eq!(builtin.override_state, Some(SubagentOverrideState::Enabled));
     assert_eq!(
         builtin.state_reason,
@@ -250,4 +250,34 @@ fn builtin_agent_definition_catalog_preserves_order_categories_models_and_visibi
         .find(|spec| spec.id == "ResearchSpecialist")
         .expect("ResearchSpecialist spec should exist");
     assert_eq!(research_specialist.default_model_id, "fast");
+}
+
+#[test]
+fn shared_coding_modes_have_identical_builtin_subagent_defaults() {
+    let specs = builtin_agent_definition_specs();
+
+    for spec in specs
+        .iter()
+        .filter(|spec| spec.category == BuiltinAgentCategory::SubAgent)
+    {
+        let expected = resolve_subagent_default_enabled(
+            SubagentSourceKind::Builtin,
+            &spec.visibility_policy,
+            Some("agentic"),
+        );
+
+        for mode_id in SHARED_CODING_MODE_IDS {
+            assert_eq!(
+                resolve_subagent_default_enabled(
+                    SubagentSourceKind::Builtin,
+                    &spec.visibility_policy,
+                    Some(mode_id),
+                ),
+                expected,
+                "builtin subagent {} differs for shared coding mode {}",
+                spec.id,
+                mode_id
+            );
+        }
+    }
 }
