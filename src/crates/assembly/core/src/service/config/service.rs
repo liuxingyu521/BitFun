@@ -100,23 +100,51 @@ impl ConfigService {
             manager.set(path, value).await?;
         }
 
-        if Self::path_touches_models(path) {
+        let model_configuration_changed = Self::path_touches_models(path);
+        if model_configuration_changed {
             if let Err(e) = self.reconcile_models("set_config").await {
                 warn!(
                     "Model reconcile after set_config failed: path={}, error={}",
                     path, e
                 );
             }
+            super::global::GlobalConfigManager::broadcast_update(
+                super::global::ConfigUpdateEvent::ModelConfigurationUpdated,
+            )
+            .await;
         }
 
         Ok(())
+    }
+
+    /// Atomically replaces one JSON configuration value when its current value
+    /// still matches the caller's snapshot. The read, comparison, and persisted
+    /// write share the existing manager write lock.
+    #[cfg(any(test, feature = "product-full"))]
+    pub(crate) async fn compare_and_set_json_config(
+        &self,
+        path: &str,
+        expected: Option<serde_json::Value>,
+        replacement: serde_json::Value,
+    ) -> BitFunResult<bool> {
+        let mut manager = self.manager.write().await;
+        let current = match manager.get::<serde_json::Value>(path) {
+            Ok(value) => Some(value),
+            Err(BitFunError::NotFound(_)) => None,
+            Err(error) => return Err(error),
+        };
+        if current != expected {
+            return Ok(false);
+        }
+        manager.set(path, replacement).await?;
+        Ok(true)
     }
 
     fn path_touches_models(path: &str) -> bool {
         path == "ai"
             || path.starts_with("ai.models")
             || path.starts_with("ai.default_models")
-            || path.starts_with("ai.agent_models")
+            || path.starts_with("ai.agent_model_defaults")
             || path.starts_with("ai.func_agent_models")
     }
 
@@ -142,6 +170,10 @@ impl ConfigService {
                     path, e
                 );
             }
+            super::global::GlobalConfigManager::broadcast_update(
+                super::global::ConfigUpdateEvent::ModelConfigurationUpdated,
+            )
+            .await;
         }
 
         Ok(())
@@ -190,6 +222,10 @@ impl ConfigService {
                 if let Err(e) = self.reconcile_models("import_config").await {
                     warn!("Model reconcile after import_config failed: {}", e);
                 }
+                super::global::GlobalConfigManager::broadcast_update(
+                    super::global::ConfigUpdateEvent::ModelConfigurationUpdated,
+                )
+                .await;
                 Ok(ConfigImportResult {
                     success: true,
                     errors: Vec::new(),
@@ -273,6 +309,10 @@ impl ConfigService {
         if let Err(e) = self.reconcile_models("reload").await {
             warn!("Model reconcile after reload failed: {}", e);
         }
+        super::global::GlobalConfigManager::broadcast_update(
+            super::global::ConfigUpdateEvent::ModelConfigurationUpdated,
+        )
+        .await;
         Ok(())
     }
 
@@ -337,12 +377,12 @@ impl ConfigService {
         self.set_config("ai.models", &config.ai.models).await
     }
 
-    /// Bring `ai.default_models`, `ai.agent_models`, and `ai.func_agent_models`
-    /// back into a consistent state with `ai.models`.
+    /// Bring `ai.default_models`, `ai.agent_model_defaults`, and
+    /// `ai.func_agent_models` back into a consistent state with `ai.models`.
     ///
     /// This is the single integrity guard the rest of the system relies on:
-    /// - any agent / func-agent mapping pointing at a model that no longer
-    ///   exists or that became disabled is dropped;
+    /// - any func-agent mapping pointing at a model that no longer exists or
+    ///   that became disabled is dropped;
     /// - `default_models.primary` / `.fast` are repointed to the first enabled
     ///   model when their current target is missing or disabled (or cleared
     ///   when no enabled model exists at all);
@@ -364,78 +404,27 @@ impl ConfigService {
             .filter(|m| m.enabled)
             .map(|m| m.id.clone())
             .collect();
-        let known_ids: HashSet<String> = config.ai.models.iter().map(|m| m.id.clone()).collect();
-
-        // Precompute lookup tables so the closures below do not need to
-        // borrow `config.ai` (which would conflict with the later mutations
-        // of `config.ai.agent_models` / `config.ai.default_models`).
-        let mut active_refs: HashSet<String> = HashSet::new();
-        let mut any_ref_to_id: std::collections::HashMap<String, String> =
-            std::collections::HashMap::new();
-        for m in &config.ai.models {
-            any_ref_to_id
-                .entry(m.id.clone())
-                .or_insert_with(|| m.id.clone());
-            any_ref_to_id
-                .entry(m.name.clone())
-                .or_insert_with(|| m.id.clone());
-            any_ref_to_id
-                .entry(m.model_name.clone())
-                .or_insert_with(|| m.id.clone());
-            if m.enabled {
-                active_refs.insert(m.id.clone());
-                active_refs.insert(m.name.clone());
-                active_refs.insert(m.model_name.clone());
-            }
-        }
         let is_active = |reference: &str| -> bool {
             // Special selectors are always considered active; their actual
             // resolution happens at runtime against the (already reconciled)
             // default slots.
-            matches!(reference, "auto" | "primary" | "fast") || active_refs.contains(reference)
+            matches!(reference, "auto" | "primary" | "fast") || enabled_ids.contains(reference)
         };
 
         let classify_invalid = |reference: &str, invalidated: &mut HashSet<String>| -> bool {
             if is_active(reference) {
                 return false;
             }
-            // Resolve back to the canonical id (if the reference is by
-            // name / model_name pointing at a now-disabled model) so we
-            // can report a stable identifier.
-            let canonical = any_ref_to_id
-                .get(reference)
-                .cloned()
-                .unwrap_or_else(|| reference.to_string());
-            invalidated.insert(canonical);
+            invalidated.insert(reference.to_string());
             true
         };
 
         let mut invalidated: HashSet<String> = HashSet::new();
-        let mut agent_models_changed = false;
+        let mut func_agent_models_changed = false;
+        let mut agent_model_defaults_changed = false;
         let mut default_models_changed = false;
 
-        // 1. agent_models
-        let agent_keys_to_remove: Vec<String> = config
-            .ai
-            .agent_models
-            .iter()
-            .filter_map(|(agent, model_ref)| {
-                if classify_invalid(model_ref, &mut invalidated) {
-                    Some(agent.clone())
-                } else {
-                    None
-                }
-            })
-            .collect();
-        for agent in agent_keys_to_remove {
-            warn!(
-                "Reconcile ({caller}): clearing ai.agent_models[{agent}] because target model is missing or disabled"
-            );
-            config.ai.agent_models.remove(&agent);
-            agent_models_changed = true;
-        }
-
-        // 2. func_agent_models
+        // 1. func_agent_models
         let func_keys_to_remove: Vec<String> = config
             .ai
             .func_agent_models
@@ -453,7 +442,76 @@ impl ConfigService {
                 "Reconcile ({caller}): clearing ai.func_agent_models[{agent}] because target model is missing or disabled"
             );
             config.ai.func_agent_models.remove(&agent);
-            agent_models_changed = true;
+            func_agent_models_changed = true;
+        }
+
+        // 2. future mode and delegated-subagent defaults
+        if classify_invalid(
+            config.ai.agent_model_defaults.mode.as_str(),
+            &mut invalidated,
+        ) {
+            warn!(
+                "Reconcile ({caller}): resetting ai.agent_model_defaults.mode because target model is missing or disabled"
+            );
+            config.ai.agent_model_defaults.mode = "auto".to_string();
+            agent_model_defaults_changed = true;
+        }
+
+        if config
+            .ai
+            .agent_model_defaults
+            .subagents
+            .default_selection
+            .fixed_model_id()
+            .is_some_and(|model_id| classify_invalid(model_id, &mut invalidated))
+        {
+            warn!(
+                "Reconcile ({caller}): resetting ai.agent_model_defaults.subagents.default because target model is missing or disabled"
+            );
+            config.ai.agent_model_defaults.subagents.default_selection =
+                SubagentModelSelection::fixed("fast");
+            agent_model_defaults_changed = true;
+        }
+
+        let builtin_keys_to_remove: Vec<String> = config
+            .ai
+            .agent_model_defaults
+            .subagents
+            .builtin
+            .iter()
+            .filter_map(|(subagent_id, selection)| {
+                selection
+                    .fixed_model_id()
+                    .filter(|model_id| classify_invalid(model_id, &mut invalidated))
+                    .map(|_| subagent_id.clone())
+            })
+            .collect();
+        for subagent_id in builtin_keys_to_remove {
+            warn!(
+                "Reconcile ({caller}): clearing ai.agent_model_defaults.subagents.builtin[{subagent_id}] because target model is missing or disabled"
+            );
+            config
+                .ai
+                .agent_model_defaults
+                .subagents
+                .builtin
+                .remove(&subagent_id);
+            agent_model_defaults_changed = true;
+        }
+
+        if config
+            .ai
+            .agent_model_defaults
+            .subagents
+            .fork
+            .fixed_model_id()
+            .is_some_and(|model_id| classify_invalid(model_id, &mut invalidated))
+        {
+            warn!(
+                "Reconcile ({caller}): resetting ai.agent_model_defaults.subagents.fork because target model is missing or disabled"
+            );
+            config.ai.agent_model_defaults.subagents.fork = SubagentModelSelection::Inherit;
+            agent_model_defaults_changed = true;
         }
 
         // 3. default model slots
@@ -503,19 +561,9 @@ impl ConfigService {
         let image_understanding_needs_fix =
             match config.ai.default_models.image_understanding.as_deref() {
                 Some("") => true,
-                Some(value) => {
-                    let canonical = any_ref_to_id
-                        .get(value)
-                        .map(String::as_str)
-                        .unwrap_or(value);
-                    !config.ai.models.iter().any(|model| {
-                        model.enabled
-                            && model.supports_image_understanding()
-                            && (model.id == canonical
-                                || model.name == value
-                                || model.model_name == value)
-                    })
-                }
+                Some(value) => !config.ai.models.iter().any(|model| {
+                    model.enabled && model.supports_image_understanding() && model.id == value
+                }),
                 None => false,
             };
         if image_understanding_needs_fix {
@@ -542,20 +590,21 @@ impl ConfigService {
             default_models_changed = true;
         }
 
-        // Ensure `invalidated` doesn't contain a still-existing-and-enabled id
-        // (defensive: classify_invalid only inserts for inactive refs, but a
-        // callsite could have re-resolved via name).
+        // Ensure `invalidated` doesn't contain a still-existing-and-enabled ID.
         invalidated.retain(|id| !enabled_ids.contains(id));
 
         // Persist any changes. We deliberately use the inner manager (and not
         // `self.set_config`) to avoid triggering a recursive reconcile pass.
-        if agent_models_changed {
+        if func_agent_models_changed {
             let mut manager = self.manager.write().await;
             manager
-                .set("ai.agent_models", &config.ai.agent_models)
-                .await?;
-            manager
                 .set("ai.func_agent_models", &config.ai.func_agent_models)
+                .await?;
+        }
+        if agent_model_defaults_changed {
+            let mut manager = self.manager.write().await;
+            manager
+                .set("ai.agent_model_defaults", &config.ai.agent_model_defaults)
                 .await?;
         }
         if default_models_changed {
@@ -565,28 +614,29 @@ impl ConfigService {
                 .await?;
         }
 
-        let _ = known_ids; // currently unused, kept for future diagnostics
-
         let report = ReconcileModelsReport {
             invalidated_model_ids: invalidated.into_iter().collect(),
             default_models_changed,
-            agent_models_changed,
+            func_agent_models_changed,
+            agent_model_defaults_changed,
         };
 
         if report.is_noop() {
             log::debug!("Reconcile ({caller}): no changes");
         } else {
             info!(
-                "Reconcile ({caller}): invalidated={:?}, default_changed={}, agent_changed={}",
+                "Reconcile ({caller}): invalidated={:?}, default_changed={}, func_agent_changed={}, agent_defaults_changed={}",
                 report.invalidated_model_ids,
                 report.default_models_changed,
-                report.agent_models_changed
+                report.func_agent_models_changed,
+                report.agent_model_defaults_changed
             );
             super::global::GlobalConfigManager::broadcast_update(
                 super::global::ConfigUpdateEvent::ModelsReconciled {
                     invalidated_model_ids: report.invalidated_model_ids.clone(),
                     default_models_changed: report.default_models_changed,
-                    agent_models_changed: report.agent_models_changed,
+                    func_agent_models_changed: report.func_agent_models_changed,
+                    agent_model_defaults_changed: report.agent_model_defaults_changed,
                 },
             )
             .await;
@@ -619,14 +669,16 @@ impl bitfun_runtime_ports::ConfigReadPort for ConfigService {
 pub struct ReconcileModelsReport {
     pub invalidated_model_ids: Vec<String>,
     pub default_models_changed: bool,
-    pub agent_models_changed: bool,
+    pub func_agent_models_changed: bool,
+    pub agent_model_defaults_changed: bool,
 }
 
 impl ReconcileModelsReport {
     pub fn is_noop(&self) -> bool {
         self.invalidated_model_ids.is_empty()
             && !self.default_models_changed
-            && !self.agent_models_changed
+            && !self.func_agent_models_changed
+            && !self.agent_model_defaults_changed
     }
 }
 
@@ -634,6 +686,7 @@ impl ReconcileModelsReport {
 mod tests {
     use super::*;
     use crate::infrastructure::PathManager;
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     fn model(id: &str, enabled: bool, category: ModelCategory) -> AIModelConfig {
@@ -676,6 +729,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn compare_and_set_json_config_rejects_a_stale_snapshot() {
+        let (service, _dir) = test_service("config-cas").await;
+        assert!(service
+            .compare_and_set_json_config(
+                "mcp_servers",
+                None,
+                serde_json::json!({ "mcpServers": { "first": {} } }),
+            )
+            .await
+            .unwrap());
+        assert!(!service
+            .compare_and_set_json_config(
+                "mcp_servers",
+                None,
+                serde_json::json!({ "mcpServers": { "stale": {} } }),
+            )
+            .await
+            .unwrap());
+        let current = service
+            .get_config::<serde_json::Value>(Some("mcp_servers"))
+            .await
+            .unwrap();
+        assert!(current["mcpServers"].get("first").is_some());
+        assert!(current["mcpServers"].get("stale").is_none());
+    }
+
+    #[tokio::test]
     async fn reconcile_models_repairs_image_understanding_default_to_capable_model() {
         let (service, _dir) = test_service("vision-default-repair").await;
         let models = vec![
@@ -713,69 +793,121 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_theme_id_path_writes_themes_current_only() {
-        let (service, _dir) = test_service("legacy-theme-id-path").await;
+    async fn reconcile_models_resets_invalid_agent_model_defaults() {
+        let (service, _dir) = test_service("agent-model-defaults-repair").await;
+        service
+            .set_config(
+                "ai.models",
+                &vec![model("old-model", true, ModelCategory::GeneralChat)],
+            )
+            .await
+            .expect("initial model should save");
+        service
+            .set_config(
+                "ai.agent_model_defaults",
+                &AgentModelDefaultsConfig {
+                    mode: "old-model".to_string(),
+                    subagents: SubagentModelDefaultsConfig {
+                        default_selection: SubagentModelSelection::fixed("old-model"),
+                        builtin: HashMap::from([(
+                            "Explore".to_string(),
+                            SubagentModelSelection::fixed("old-model"),
+                        )]),
+                        fork: SubagentModelSelection::fixed("old-model"),
+                    },
+                },
+            )
+            .await
+            .expect("agent model defaults should save");
 
         service
-            .set_config("theme.id", "dark")
+            .set_config(
+                "ai.models",
+                &vec![model("new-model", true, ModelCategory::GeneralChat)],
+            )
             .await
-            .expect("legacy theme path should remain a thin compatibility alias");
+            .expect("model replacement should reconcile defaults");
 
-        let current: String = service
-            .get_config(Some("themes.current"))
+        let defaults: AgentModelDefaultsConfig = service
+            .get_config(Some("ai.agent_model_defaults"))
             .await
-            .expect("theme selection should be readable from the TS-owned path");
-        assert_eq!(current, "bitfun-dark");
+            .expect("agent model defaults should load");
+        assert_eq!(defaults.mode, "auto");
+        assert_eq!(
+            defaults.subagents.default_selection,
+            SubagentModelSelection::fixed("fast")
+        );
+        assert!(defaults.subagents.builtin.is_empty());
+        assert_eq!(defaults.subagents.fork, SubagentModelSelection::Inherit);
+    }
+
+    #[tokio::test]
+    async fn appearance_selection_round_trips_through_the_typed_config() {
+        let (service, _dir) = test_service("appearance-selection").await;
+
+        service
+            .set_config("appearance.selection", "bitfun-dark")
+            .await
+            .expect("appearance selection should save");
+
+        let selection: String = service
+            .get_config(Some("appearance.selection"))
+            .await
+            .expect("appearance selection should load");
+        assert_eq!(selection, "bitfun-dark");
 
         let export: GlobalConfig = service
             .get_config(None)
             .await
             .expect("full config should load");
         let serialized = serde_json::to_value(export).expect("config should serialize");
-        assert!(
-            serialized.get("theme").is_none(),
-            "legacy path must not recreate the removed Rust GUI theme schema"
-        );
+        assert_eq!(serialized["appearance"]["selection"], "bitfun-dark");
+        assert!(serialized.get("theme").is_none());
+        assert!(serialized.get("themes").is_none());
     }
 
     #[tokio::test]
-    async fn raw_import_preserves_legacy_theme_id_before_deserialization() {
-        let (service, _dir) = test_service("legacy-theme-raw-import").await;
+    async fn raw_import_migrates_legacy_skip_confirmation_and_removes_it_from_disk() {
+        let test_name = "legacy-skip-confirmation-raw-import";
+        let (service, dir) = test_service(test_name).await;
         let mut raw_config =
             serde_json::to_value(GlobalConfig::default()).expect("default config should serialize");
         let raw_object = raw_config
             .as_object_mut()
             .expect("default config should serialize as an object");
-        raw_object.remove("themes");
-        raw_object.insert(
-            "theme".to_string(),
-            serde_json::json!({
-                "id": "dark",
-                "colors": {
-                    "background": "#1e1e1e"
-                }
-            }),
-        );
+        raw_object.remove("tool_permissions");
+        raw_object
+            .get_mut("ai")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("default config should include an AI object")
+            .insert(
+                "skip_tool_confirmation".to_string(),
+                serde_json::Value::Bool(true),
+            );
 
         service
             .import_config_data(raw_config)
             .await
-            .expect("raw legacy config should import before old fields are dropped");
+            .expect("legacy confirmation preference should import");
 
-        let current: String = service
-            .get_config(Some("themes.current"))
+        let permissions: serde_json::Value = service
+            .get_config(Some("tool_permissions"))
             .await
-            .expect("legacy theme id should migrate into themes.current");
-        assert_eq!(current, "bitfun-dark");
+            .expect("migrated tool permissions should be readable");
+        assert_eq!(permissions["policy"]["preset"], "ask");
+        assert_eq!(permissions["interaction"]["auto_approve_ask"], true);
 
-        let export: GlobalConfig = service
-            .get_config(None)
-            .await
-            .expect("full config should load after import");
-        let serialized = serde_json::to_value(export).expect("config should serialize");
-        assert!(
-            serialized.get("theme").is_none(),
-            "legacy theme payload should not be exported after import"
+        let path_manager = PathManager::with_user_root_for_tests(dir.path().join(test_name));
+        let persisted: serde_json::Value = serde_json::from_str(
+            &tokio::fs::read_to_string(path_manager.app_config_file())
+                .await
+                .expect("migrated config should be persisted"),
+        )
+        .expect("persisted config should be valid JSON");
+        assert!(persisted["ai"].get("skip_tool_confirmation").is_none());
+        assert_eq!(
+            persisted["tool_permissions"]["interaction"]["auto_approve_ask"],
+            true
         );
     }
 }

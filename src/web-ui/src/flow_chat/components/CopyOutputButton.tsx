@@ -12,6 +12,7 @@ import { Tooltip } from '@/component-library';
 import { i18nService } from '@/infrastructure/i18n';
 import { createLogger } from '@/shared/utils/logger';
 import { formatSessionViewPreviewText } from '../utils/sessionViewPreview';
+import { projectEffectiveToolItem } from '../utils/toolInvocationIdentity';
 import './CopyOutputButton.css';
 
 const log = createLogger('CopyOutputButton');
@@ -49,13 +50,14 @@ export const CopyOutputButton: React.FC<CopyOutputButtonProps> = ({
           const toolItem = item as FlowToolItem;
           
           if (toolItem.toolCall) {
-            const toolName = toolItem.toolName || t('copyOutput.unknownTool');
+            const effectiveItem = projectEffectiveToolItem(toolItem);
+            const toolName = effectiveItem.toolName || t('copyOutput.unknownTool');
             let toolContent = t('copyOutput.toolCall', { name: toolName }) + '\n';
             
-            if (toolItem.toolCall.input) {
-              const inputStr = typeof toolItem.toolCall.input === 'string'
-                ? toolItem.toolCall.input
-                : JSON.stringify(toolItem.toolCall.input, null, 2);
+            if (effectiveItem.toolCall.input) {
+              const inputStr = typeof effectiveItem.toolCall.input === 'string'
+                ? effectiveItem.toolCall.input
+                : JSON.stringify(effectiveItem.toolCall.input, null, 2);
               toolContent += `\n[Input]\n\`\`\`json\n${inputStr}\n\`\`\`\n`;
             }
             
@@ -141,31 +143,37 @@ export const CopyOutputButton: React.FC<CopyOutputButtonProps> = ({
   }
 
   return (
-    <div className={`copy-output-button-group ${className}`}>
+    <div data-bf-component="copy-output-button" data-bf-part="root" data-bf-state={copied ? 'copied' : ''} className={`copy-output-button-group ${className}`}>
       <button
+        data-bf-component="copy-output-button"
+        data-bf-part="action"
+        data-bf-action="copy"
         className={`copy-output-button ${copied ? 'copied' : ''}`}
         onClick={handleCopy}
         title={copied ? t('copyOutput.copiedOutputContent') : t('copyOutput.copyOutputContent')}
         aria-label={copied ? t('copyOutput.copiedOutputContent') : t('copyOutput.copyOutputContent')}
       >
-        <span className="button-icon">
+        <span data-bf-component="copy-output-button" data-bf-part="icon" className="button-icon">
           {copied ? <Check size={14} /> : <Copy size={14} />}
         </span>
-        <span className="button-text">
+        <span data-bf-component="copy-output-button" data-bf-part="text" className="button-text">
           {copied ? t('copyOutput.copied') : t('copyOutput.copy')}
         </span>
       </button>
       
       <Tooltip content={t('copyOutput.openInEditor')}>
         <button
+          data-bf-component="copy-output-button"
+          data-bf-part="action"
+          data-bf-action="edit"
           className="copy-output-button edit-button"
           onClick={handleOpenInEditor}
           aria-label={t('copyOutput.openInEditor')}
         >
-          <span className="button-icon">
+          <span data-bf-component="copy-output-button" data-bf-part="icon" className="button-icon">
             <Edit size={14} />
           </span>
-          <span className="button-text">
+          <span data-bf-component="copy-output-button" data-bf-part="text" className="button-text">
             {t('copyOutput.edit')}
           </span>
         </button>

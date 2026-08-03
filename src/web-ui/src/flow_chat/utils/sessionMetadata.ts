@@ -189,18 +189,6 @@ export function deriveSessionRelationshipFromMetadata(
   });
 }
 
-export function isLegacyPersistedBtwSession(
-  metadata?: Pick<SessionMetadata, 'customMetadata' | 'tags'> | null
-): boolean {
-  const kind = normalizeSessionKind(metadata?.customMetadata?.kind);
-  if (kind === 'btw') {
-    return true;
-  }
-
-  const tags = metadata?.tags;
-  return Array.isArray(tags) && tags.includes('btw');
-}
-
 export function deriveLastFinishedAtFromMetadata(
   metadata?: Pick<SessionMetadata, 'lastFinishedAt' | 'customMetadata'> | null
 ): number | undefined {
@@ -305,7 +293,7 @@ export function buildCreateSessionRelationship(
 ): SessionRelationship | undefined {
   const normalized = normalizeSessionRelationship(session);
 
-  if (normalized.sessionKind === 'normal' || normalized.sessionKind === 'btw') {
+  if (normalized.sessionKind === 'normal') {
     return undefined;
   }
 
@@ -348,6 +336,7 @@ export function buildSessionMetadata(
     | 'config'
     | 'createdAt'
     | 'workspacePath'
+    | 'projectWorkspacePath'
     | 'remoteConnectionId'
     | 'remoteSshHost'
     | 'todos'
@@ -422,6 +411,13 @@ export function buildSessionMetadata(
     ),
     todos: session.todos || existingMetadata?.todos || [],
     workspacePath: session.workspacePath || existingMetadata?.workspacePath,
+    projectWorkspacePath:
+      session.projectWorkspacePath
+      || session.config.projectWorkspacePath
+      || session.workspacePath
+      || existingMetadata?.projectWorkspacePath,
+    executionTarget:
+      session.config.executionTarget ?? existingMetadata?.executionTarget,
     remoteConnectionId:
       session.remoteConnectionId ?? existingMetadata?.remoteConnectionId,
     remoteSshHost: session.remoteSshHost ?? existingMetadata?.remoteSshHost,

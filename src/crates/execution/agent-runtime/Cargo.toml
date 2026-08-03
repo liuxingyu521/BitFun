@@ -19,20 +19,23 @@ bitfun-agent-tools = { path = "../tool-contracts" }
 bitfun-core-types = { path = "../../contracts/core-types" }
 bitfun-events = { path = "../../contracts/events" }
 bitfun-harness = { path = "../harness" }
-bitfun-runtime-ports = { path = "../../contracts/runtime-ports" }
+bitfun-runtime-ports = { path = "../../contracts/runtime-ports", features = ["permission"] }
 bitfun-runtime-services = { path = "../runtime-services" }
 dashmap = { workspace = true }
+hex = { workspace = true }
 log = { workspace = true }
 regex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
+sha2 = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "macros", "process", "rt", "sync", "time"] }
 tokio-util = { workspace = true }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread"] }
 
 [lints]
 workspace = true

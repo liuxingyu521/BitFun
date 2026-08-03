@@ -21,12 +21,14 @@ pub use resolver::{
 };
 pub use roots::{
     normalize_local_skill_dir_name, normalize_remote_skill_dir_name,
-    resolve_user_config_skill_root, SkillRootSpec, BITFUN_SYSTEM_SKILL_DIR,
-    BITFUN_SYSTEM_SKILL_SLOT, BITFUN_USER_SKILL_SLOT, PROJECT_SKILL_KEY_PREFIX,
-    PROJECT_SKILL_ROOTS, USER_CONFIG_SKILL_ROOTS, USER_HOME_SKILL_ROOTS, USER_SKILL_KEY_PREFIX,
+    resolve_user_config_skill_root, SkillRootSpec, BITFUN_SKILL_SOURCE_ID,
+    BITFUN_SKILL_SOURCE_LABEL, BITFUN_SYSTEM_SKILL_DIR, BITFUN_SYSTEM_SKILL_SLOT,
+    BITFUN_USER_SKILL_SLOT, PROJECT_SKILL_KEY_PREFIX, PROJECT_SKILL_ROOTS, USER_CONFIG_SKILL_ROOTS,
+    USER_HOME_SKILL_ROOTS, USER_SKILL_KEY_PREFIX,
 };
 pub use selection::{
     annotate_shadowed_skills, build_mode_skill_infos, filter_candidates_for_mode,
+    filter_implicitly_invocable_skills, filter_user_invocable_skills, is_skill_globally_enabled,
     normalize_skill_keys, resolve_default_hidden_builtin_for_explicit_invocation,
     resolve_visible_skills, sort_skill_candidates_by_dir, sort_skills,
     ExplicitSkillInvocationResolution, SkillCandidate,

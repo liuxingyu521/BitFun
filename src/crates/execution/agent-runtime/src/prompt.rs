@@ -1,5 +1,6 @@
 //! Prompt-loop owner facts and reminder ordering.
 
+use bitfun_core_types::{SessionExecutionTarget, SessionExecutionTargetKind};
 use serde::{Deserialize, Serialize};
 
 const SKILL_LISTING_TITLE: &str = "# Skill Listing";
@@ -8,11 +9,16 @@ If the user names a skill (with `[$SkillName]` or plain text) OR the task clearl
 Below is the list of skills that can be used with the Skill tool. Each entry includes a name and description"#;
 const AGENT_LISTING_TITLE: &str = "# Agent Listing";
 const AGENT_LISTING_GUIDANCE: &str = "Available subagent types for the Task tool:";
-const COLLAPSED_TOOL_LISTING_TITLE: &str = "# Collapsed Tool Listing";
-const COLLAPSED_TOOL_LISTING_GUIDANCE: &str = r#"The folling tools are intentionally collapsed. Their listed descriptions are short summaries rather than full usage instructions.
-Before calling a collapsed tool, call `GetToolSpec` with its exact tool name to read its full schema.
-After reading the returned spec, call the real tool directly by its own name.
-If a tool spec is already available in the current conversation, do not call `GetToolSpec` for it again."#;
+const TOOL_CALLING_GUIDANCE_TITLE: &str = "# Tool Calling Guide";
+const TOOL_CALLING_GUIDANCE: &str = r#"You can access two types of tools:
+- Direct tools: tools in the available tool list include their full definitions. Call them directly using their listed names and input schemas.
+- Deferred tools: call them through `CallDeferredTool`.
+  Before the first call for a deferred tool whose full spec is not already available in the current conversation, call `GetToolSpec` with its exact name.
+  Once its spec is available, call `CallDeferredTool` directly with that tool name and its arguments inside `args`.
+  Do not call `GetToolSpec` again unless the system reports that the spec is stale or unavailable.
+
+## Deferred Tool Listing
+Each entry has the form `tool_name[: optional short description]`."#;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PromptEnvironmentFacts<'a> {
@@ -151,14 +157,30 @@ pub struct RuntimeContextFacts {
     pub remote_execution: Option<RemoteExecutionHints>,
     pub local_shell: Option<RuntimeShellFacts>,
     pub supports_image_understanding: Option<bool>,
+    pub inline_markdown_image_display: bool,
 }
 
 pub fn render_runtime_context_reminder(facts: &RuntimeContextFacts) -> Option<String> {
-    if facts.needs.is_empty() {
+    if facts.needs.is_empty() && !facts.inline_markdown_image_display {
         return None;
     }
 
     let mut lines = vec!["# Runtime Context".to_string()];
+
+    if facts.inline_markdown_image_display {
+        push_runtime_context_section(
+            &mut lines,
+            "Chat Image Display",
+            vec![
+                "- The current Desktop/Web chat renders Markdown images inline. To show an image to the user, use `![concise alt text](source)` in the response."
+                    .to_string(),
+                "- Supported sources are verified HTTP(S) image URLs and workspace-relative image paths. Prefer PNG, JPEG, GIF, or WebP for reliable rendering."
+                    .to_string(),
+                "- Do not invent image URLs, and do not call image-analysis tools solely to display an image. Use a URL you verified or a path to a file that exists in the active workspace."
+                    .to_string(),
+            ],
+        );
+    }
 
     if facts.needs.workspace_tools {
         let mut workspace_lines = Vec::new();
@@ -267,6 +289,55 @@ pub struct WorkspaceContextFacts {
     pub workspace_path: String,
     pub related_paths: Vec<PromptRelatedPath>,
     pub remote_execution: Option<RemoteExecutionHints>,
+    pub worktree: Option<WorktreeContextFacts>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeContextFacts {
+    pub project_workspace_path: String,
+    pub execution_target: SessionExecutionTarget,
+}
+
+fn render_worktree_context(facts: Option<&WorktreeContextFacts>) -> String {
+    let Some(facts) = facts else {
+        return String::new();
+    };
+    let target = &facts.execution_target;
+    let target_label = match target.kind {
+        SessionExecutionTargetKind::Local => return String::new(),
+        SessionExecutionTargetKind::ManagedWorktree => {
+            "Managed Git worktree created for this session"
+        }
+        SessionExecutionTargetKind::ExistingWorktree => {
+            "Existing Git worktree registered for this session"
+        }
+    };
+    let mut lines = vec![
+        format!("- Execution target: {}", target_label),
+        format!(
+            "- Owning project root (session history and worktree management only): {}",
+            facts.project_workspace_path.replace('\\', "/")
+        ),
+    ];
+    if let Some(worktree_id) = target.worktree_id.as_deref() {
+        lines.push(format!("- Worktree ID: {}", worktree_id));
+    }
+    if let Some(branch) = target.branch.as_deref() {
+        lines.push(format!("- Worktree branch: {}", branch));
+    } else {
+        lines.push("- Worktree checkout: detached HEAD".to_string());
+    }
+    if let Some(base_ref) = target.base_ref.as_deref() {
+        lines.push(format!("- Worktree base ref: {}", base_ref));
+    }
+    if let Some(base_commit) = target.base_commit.as_deref() {
+        lines.push(format!("- Worktree base commit: {}", base_commit));
+    }
+    lines.push(
+        "- Keep file, shell, and Git operations inside the workspace root above unless the user explicitly requests otherwise."
+            .to_string(),
+    );
+    lines.join("\n")
 }
 
 pub fn render_workspace_context(facts: &WorkspaceContextFacts) -> String {
@@ -292,13 +363,14 @@ pub fn render_workspace_context(facts: &WorkspaceContextFacts) -> String {
             items
         )
     };
+    let worktree_section = render_worktree_context(facts.worktree.as_ref());
 
     if let Some(remote) = &facts.remote_execution {
         format!(
             r#"## Workspace Context
 <workspace_context>
 - Workspace root (file tools, Glob, LS, ExecCommand on workspace): {}
-{}
+{}{}
 - Execution environment: **Remote SSH** — connection "{}".
 - Remote host: {} (uname/kernel: {})
 </workspace_context>
@@ -309,6 +381,11 @@ pub fn render_workspace_context(facts: &WorkspaceContextFacts) -> String {
             } else {
                 format!("{}\n", related_paths_section)
             },
+            if worktree_section.is_empty() {
+                String::new()
+            } else {
+                format!("{}\n", worktree_section)
+            },
             remote.connection_display_name.replace('"', "'"),
             remote.hostname.replace('"', "'"),
             remote.kernel_name.replace('"', "'"),
@@ -318,7 +395,7 @@ pub fn render_workspace_context(facts: &WorkspaceContextFacts) -> String {
             r#"## Workspace Context
 <workspace_context>
 - Current Working Directory: {}
-{}
+{}{}
 </workspace_context>
 "#,
             facts.workspace_path,
@@ -326,6 +403,11 @@ pub fn render_workspace_context(facts: &WorkspaceContextFacts) -> String {
                 String::new()
             } else {
                 format!("\n{}", related_paths_section)
+            },
+            if worktree_section.is_empty() {
+                String::new()
+            } else {
+                format!("\n{}", worktree_section)
             }
         )
     }
@@ -559,14 +641,14 @@ impl UserContextSection {
 pub struct ToolListingSections {
     pub skill_listing: Option<String>,
     pub agent_listing: Option<String>,
-    pub collapsed_tool_listing: Option<String>,
+    pub deferred_tool_listing: Option<String>,
 }
 
 impl ToolListingSections {
     pub fn is_empty(&self) -> bool {
         self.skill_listing.is_none()
             && self.agent_listing.is_none()
-            && self.collapsed_tool_listing.is_none()
+            && self.deferred_tool_listing.is_none()
     }
 
     pub fn render_skill_listing_reminder(&self) -> Option<String> {
@@ -589,14 +671,14 @@ impl ToolListingSections {
         })
     }
 
-    pub fn render_collapsed_tool_listing_reminder(&self) -> Option<String> {
-        self.collapsed_tool_listing
+    pub fn render_deferred_tool_listing_reminder(&self) -> Option<String> {
+        self.deferred_tool_listing
             .as_deref()
-            .map(|collapsed_tool_listing| {
+            .map(|deferred_tool_listing| {
                 Self::render_section(
-                    COLLAPSED_TOOL_LISTING_TITLE,
-                    collapsed_tool_listing,
-                    Some(COLLAPSED_TOOL_LISTING_GUIDANCE),
+                    TOOL_CALLING_GUIDANCE_TITLE,
+                    deferred_tool_listing,
+                    Some(TOOL_CALLING_GUIDANCE),
                 )
             })
     }
@@ -611,7 +693,7 @@ impl ToolListingSections {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PrependedPromptReminders {
-    pub collapsed_tool_listing: Option<String>,
+    pub deferred_tool_listing: Option<String>,
     pub skill_listing: Option<String>,
     pub agent_listing: Option<String>,
     pub runtime_context: Option<String>,
@@ -621,8 +703,8 @@ pub struct PrependedPromptReminders {
 impl PrependedPromptReminders {
     pub fn ordered_reminders(&self) -> Vec<&str> {
         let mut reminders = Vec::new();
-        if let Some(collapsed_tool_listing) = self.collapsed_tool_listing.as_deref() {
-            reminders.push(collapsed_tool_listing);
+        if let Some(deferred_tool_listing) = self.deferred_tool_listing.as_deref() {
+            reminders.push(deferred_tool_listing);
         }
         if let Some(skill_listing) = self.skill_listing.as_deref() {
             reminders.push(skill_listing);

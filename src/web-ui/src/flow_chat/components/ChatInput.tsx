@@ -9,7 +9,12 @@ import { useTranslation } from 'react-i18next';
 import { ArrowUp, BotMessageSquare, Image, RotateCcw, Plus, X, Sparkles, Loader2, ChevronRight, Files, MessageSquarePlus, Star } from 'lucide-react';
 import { ContextDropZone, useContextStore } from '../../shared/context-system';
 import { useActiveSessionState } from '@/flow_chat/hooks';
-import { RichTextInput, type MentionState, type InlineTriggerState } from './RichTextInput';
+import {
+  RichTextInput,
+  type InlineTriggerState,
+  type MentionState,
+  type RichTextInputElement,
+} from './RichTextInput';
 import { FileMentionPicker } from './FileMentionPicker';
 import { globalEventBus } from '@/infrastructure/event-bus';
 import {
@@ -25,24 +30,42 @@ import { filterSlashCommands, useAcpSlashCommands } from '../hooks/useAcpSlashCo
 import { acpSessionRef, acpSlashCommandText } from '../utils/acpSession';
 import { AcpPlanPanel } from './AcpPlanPanel';
 import type { FlowChatState } from '../types/flow-chat';
-import type { ContextItem, FileContext, DirectoryContext, ImageContext } from '@/types/context.ts';
+import type {
+  ContextItem,
+  DirectoryContext,
+  FileContext,
+  ImageContext,
+  SessionReferenceContext,
+} from '@/types/context.ts';
 import { SmartRecommendations } from './smart-recommendations';
 import { useCurrentWorkspace, useWorkspaceContext } from '@/infrastructure/contexts/WorkspaceContext';
+import { flowChatSessionConfigForCurrentWorkspace } from '@/app/utils/projectSessionWorkspace';
 import { createImageContextFromFile, createImageContextFromClipboard } from '../utils/imageUtils';
-import { getSlashCommandPickerQuery, isSlashCommand, stripSlashCommand } from '../utils/slashCommand';
+import { getInlineSlashCommandPickerQuery, getSlashCommandPickerQuery, isSlashCommand, stripSlashCommand } from '../utils/slashCommand';
 import {
   resolveSlashActionInputValue,
   type SlashActionId,
 } from '../utils/slashActionSelection';
+import { parseReloadCommand, supportsLocalReloadContext } from '../utils/reloadCommand';
+import { reviewPromptCommandShell } from '../utils/promptCommandShellReview';
 import { notificationService } from '@/shared/notification-system';
-import { inputReducer, initialInputState } from '../reducers/inputReducer';
+import { useI18n } from '@/infrastructure/i18n';
+import { inputReducer, initialInputState, type InputAction } from '../reducers/inputReducer';
 import { modeReducer, initialModeState } from '../reducers/modeReducer';
 import { CHAT_INPUT_CONFIG } from '../constants/chatInputConfig';
 import { useMessageSender } from '../hooks/useMessageSender';
 import { useChatInputState } from '../store/chatInputStateStore';
 import { useInputHistoryStore } from '../store/inputHistoryStore';
+import {
+  sessionComposerStore,
+  type PendingLargePasteMap,
+} from '../store/sessionComposerStore';
+import {
+  failedSubmissionRecoveryTarget,
+  shouldRecordContextMutation,
+  successfulRetryCleanupTarget,
+} from './chatInputDraftRecovery';
 import { startBtwThread } from '../services/BtwThreadService';
-import { runUsageReportCommand } from '../services/usageReportService';
 import { buildImagePayload } from '../utils/imagePayload';
 import { isGoalSlashCommand, parseGoalCommand } from '../services/goalService';
 import {
@@ -50,6 +73,7 @@ import {
   subscribeHistorySessionOpenTransition,
 } from '../services/sessionOpenIntent';
 import { useThreadGoalController } from '../hooks/useThreadGoalController';
+import { useComposerDefaultFocus } from '../hooks/useComposerDefaultFocus';
 import { ThreadGoalDialogs } from './thread-goal/ThreadGoalDialogs';
 import { FlowChatManager } from '@/flow_chat/services/FlowChatManager';
 import {
@@ -61,8 +85,15 @@ import {
 } from '../services/ReviewService';
 import { isReviewSlashCommand } from '../deep-review/launch/commandParser';
 import { createLogger } from '@/shared/utils/logger';
+import { isSamePath } from '@/shared/utils/pathUtils';
+import {
+  isSessionWorktreeIsolationEnabled,
+  isSessionWorktreeBindingLocked,
+  sessionWorktreeBindingSubscriptionKey,
+} from '../utils/sessionWorktree';
+import { isRemoteWorkspaceSession } from '../utils/sessionWorkspace';
 import { isTauriRuntime } from '@/infrastructure/runtime';
-import { Tooltip, IconButton, confirmWarning } from '@/component-library';
+import { Tooltip, IconButton, confirmDanger, confirmWarning } from '@/component-library';
 import { PendingQueuePanel } from './PendingQueuePanel';
 import { useAgentCanvasStore } from '@/app/components/panels/content-canvas/stores';
 import { openBtwSessionInAuxPane, selectActiveBtwSessionTab } from '../services/btwSessionPane';
@@ -84,15 +115,40 @@ import { useSceneStore } from '@/app/stores/sceneStore';
 import type { SceneTabId } from '@/app/components/SceneBar/types';
 import { useAgentsStore } from '@/app/scenes/agents/agentsStore';
 import { configAPI } from '@/infrastructure/api/service-api/ConfigAPI';
-import { configManager } from '@/infrastructure/config';
+import {
+  configManager,
+  DEFAULT_TOOL_PERMISSION_CONFIG,
+  normalizeToolPermissionConfig,
+  permissionConfigService,
+} from '@/infrastructure/config';
+import { useComputerUseEnabled } from '@/infrastructure/config/hooks/useComputerUseEnabled';
+import type { ToolPermissionConfig } from '@/infrastructure/config/types';
 import type { ModeSkillInfo } from '@/infrastructure/config/types';
 import { SubagentAPI, type SubagentInfo } from '@/infrastructure/api/service-api/SubagentAPI';
 import MCPAPI, { type MCPPrompt, type MCPPromptMessage, type MCPServerInfo } from '@/infrastructure/api/service-api/MCPAPI';
-import { ChatInputWorkspaceStrip } from './ChatInputWorkspaceStrip';
+import {
+  ChatInputWorkspaceStrip,
+  type ChatInputPermissionMode,
+} from './ChatInputWorkspaceStrip';
+import type { DispatchSelection, DispatchTarget } from '@/features/dispatch/types';
+import { isNonLocalDispatchTarget } from '@/features/dispatch/types';
+import { dispatchJobStore } from '@/features/dispatch/dispatchJobStore';
+import { useComposerCapabilities } from '../session-drivers/useComposerCapabilities';
+import { ComposerVoiceInputButton } from './voice/ComposerVoiceInputButton';
+import { useComposerVoiceInput } from './voice/useComposerVoiceInput';
 import { expandWidgetPromptReferenceTokens } from '@/tools/generative-widget/widgetPromptReference';
+import {
+  composerPresentationContexts,
+  composerPresentationToEditorText,
+  composerPresentationToModelText,
+  hasComposerPresentationReferences,
+  parseComposerPresentation,
+  type ComposerPresentation,
+} from '../utils/composerPresentation';
 import {
   appendSkillPromptReferenceToken,
   createSkillPromptReferenceToken,
+  isSkillAvailableForUserInvocation,
   isSlashAddressableSkillName,
   replaceLeadingSlashCommandWithSkillToken,
 } from '../utils/skillPromptReference';
@@ -106,6 +162,26 @@ import {
   type ContextUsageDisplay,
 } from '../utils/tokenUsageDisplay';
 import { agentAPI } from '@/infrastructure/api/service-api/AgentAPI';
+import {
+  ExternalSourceApiError,
+  externalSourcesAPI,
+  type NativePromptCommandDescriptor,
+} from '@/infrastructure/api/service-api/ExternalSourcesAPI';
+import { externalSourceDiscoveryPollDelay } from '@/infrastructure/api/service-api/externalSourceDiscovery';
+import {
+  buildExternalPromptCommandItems,
+  classifyExternalPromptCommandCatalogIssue,
+  externalPromptComposerIsUnchanged,
+  isExternalPromptSubmissionTargetCurrent,
+  routeUnmatchedExternalPromptCommand,
+  resolveExternalPromptCommandInvocation,
+  type ExternalPromptCommandCatalogIssue,
+  type ExternalPromptCommandItem,
+} from '../utils/externalPromptCommands';
+import {
+  submitThroughChatInputRegistration,
+  type ChatInputRegistration,
+} from './chatInputRegistration';
 import './ChatInput.scss';
 
 import { setChatPopupActive } from './chatPopupState';
@@ -115,6 +191,12 @@ const log = createLogger('ChatInput');
 export interface ChatInputProps {
   className?: string;
   onSendMessage?: (message: string) => void;
+  isSceneActive?: boolean;
+  /**
+   * Optional content and transport registration for hosts that embed the
+   * standard composer. The registration never replaces ChatInput's UI.
+   */
+  registration?: ChatInputRegistration;
 }
 
 type SlashActionItem = {
@@ -161,14 +243,61 @@ type SlashSkillItem = {
   skillName: string;
 };
 
+type SlashExternalPromptCommandItem = ExternalPromptCommandItem & {
+  kind: 'externalCommand';
+};
+
+function toSlashExternalPromptCommands(
+  snapshot: Parameters<typeof buildExternalPromptCommandItems>[0],
+): SlashExternalPromptCommandItem[] {
+  return buildExternalPromptCommandItems(snapshot).map(item => ({
+    ...item,
+    kind: 'externalCommand' as const,
+  }));
+}
+
 type SlashPickerItem =
   | SlashActionItem
   | SlashModeItem
   | SlashMcpPromptItem
   | SlashAcpCommandItem
-  | SlashSkillItem;
+  | SlashSkillItem
+  | SlashExternalPromptCommandItem;
 type ChatInputTarget = 'main' | 'btw';
-type PendingLargePasteMap = Record<string, string>;
+
+function nativePromptCommandCandidateId(
+  kind: Exclude<SlashPickerItem['kind'], 'externalCommand'>,
+  id: string,
+): string {
+  return `bitfun.desktop:${kind}:${id}`;
+}
+
+function toNativePromptCommandDescriptor(
+  item: Exclude<SlashPickerItem, SlashExternalPromptCommandItem>,
+): NativePromptCommandDescriptor {
+  const command = item.kind === 'mode' ? `/${item.id}` : item.command;
+  const commandName = command.slice(1).split(/\s+/, 1)[0]?.toLowerCase() ?? '';
+  const behaviorVersion = item.kind === 'mcpPrompt'
+    ? JSON.stringify({
+        kind: item.kind,
+        serverId: item.serverId,
+        promptName: item.promptName,
+        arguments: item.arguments.map(argument => ({
+          name: argument.name,
+          required: argument.required,
+        })),
+      })
+    : JSON.stringify(item.kind === 'mode'
+        ? { kind: item.kind, id: item.id }
+        : item.kind === 'skill'
+          ? { kind: item.kind, id: item.id, skillName: item.skillName }
+          : { kind: item.kind, id: item.id, command });
+  return {
+    commandName,
+    candidateId: nativePromptCommandCandidateId(item.kind, item.id),
+    behaviorVersion,
+  };
+}
 
 function getCharacterCount(text: string): number {
   return Array.from(text).length;
@@ -264,35 +393,49 @@ function renderMcpPromptMessages(messages: MCPPromptMessage[]): string {
 
 export const ChatInput: React.FC<ChatInputProps> = ({
   className = '',
-  onSendMessage
+  onSendMessage,
+  isSceneActive = true,
+  registration,
 }) => {
   const { t } = useTranslation('flow-chat');
+  const { t: tWorktrees } = useI18n('worktrees');
   const canLaunchReview = isTauriRuntime();
   
-  const [inputState, dispatchInput] = useReducer(inputReducer, initialInputState);
+  const [inputState, dispatchLocalInput] = useReducer(inputReducer, initialInputState);
   const [modeState, dispatchMode] = useReducer(modeReducer, initialModeState);
   
-  const richTextInputRef = useRef<HTMLDivElement>(null);
+  const richTextInputRef = useRef<RichTextInputElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const agentBoostRef = useRef<HTMLDivElement>(null);
   const isImeComposingRef = useRef(false);
   // Ref so the queuedInput sync effect can read the latest value without it being a dep
   const inputValueRef = useRef('');
   const pendingLargePastesRef = useRef<PendingLargePasteMap>({});
+  const composerMutationRevisionsRef = useRef(new Map<string, number>());
+  const isRestoringSessionDraftRef = useRef(false);
+  const sessionConflictRetryBaselinesRef = useRef(new Map<string, number>());
   const reviewLaunchPendingRef = useRef(false);
   const largePasteCountersRef = useRef<Record<number, number>>({});
   const undoImageStackRef = useRef<string[]>([]);
+  const nativePromptModeSelectionGenerationRef = useRef(0);
+  const nativePromptModeSelectionQueueRef = useRef<Promise<void>>(Promise.resolve());
   
   // History navigation state
   const [historyIndex, setHistoryIndex] = useState(-1);
   const [savedDraft, setSavedDraft] = useState('');
   const [inputTarget, setInputTarget] = useState<ChatInputTarget>('main');
+  const [toolPermissionConfig, setToolPermissionConfig] = useState<ToolPermissionConfig>(
+    DEFAULT_TOOL_PERMISSION_CONFIG,
+  );
+  const [permissionModeSaving, setPermissionModeSaving] = useState(false);
+  const [showPermissionModeControl, setShowPermissionModeControl] = useState(true);
   const { addMessage: addToHistory, getSessionHistory } = useInputHistoryStore();
   
   const contexts = useContextStore(state => state.contexts);
   const addContext = useContextStore(state => state.addContext);
   const removeContext = useContextStore(state => state.removeContext);
   const clearContexts = useContextStore(state => state.clearContexts);
+  const replaceContexts = useContextStore(state => state.replaceContexts);
 
   const contextsRef = useRef(contexts);
   contextsRef.current = contexts;
@@ -316,23 +459,81 @@ export const ChatInput: React.FC<ChatInputProps> = ({
     : undefined;
   const effectiveTargetSessionId =
     inputTarget === 'btw' && activeBtwSessionId ? activeBtwSessionId : currentSessionId;
+  const effectiveTargetSessionIdRef = useRef<string | null>(effectiveTargetSessionId);
+  effectiveTargetSessionIdRef.current = effectiveTargetSessionId;
+
+  const markComposerMutation = useCallback(() => {
+    const sessionId = effectiveTargetSessionIdRef.current;
+    if (!sessionId) return;
+    const revisions = composerMutationRevisionsRef.current;
+    revisions.set(sessionId, (revisions.get(sessionId) ?? 0) + 1);
+  }, []);
+  const composerMutationRevision = useCallback(
+    (sessionId: string) => composerMutationRevisionsRef.current.get(sessionId) ?? 0,
+    [],
+  );
+
+  useComposerDefaultFocus({
+    editorRef: richTextInputRef,
+    sessionId: effectiveTargetSessionId,
+    isSceneActive,
+  });
+
+  const dispatchInput = useCallback((action: InputAction) => {
+    const changesValue = (action.type === 'SET_VALUE' && action.payload !== inputValueRef.current)
+      || (action.type === 'CLEAR_VALUE' && inputValueRef.current !== '');
+    if (changesValue) {
+      nativePromptModeSelectionGenerationRef.current += 1;
+      markComposerMutation();
+    }
+    dispatchLocalInput(action);
+
+    const sessionId = effectiveTargetSessionIdRef.current;
+    if (!sessionId) {
+      return;
+    }
+
+    if (action.type === 'SET_VALUE') {
+      inputValueRef.current = action.payload;
+      sessionComposerStore.getState().setValue(sessionId, action.payload);
+    } else if (action.type === 'CLEAR_VALUE') {
+      inputValueRef.current = '';
+      sessionComposerStore.getState().setValue(sessionId, '');
+    }
+  }, [markComposerMutation]);
   const effectiveTargetSession = effectiveTargetSessionId
     ? flowChatState.sessions.get(effectiveTargetSessionId)
     : undefined;
+  const dispatchObserverJob = dispatchJobStore(state => {
+    const jobId = effectiveTargetSession?.config.dispatchJobId;
+    return jobId ? state.jobs[jobId] : undefined;
+  });
+  const effectiveTargetRelationship = resolveSessionRelationship(effectiveTargetSession);
+  const isBtwSession = effectiveTargetRelationship.displayAsChild;
+  const isSubagentInputTarget = effectiveTargetRelationship.isSubagent;
+  const caps = useComposerCapabilities({
+    sessionId: effectiveTargetSessionId,
+    session: effectiveTargetSession,
+    hostMasksDispatch: !!registration,
+    displayAsChild: isBtwSession,
+  });
   const historySessionOpenTransition = useSyncExternalStore(
     subscribeHistorySessionOpenTransition,
     getHistorySessionOpenTransitionSnapshot,
     getHistorySessionOpenTransitionSnapshot,
   );
-  const effectiveTargetRelationship = resolveSessionRelationship(effectiveTargetSession);
-  const isBtwSession = effectiveTargetRelationship.displayAsChild;
-  const isSubagentInputTarget = effectiveTargetRelationship.isSubagent;
   const acpSessionForInput = useMemo(
     () => acpSessionRef(effectiveTargetSession),
     [effectiveTargetSession],
   );
   const { commands: acpAgentCommands } = useAcpSlashCommands(acpSessionForInput);
   const isAcpInputSession = Boolean(acpSessionForInput);
+  const reloadContextSupported = supportsLocalReloadContext({
+    desktopRuntime: isTauriRuntime(),
+    acpSession: isAcpInputSession,
+    dispatchTransport: caps.dispatchTransport,
+  });
+  const canReloadContext = reloadContextSupported && Boolean(effectiveTargetSessionId);
   const { entries: acpPlanEntries } = useAcpPlan(acpSessionForInput?.sessionId ?? null);
   const threadGoalController = useThreadGoalController(effectiveTargetSession, {
     isBtwSession,
@@ -599,7 +800,25 @@ export const ChatInput: React.FC<ChatInputProps> = ({
     }
 
     let rafId: number | null = null;
-    const observer = new ResizeObserver(() => {
+    // Only width feeds the capsule measurement, and re-measuring clones the whole
+    // composer into the document (two forced layouts). The box height animates on
+    // every capsule ↔ multi-line flip, so reacting to height would run that clone
+    // once per frame of the transition — exactly while the user is typing at the
+    // wrap boundary. Ignore entries whose width is unchanged.
+    const lastObservedWidths = new WeakMap<Element, number>();
+    const observer = new ResizeObserver(entries => {
+      let widthChanged = false;
+      for (const entry of entries) {
+        const width = entry.contentRect.width;
+        const previousWidth = lastObservedWidths.get(entry.target);
+        if (previousWidth === undefined || Math.abs(previousWidth - width) >= 0.5) {
+          widthChanged = true;
+        }
+        lastObservedWidths.set(entry.target, width);
+      }
+      if (!widthChanged) {
+        return;
+      }
       if (rafId !== null) {
         cancelAnimationFrame(rafId);
       }
@@ -639,21 +858,78 @@ export const ChatInput: React.FC<ChatInputProps> = ({
 
   const { transition, setQueuedInput } = useSessionStateMachineActions(effectiveTargetSessionId);
 
-  const { workspace, workspacePath, workspaceName } = useCurrentWorkspace();
+  const {
+    workspace,
+    workspacePath: currentWorkspacePath,
+    workspaceName: currentWorkspaceName,
+  } = useCurrentWorkspace();
+  // A host that explicitly registers workspacePath owns the composer
+  // workspace. Even an empty registered path is intentional isolation and
+  // must not leak the user's active project into an Agentic MiniApp surface.
+  const hasRegisteredWorkspace = Boolean(
+    registration && Object.prototype.hasOwnProperty.call(registration, 'workspacePath'),
+  );
+  const workspacePath = hasRegisteredWorkspace
+    ? (registration?.workspacePath || '').trim()
+    : currentWorkspacePath;
+  const workspaceName = hasRegisteredWorkspace
+    ? (workspacePath ? path.basename(workspacePath) : '')
+    : currentWorkspaceName;
+  const sessionBoundWorkspacePath = (
+    (!hasRegisteredWorkspace && effectiveTargetSession?.workspacePath)
+    || workspacePath
+    || ''
+  ).trim();
+  const workspacePathRef = useRef(sessionBoundWorkspacePath);
+  workspacePathRef.current = sessionBoundWorkspacePath;
   const { openedWorkspaces } = useWorkspaceContext();
 
   const chatStripRepositoryPath = useMemo(() => {
+    const fromSession = hasRegisteredWorkspace
+      ? ''
+      : (effectiveTargetSession?.workspacePath || '').trim();
     const fromContext = (workspacePath || '').trim();
-    const fromSession = (effectiveTargetSession?.workspacePath || '').trim();
-    return fromContext || fromSession;
-  }, [workspacePath, effectiveTargetSession?.workspacePath]);
+    return fromSession || fromContext;
+  }, [hasRegisteredWorkspace, workspacePath, effectiveTargetSession?.workspacePath]);
 
   const chatStripWorkspaceLabel = useMemo(() => {
     const name = (workspaceName || '').trim();
-    if (name) return name;
+    const sessionPath = hasRegisteredWorkspace
+      ? ''
+      : (effectiveTargetSession?.workspacePath || '').trim();
+    const contextPath = (workspacePath || '').trim();
+    // A managed worktree is where the session executes, not a different project.
+    // Its directory is a generated id, so keep labelling by the owning project.
+    const sessionProjectPath = hasRegisteredWorkspace
+      ? ''
+      : (
+        effectiveTargetSession?.config.projectWorkspacePath
+        || effectiveTargetSession?.projectWorkspacePath
+        || ''
+      ).trim();
+    const isWorktreeSession = !!effectiveTargetSession?.config.executionTarget?.worktreeId;
+    const sessionUsesDifferentRoot = !!sessionPath
+      && (!contextPath || !isSamePath(sessionPath, contextPath))
+      && !(
+        isWorktreeSession
+        && !!contextPath
+        && !!sessionProjectPath
+        && isSamePath(sessionProjectPath, contextPath)
+      );
+    if (name && !sessionUsesDifferentRoot) return name;
+    if (isWorktreeSession && sessionProjectPath) return path.basename(sessionProjectPath);
     if (chatStripRepositoryPath) return path.basename(chatStripRepositoryPath);
     return '';
-  }, [workspaceName, chatStripRepositoryPath]);
+  }, [
+    chatStripRepositoryPath,
+    effectiveTargetSession?.config.executionTarget?.worktreeId,
+    effectiveTargetSession?.config.projectWorkspacePath,
+    effectiveTargetSession?.projectWorkspacePath,
+    effectiveTargetSession?.workspacePath,
+    hasRegisteredWorkspace,
+    workspaceName,
+    workspacePath,
+  ]);
   
   const [tokenUsage, setTokenUsage] = React.useState<ContextUsageDisplay>(
     getSessionContextUsageDisplay()
@@ -676,6 +952,13 @@ export const ChatInput: React.FC<ChatInputProps> = ({
     [effectiveTargetSession]
   );
   const isAcpTargetSession = Boolean(acpTargetAgentType);
+  const permissionMode: ChatInputPermissionMode = isAcpTargetSession
+    ? 'acp'
+    : toolPermissionConfig.policy.preset === 'full_access'
+      ? 'full_access'
+      : toolPermissionConfig.interaction.auto_approve_ask
+        ? 'auto'
+        : 'ask';
   const activeSessionMode = effectiveTargetSessionId
     ? acpTargetAgentType || flowChatState.sessions.get(effectiveTargetSessionId)?.mode
     : undefined;
@@ -721,24 +1004,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({
   const [targetModeEnabledTools, setTargetModeEnabledTools] = useState<string[] | null>(null);
   const [userDefaultModeId, setUserDefaultModeId] = useState<string | null>(null);
   const [defaultModeSavingId, setDefaultModeSavingId] = useState<string | null>(null);
-  const [computerUseEnabled, setComputerUseEnabled] = useState(true);
-
-  useEffect(() => {
-    let cancelled = false;
-    const loadComputerUseEnabled = () => {
-      void configManager.getConfig<boolean>('ai.computer_use_enabled').then((enabled) => {
-        if (!cancelled) setComputerUseEnabled(enabled ?? false);
-      });
-    };
-    loadComputerUseEnabled();
-    const unsubscribe = configManager.onConfigChange((path) => {
-      if (path === 'ai.computer_use_enabled' || path === 'ai') loadComputerUseEnabled();
-    });
-    return () => {
-      cancelled = true;
-      unsubscribe();
-    };
-  }, []);
+  const { computerUseEnabled } = useComputerUseEnabled();
 
   const [skillsFlyoutOpen, setSkillsFlyoutOpen] = useState(false);
   const [skillsFlyoutLeft, setSkillsFlyoutLeft] = useState(false);
@@ -785,9 +1051,9 @@ export const ChatInput: React.FC<ChatInputProps> = ({
   const setChatInputActive = useChatInputState(state => state.setActive);
   const setChatInputExpanded = useChatInputState(state => state.setExpanded);
   const setChatInputHeight = useChatInputState(state => state.setInputHeight);
-  const runtimeResolvedSkills = useMemo(
-    // Only surface skills that this mode will actually resolve at runtime.
-    () => resolvedModeSkills.filter(skill => skill.selectedForRuntime),
+  const userInvocableSkills = useMemo(
+    // Management keeps the full catalog; invocation surfaces apply both runtime and author visibility.
+    () => resolvedModeSkills.filter(isSkillAvailableForUserInvocation),
     [resolvedModeSkills]
   );
 
@@ -812,7 +1078,10 @@ export const ChatInput: React.FC<ChatInputProps> = ({
               `${s.remoteConnectionId ?? ''}|${s.remoteSshHost ?? ''}|${s.lastSubmittedMode ?? ''}|` +
               `${s.currentAcpContextUsage?.used ?? ''}|${s.currentAcpContextUsage?.size ?? ''}|` +
               `${s.currentTokenUsage?.inputTokens ?? ''}|${s.maxContextTokens ?? ''}|` +
-              `${s.needsUserAttention ? '1':'0'}`
+              `${s.needsUserAttention ? '1':'0'}|${s.dialogTurns.length}|` +
+              `${JSON.stringify(s.config.dispatchTarget ?? null)}|` +
+              `${s.config.dispatchApprovalPolicy ?? ''}|${s.config.dispatchJobState ?? ''}|` +
+              `${sessionWorktreeBindingSubscriptionKey(s)}`
             );
           }
         }
@@ -861,23 +1130,6 @@ export const ChatInput: React.FC<ChatInputProps> = ({
     setHistoryIndex(-1);
   }, [effectiveTargetSessionId]);
   
-  const { sendMessage } = useMessageSender({
-    currentSessionId: effectiveTargetSessionId || undefined,
-    contexts,
-    onClearContexts: clearContexts,
-    onSuccess: onSendMessage,
-    currentAgentType: resolveChatInputSendAgentType({
-      isSubagentTarget: isSubagentInputTarget,
-      subagentType: effectiveTargetSession?.subagentType,
-      sessionMode: effectiveTargetSession?.mode,
-      acpTargetAgentType,
-      // Composer mode is authoritative for normal sessions (synced from session
-      // on switch, updated in applyModeChange). Subagent continuations keep the
-      // child session's own agent type instead of inheriting the parent composer.
-      composerMode: modeState.current,
-    }),
-  });
-
   const modeInfoById = useMemo(
     () => new Map(modeState.available.map(mode => [mode.id, mode])),
     [modeState.available],
@@ -906,7 +1158,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({
     acpTargetAgentType,
     composerMode: currentMode,
   });
-  const targetWorkspacePath = (workspacePath || effectiveTargetSession?.workspacePath || '').trim();
+  const targetWorkspacePath = sessionBoundWorkspacePath;
 
   useEffect(() => {
     if (!isSubagentInputTarget) {
@@ -1051,6 +1303,98 @@ export const ChatInput: React.FC<ChatInputProps> = ({
 
   const [mcpPromptCommands, setMcpPromptCommands] = useState<SlashMcpPromptItem[]>([]);
   const [mcpPromptCommandsLoading, setMcpPromptCommandsLoading] = useState(false);
+  const [externalPromptCommands, setExternalPromptCommands] = useState<SlashExternalPromptCommandItem[]>([]);
+  const [externalPromptCommandsLoading, setExternalPromptCommandsLoading] = useState(false);
+  const [externalPromptCommandsPending, setExternalPromptCommandsPending] = useState(false);
+  const [externalPromptCommandsIssue, setExternalPromptCommandsIssue] = useState<ExternalPromptCommandCatalogIssue>();
+  const [selectedExternalPromptCandidateId, setSelectedExternalPromptCandidateId] = useState<string>();
+  const [selectedNonExternalSlashCommand, setSelectedNonExternalSlashCommand] = useState<string>();
+  const [selectedNonExternalSlashCandidateId, setSelectedNonExternalSlashCandidateId] = useState<string>();
+  const externalPromptCatalogRequestRef = useRef(0);
+
+  const refreshExternalPromptCommands = useCallback(async (
+    showLoading: boolean,
+    forceRefresh = false,
+  ) => {
+    const requestId = ++externalPromptCatalogRequestRef.current;
+    if (isAcpInputSession) {
+      setExternalPromptCommands([]);
+      setExternalPromptCommandsPending(false);
+      setExternalPromptCommandsIssue(undefined);
+      setExternalPromptCommandsLoading(false);
+      return undefined;
+    }
+    if (showLoading) {
+      setExternalPromptCommandsLoading(true);
+    }
+    try {
+      const snapshot = await externalSourcesAPI.getSnapshot(
+        sessionBoundWorkspacePath || undefined,
+        forceRefresh,
+      );
+      if (requestId !== externalPromptCatalogRequestRef.current) return undefined;
+      setExternalPromptCommands(toSlashExternalPromptCommands(snapshot));
+      setExternalPromptCommandsPending(snapshot.discoveryPending);
+      setExternalPromptCommandsIssue(undefined);
+      return snapshot;
+    } catch (error) {
+      if (requestId !== externalPromptCatalogRequestRef.current) return undefined;
+      const issue = classifyExternalPromptCommandCatalogIssue(error);
+      setExternalPromptCommands([]);
+      setSelectedExternalPromptCandidateId(undefined);
+      setExternalPromptCommandsIssue(issue);
+      setExternalPromptCommandsPending(false);
+      if (issue === 'host_unavailable') {
+        log.debug('External prompt commands are unavailable on this host', {
+          code: error instanceof ExternalSourceApiError ? error.code : 'internal',
+        });
+      } else {
+        log.warn('Failed to load external prompt command catalog', {
+          code: error instanceof ExternalSourceApiError ? error.code : 'internal',
+        });
+      }
+      return undefined;
+    } finally {
+      if (showLoading && requestId === externalPromptCatalogRequestRef.current) {
+        setExternalPromptCommandsLoading(false);
+      }
+    }
+  }, [isAcpInputSession, sessionBoundWorkspacePath]);
+
+  useEffect(() => {
+    externalPromptCatalogRequestRef.current += 1;
+    setExternalPromptCommands([]);
+    setExternalPromptCommandsPending(false);
+    setExternalPromptCommandsIssue(undefined);
+    setSelectedExternalPromptCandidateId(undefined);
+    setSelectedNonExternalSlashCommand(undefined);
+    setSelectedNonExternalSlashCandidateId(undefined);
+    void refreshExternalPromptCommands(true);
+
+    return () => {
+      externalPromptCatalogRequestRef.current += 1;
+    };
+  }, [refreshExternalPromptCommands]);
+
+  useEffect(() => {
+    if (!externalPromptCommandsPending) return undefined;
+    let cancelled = false;
+    let timer: number | undefined;
+    let attempt = 0;
+    const schedulePoll = () => {
+      timer = window.setTimeout(async () => {
+        const snapshot = await refreshExternalPromptCommands(false);
+        if (cancelled || !snapshot || !snapshot.discoveryPending) return;
+        attempt += 1;
+        schedulePoll();
+      }, externalSourceDiscoveryPollDelay(attempt));
+    };
+    schedulePoll();
+    return () => {
+      cancelled = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [externalPromptCommandsPending, refreshExternalPromptCommands]);
 
   const loadMcpPromptCommands = useCallback(async () => {
     setMcpPromptCommandsLoading(true);
@@ -1136,6 +1480,15 @@ export const ChatInput: React.FC<ChatInputProps> = ({
     selectedIndex: 0,
   });
 
+  const slashPickerWasActiveRef = useRef(false);
+  useEffect(() => {
+    const opening = slashCommandState.isActive && !slashPickerWasActiveRef.current;
+    slashPickerWasActiveRef.current = slashCommandState.isActive;
+    if (opening && !externalPromptCommandsLoading && !externalPromptCommandsPending) {
+      void refreshExternalPromptCommands(false);
+    }
+  }, [externalPromptCommandsLoading, externalPromptCommandsPending, refreshExternalPromptCommands, slashCommandState.isActive]);
+
   // Keep the module-level popup-active flag in sync so ModernFlowChatContainer
   // can disable the global Escape shortcut while popups are open.
   useEffect(() => {
@@ -1163,6 +1516,17 @@ export const ChatInput: React.FC<ChatInputProps> = ({
   ]);
 
   useEffect(() => {
+    const inlineCommandQuery = getInlineSlashCommandPickerQuery(inlineTriggerState);
+    if (inlineCommandQuery !== null) {
+      setSlashCommandState(prev => ({
+        isActive: true,
+        kind: derivedState?.isProcessing && !isAcpInputSession ? 'actions' : 'all',
+        query: inlineCommandQuery,
+        selectedIndex: prev.query === inlineCommandQuery ? prev.selectedIndex : 0,
+      }));
+      return;
+    }
+
     if (isAcpInputSession || !canUseSkillsForTarget) {
       if (slashCommandState.isActive && slashCommandState.kind === 'skills') {
         setSlashCommandState({ isActive: false, kind: 'modes', query: '', selectedIndex: 0 });
@@ -1193,11 +1557,192 @@ export const ChatInput: React.FC<ChatInputProps> = ({
     if (slashCommandState.isActive && slashCommandState.kind === 'skills') {
       setSlashCommandState({ isActive: false, kind: 'modes', query: '', selectedIndex: 0 });
     }
-  }, [canUseSkillsForTarget, inlineTriggerState, isAcpInputSession, slashCommandState.isActive, slashCommandState.kind]);
+  }, [canUseSkillsForTarget, derivedState?.isProcessing, inlineTriggerState, isAcpInputSession, slashCommandState.isActive, slashCommandState.kind]);
+
+  const previousComposerSessionIdRef = useRef<string | null>(null);
+
+  React.useLayoutEffect(() => {
+    const previousSessionId = previousComposerSessionIdRef.current;
+    const draft = sessionComposerStore.getState().activateDraft(
+      previousSessionId,
+      effectiveTargetSessionId,
+      useContextStore.getState().contexts,
+    );
+    previousComposerSessionIdRef.current = effectiveTargetSessionId;
+
+    const nextValue = draft.value;
+    const nextContexts = draft.contexts;
+    const nextPendingLargePastes = draft.pendingLargePastes;
+
+    dispatchLocalInput({ type: 'SET_VALUE', payload: nextValue });
+    inputValueRef.current = nextValue;
+    pendingLargePastesRef.current = { ...nextPendingLargePastes };
+    isRestoringSessionDraftRef.current = true;
+    try {
+      replaceContexts(nextContexts);
+    } finally {
+      isRestoringSessionDraftRef.current = false;
+    }
+    setHistoryIndex(-1);
+    setSavedDraft('');
+    setMentionState({ isActive: false, query: '', startOffset: 0 });
+    setInlineTriggerState({
+      isActive: false,
+      trigger: null,
+      query: '',
+      startOffset: 0,
+    });
+    setSlashCommandState({
+      isActive: false,
+      kind: 'modes',
+      query: '',
+      selectedIndex: 0,
+    });
+  }, [effectiveTargetSessionId, replaceContexts]);
+
+  useEffect(() => {
+    let previousContexts = useContextStore.getState().contexts;
+    const unsubscribe = useContextStore.subscribe((state) => {
+      if (shouldRecordContextMutation(
+        state.contexts !== previousContexts,
+        isRestoringSessionDraftRef.current,
+      )) {
+        markComposerMutation();
+      }
+      previousContexts = state.contexts;
+      const sessionId = effectiveTargetSessionIdRef.current;
+      if (sessionId) {
+        sessionComposerStore.getState().setContexts(sessionId, state.contexts);
+      }
+    });
+
+    return () => {
+      const sessionId = effectiveTargetSessionIdRef.current;
+      if (sessionId) {
+        sessionComposerStore.getState().setContexts(
+          sessionId,
+          useContextStore.getState().contexts,
+        );
+      }
+      unsubscribe();
+    };
+  }, [markComposerMutation]);
+
+  const replacePendingLargePastes = useCallback((pendingLargePastes: PendingLargePasteMap) => {
+    const nextPendingLargePastes = { ...pendingLargePastes };
+    const previousPendingLargePastes = pendingLargePastesRef.current;
+    const previousKeys = Object.keys(previousPendingLargePastes);
+    const nextKeys = Object.keys(nextPendingLargePastes);
+    if (
+      previousKeys.length !== nextKeys.length ||
+      nextKeys.some(key => previousPendingLargePastes[key] !== nextPendingLargePastes[key])
+    ) {
+      markComposerMutation();
+    }
+    pendingLargePastesRef.current = nextPendingLargePastes;
+
+    const sessionId = effectiveTargetSessionIdRef.current;
+    if (sessionId) {
+      sessionComposerStore.getState().setPendingLargePastes(sessionId, nextPendingLargePastes);
+    }
+  }, [markComposerMutation]);
 
   const clearPendingLargePastes = useCallback(() => {
-    pendingLargePastesRef.current = {};
-  }, []);
+    replacePendingLargePastes({});
+  }, [replacePendingLargePastes]);
+
+  const { sendMessage } = useMessageSender({
+    currentSessionId: effectiveTargetSessionId || undefined,
+    contexts,
+    onClearContexts: clearContexts,
+    onSuccess: onSendMessage,
+    onSessionConflictRetryStart: ({ sessionId }) => {
+      sessionConflictRetryBaselinesRef.current.set(
+        sessionId,
+        composerMutationRevision(sessionId),
+      );
+    },
+    onSessionConflictRetrySuccess: ({ sessionId, message, contextIds }) => {
+      const baselineRevision = sessionConflictRetryBaselinesRef.current.get(sessionId);
+      sessionConflictRetryBaselinesRef.current.delete(sessionId);
+      const isCurrentSession = effectiveTargetSessionIdRef.current === sessionId;
+      const draft = isCurrentSession
+        ? {
+            value: inputValueRef.current,
+            contexts: contextsRef.current,
+          }
+        : sessionComposerStore.getState().getDraft(sessionId);
+      const cleanupTarget = baselineRevision !== undefined
+        ? successfulRetryCleanupTarget(
+            sessionId,
+            effectiveTargetSessionIdRef.current,
+            baselineRevision,
+            composerMutationRevision(sessionId),
+            draft.value,
+            draft.contexts.map(context => context.id),
+            message,
+            contextIds,
+          )
+        : 'none';
+
+      if (cleanupTarget === 'current') {
+        clearContexts();
+        clearPendingLargePastes();
+        dispatchInput({ type: 'CLEAR_VALUE' });
+        setQueuedInput(null);
+        dispatchInput({ type: 'DEACTIVATE' });
+      } else if (cleanupTarget === 'stored') {
+        sessionComposerStore.getState().clearDraft(sessionId);
+      }
+      onSendMessage?.(message);
+    },
+    currentAgentType: resolveChatInputSendAgentType({
+      isSubagentTarget: isSubagentInputTarget,
+      subagentType: effectiveTargetSession?.subagentType,
+      sessionMode: effectiveTargetSession?.mode,
+      acpTargetAgentType,
+      // Composer mode is authoritative for normal sessions (synced from session
+      // on switch, updated in applyModeChange). Subagent continuations keep the
+      // child session's own agent type instead of inheriting the parent composer.
+      composerMode: modeState.current,
+    }),
+  });
+
+  const consumedRegisteredDraftRef = useRef<{
+    registrationId?: string;
+    draftId: number;
+  } | null>(null);
+  React.useEffect(() => {
+    const draft = registration?.draft;
+    const consumed = consumedRegisteredDraftRef.current;
+    if (
+      !draft
+      || (
+        consumed
+        && consumed.registrationId === registration?.registrationId
+        && consumed.draftId === draft.id
+      )
+    ) {
+      return;
+    }
+
+    consumedRegisteredDraftRef.current = {
+      registrationId: registration?.registrationId,
+      draftId: draft.id,
+    };
+    clearPendingLargePastes();
+    replaceContexts([]);
+    dispatchInput({ type: 'ACTIVATE' });
+    dispatchInput({ type: 'SET_VALUE', payload: draft.text });
+    inputValueRef.current = draft.text;
+    richTextInputRef.current?.focus();
+    registration.onDraftConsumed?.(draft.id);
+  }, [
+    clearPendingLargePastes,
+    dispatchInput,
+    registration,
+    replaceContexts,
+  ]);
 
   const createLargePastePlaceholder = useCallback((text: string): string | null => {
     const charCount = getCharacterCount(text);
@@ -1214,13 +1759,13 @@ export const ChatInput: React.FC<ChatInputProps> = ({
     });
     const placeholder = nextSuffix === 1 ? base : `${base} #${nextSuffix}`;
 
-    pendingLargePastesRef.current = {
+    replacePendingLargePastes({
       ...pendingLargePastesRef.current,
       [placeholder]: text,
-    };
+    });
 
     return placeholder;
-  }, [t]);
+  }, [replacePendingLargePastes, t]);
 
   const prunePendingLargePastes = useCallback((text: string) => {
     const entries = Object.entries(pendingLargePastesRef.current);
@@ -1228,10 +1773,10 @@ export const ChatInput: React.FC<ChatInputProps> = ({
       return;
     }
 
-    pendingLargePastesRef.current = Object.fromEntries(
+    replacePendingLargePastes(Object.fromEntries(
       entries.filter(([placeholder]) => text.includes(placeholder))
-    );
-  }, []);
+    ));
+  }, [replacePendingLargePastes]);
 
   const expandPendingLargePastes = useCallback((text: string) => {
     let expanded = text;
@@ -1274,12 +1819,13 @@ export const ChatInput: React.FC<ChatInputProps> = ({
     return () => {
       window.removeEventListener('fill-chat-input', handleFillInput);
     };
-  }, [clearPendingLargePastes]);
+  }, [clearPendingLargePastes, dispatchInput]);
 
   React.useEffect(() => {
     const handleFillChatInput = (data: {
       content?: string;
       context?: ContextItem;
+      composerPresentation?: ComposerPresentation;
       onlyIfEmpty?: boolean;
       mode?: 'replace' | 'append';
       separator?: string;
@@ -1298,6 +1844,19 @@ export const ChatInput: React.FC<ChatInputProps> = ({
           input.focus();
           input.insertTag?.(data.context);
         }
+        return;
+      }
+
+      const composerPresentation = parseComposerPresentation(data.composerPresentation);
+      if (composerPresentation && data.mode !== 'append') {
+        const restoredValue = composerPresentationToEditorText(composerPresentation);
+        replaceContexts(composerPresentationContexts(composerPresentation));
+        clearPendingLargePastes();
+        dispatchInput({ type: 'ACTIVATE' });
+        dispatchInput({ type: 'SET_VALUE', payload: restoredValue });
+        inputValueRef.current = restoredValue;
+        richTextInputRef.current?.restoreComposerPresentation?.(composerPresentation);
+        richTextInputRef.current?.focus();
         return;
       }
 
@@ -1333,7 +1892,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({
     return () => {
       globalEventBus.off('fill-chat-input', handleFillChatInput);
     };
-  }, [addContext, clearPendingLargePastes]);
+  }, [addContext, clearPendingLargePastes, dispatchInput, replaceContexts]);
 
   // Expose current input value for external queries (e.g. deep review fill-back confirmation)
   React.useEffect(() => {
@@ -1347,6 +1906,311 @@ export const ChatInput: React.FC<ChatInputProps> = ({
       globalEventBus.off('chat-input:get-state', handleGetChatInputState);
     };
   }, []);
+
+  React.useEffect(() => {
+    const configPath = 'app.flow_chat.show_permission_mode_control';
+    let cancelled = false;
+    const applyVisibility = (value: unknown) => {
+      if (!cancelled) {
+        setShowPermissionModeControl(value !== false);
+      }
+    };
+    const loadVisibility = async () => {
+      try {
+        applyVisibility(await configManager.getOptionalConfig<boolean>(configPath));
+      } catch (error) {
+        log.warn('Failed to load permission mode control visibility preference', error);
+        applyVisibility(true);
+      }
+    };
+
+    void loadVisibility();
+    const unsubscribe = configManager.onConfigChange((path, _oldValue, value) => {
+      if (path === configPath) {
+        applyVisibility(value);
+      }
+    });
+    return () => {
+      cancelled = true;
+      unsubscribe();
+    };
+  }, []);
+
+  React.useEffect(() => {
+    let cancelled = false;
+    const applyConfig = (config: ToolPermissionConfig) => {
+      if (!cancelled) {
+        setToolPermissionConfig(config);
+      }
+    };
+    const loadConfig = async () => {
+      applyConfig(await permissionConfigService.getConfig());
+    };
+    const handlePermissionConfigUpdated = (value?: ToolPermissionConfig) => {
+      if (value) {
+        applyConfig(normalizeToolPermissionConfig(value));
+      } else {
+        void loadConfig();
+      }
+    };
+
+    void loadConfig();
+    globalEventBus.on('permission:config:updated', handlePermissionConfigUpdated);
+    return () => {
+      cancelled = true;
+      globalEventBus.off('permission:config:updated', handlePermissionConfigUpdated);
+    };
+  }, []);
+
+  const handlePermissionModeChange = useCallback(async (
+    nextMode: Exclude<ChatInputPermissionMode, 'acp'>,
+  ) => {
+    if (permissionModeSaving || isAcpTargetSession) return;
+    if (nextMode === 'full_access') {
+      const confirmed = await confirmDanger(
+        t('chatInput.permissionMode.fullAccessWarningTitle'),
+        t('chatInput.permissionMode.fullAccessWarningMessage'),
+        {
+          confirmText: t('chatInput.permissionMode.fullAccessConfirm'),
+          cancelText: t('chatInput.permissionMode.cancel'),
+        },
+      );
+      if (!confirmed) return;
+    }
+
+    const previousConfig = toolPermissionConfig;
+    const nextConfig: ToolPermissionConfig = {
+      policy: {
+        ...previousConfig.policy,
+        preset: nextMode === 'full_access' ? 'full_access' : 'ask',
+      },
+      interaction: {
+        ...previousConfig.interaction,
+        auto_approve_ask: nextMode === 'auto',
+      },
+    };
+    setToolPermissionConfig(nextConfig);
+    setPermissionModeSaving(true);
+    try {
+      const saved = await permissionConfigService.saveConfig(nextConfig);
+      setToolPermissionConfig(saved);
+    } catch (error) {
+      log.error('Failed to change permission mode', error);
+      setToolPermissionConfig(previousConfig);
+      notificationService.error(t('chatInput.permissionMode.changeFailed'));
+    } finally {
+      setPermissionModeSaving(false);
+    }
+  }, [isAcpTargetSession, permissionModeSaving, t, toolPermissionConfig]);
+
+  const dispatchPermissionMode: ChatInputPermissionMode =
+    effectiveTargetSession?.config.dispatchApprovalPolicy === 'auto'
+      ? 'auto'
+      : effectiveTargetSession?.config.dispatchApprovalPolicy === 'reject-and-report'
+        ? 'reject'
+        : 'ask';
+  const dispatchSubmissionOptionsLocked = caps.submissionOptionsLocked;
+  const handleDispatchPermissionModeChange = useCallback((
+    nextMode: Exclude<ChatInputPermissionMode, 'acp'>,
+  ) => {
+    if (!effectiveTargetSessionId || dispatchSubmissionOptionsLocked) {
+      return;
+    }
+    const approvalPolicy =
+      nextMode === 'auto' || nextMode === 'full_access'
+        ? 'auto'
+        : nextMode === 'reject'
+          ? 'reject-and-report'
+          : 'remote';
+    FlowChatStore.getInstance().updateSessionDispatchApprovalPolicy(
+      effectiveTargetSessionId,
+      approvalPolicy,
+    );
+    const jobId = effectiveTargetSession?.config.dispatchJobId;
+    if (jobId) {
+      dispatchJobStore.getState().updateApprovalPolicy(jobId, approvalPolicy);
+    }
+  }, [
+    dispatchSubmissionOptionsLocked,
+    effectiveTargetSession?.config.dispatchJobId,
+    effectiveTargetSessionId,
+  ]);
+
+  /**
+   * Checking worktree isolation only arms the empty session. The first prompt
+   * materializes the worktree after it has visibly been submitted.
+   */
+  const remoteWorkspaceSession =
+    isRemoteWorkspaceSession(effectiveTargetSession, workspace);
+
+  const worktreeControl = useMemo(() => {
+    if (!effectiveTargetSessionId || !effectiveTargetSession) return undefined;
+    if (remoteWorkspaceSession) return undefined;
+    if (isSubagentInputTarget || isAcpTargetSession) return undefined;
+    // A dispatch always executes against a managed worktree baseline of this
+    // repository, so the chip reports that state instead of disappearing. It is
+    // never togglable: the baseline is chosen with the target, not after.
+    if (caps.worktreeBaselineLocked) {
+      return {
+        enabled: true,
+        locked: true,
+        lockedReason: 'dispatch' as const,
+        onChange: () => {},
+      };
+    }
+
+    const locked = isSessionWorktreeBindingLocked(
+      effectiveTargetSession,
+      !!derivedState?.isProcessing,
+    );
+
+    return {
+      enabled: isSessionWorktreeIsolationEnabled(effectiveTargetSession),
+      locked,
+      onChange: (enabled: boolean) => {
+        const latestSession = FlowChatStore.getInstance()
+          .getState()
+          .sessions
+          .get(effectiveTargetSessionId);
+        if (
+          !latestSession
+          || isSessionWorktreeBindingLocked(latestSession, false)
+        ) {
+          notificationService.error(tWorktrees('strip.toggleLocked'));
+          return;
+        }
+        FlowChatStore.getInstance().setSessionWorktreeIsolationRequested(
+          effectiveTargetSessionId,
+          enabled,
+        );
+      },
+    };
+  }, [
+    effectiveTargetSession,
+    effectiveTargetSessionId,
+    derivedState?.isProcessing,
+    isAcpTargetSession,
+    isSubagentInputTarget,
+    remoteWorkspaceSession,
+    tWorktrees,
+    caps.worktreeBaselineLocked,
+  ]);
+
+  const handleSelectDispatchTarget = useCallback(async (selection: DispatchSelection) => {
+    try {
+      await FlowChatManager.getInstance().createChatSession(
+        {
+          ...flowChatSessionConfigForCurrentWorkspace(workspace),
+          dispatchTargetRequest: selection.request,
+          dispatchTarget: selection.target,
+          dispatchApprovalPolicy: selection.approvalPolicy,
+          dispatchIncludeUncommitted: selection.includeUncommitted,
+          dispatchBaseRef: selection.baseRef,
+          // Undefined is intentional: the target's probed default model wins
+          // unless a future preflight selector records an explicit choice.
+          dispatchModel: selection.model,
+          dispatchAvailableModels: selection.availableModels,
+          dispatchDefaultModel: selection.defaultModel,
+        },
+        effectiveSendAgentType,
+      );
+    } catch (error) {
+      log.error('Failed to create dispatched session projection', { error });
+      notificationService.error(t('chatInput.dispatch.createFailed'));
+    }
+  }, [effectiveSendAgentType, t, workspace]);
+
+  const dispatchControl = useMemo(() => {
+    if (
+      registration ||
+      isBtwSession ||
+      isSubagentInputTarget ||
+      isAcpInputSession ||
+      remoteWorkspaceSession
+    ) {
+      return undefined;
+    }
+    const target: DispatchTarget =
+      effectiveTargetSession?.config.dispatchTarget ?? { kind: 'local' };
+    // Syncing is available as soon as the target has a worktree to commit —
+    // that is, from the moment the job starts running. Waiting for a terminal
+    // state would block the common "let me see what it has so far" case.
+    const jobId = effectiveTargetSession?.config.dispatchJobId;
+    const jobState = effectiveTargetSession?.config.dispatchJobState;
+    const syncableJobId =
+      isNonLocalDispatchTarget(target)
+      && jobId
+      && (jobState === 'running'
+        || jobState === 'succeeded'
+        || jobState === 'failed'
+        || jobState === 'cancelled')
+        ? jobId
+        : undefined;
+    return {
+      target,
+      sourceWorkspacePath: workspacePath || undefined,
+      locked:
+        isNonLocalDispatchTarget(target) ||
+        (effectiveTargetSession?.dialogTurns.length ?? 0) > 0 ||
+        !!derivedState?.isProcessing,
+      onSelectTarget: handleSelectDispatchTarget,
+      syncableJobId,
+      branch: dispatchObserverJob?.branch,
+      baselineWorktreePath: dispatchObserverJob?.baselineWorktreePath,
+      baselineMissing: dispatchObserverJob?.baselineWorktreeMissing,
+    };
+  }, [
+    derivedState?.isProcessing,
+    effectiveTargetSession?.config.dispatchJobId,
+    effectiveTargetSession?.config.dispatchJobState,
+    effectiveTargetSession?.config.dispatchTarget,
+    effectiveTargetSession?.dialogTurns.length,
+    dispatchObserverJob?.baselineWorktreeMissing,
+    dispatchObserverJob?.baselineWorktreePath,
+    dispatchObserverJob?.branch,
+    handleSelectDispatchTarget,
+    isAcpInputSession,
+    isBtwSession,
+    isSubagentInputTarget,
+    registration,
+    remoteWorkspaceSession,
+    workspacePath,
+  ]);
+
+  const dispatchModelSelection = useMemo(() => {
+    if (!caps.targetModelSelection || !effectiveTargetSession) {
+      return undefined;
+    }
+    const target = effectiveTargetSession.config.dispatchTarget;
+    const providerLabel =
+      target && target.kind !== 'local'
+        ? target.displayName
+        : t('chatInput.dispatch.remoteTarget');
+    const sessionId = effectiveTargetSession.sessionId;
+    const jobId = effectiveTargetSession.config.dispatchJobId;
+    return {
+      models: effectiveTargetSession.config.dispatchAvailableModels ?? [],
+      selectedModelId: effectiveTargetSession.config.dispatchModel,
+      defaultModelId: effectiveTargetSession.config.dispatchDefaultModel,
+      providerLabel,
+      disabled: caps.submissionOptionsLocked,
+      onSelect: (modelId: string) => {
+        FlowChatStore.getInstance().updateSessionDispatchModel(sessionId, modelId);
+        if (jobId) {
+          dispatchJobStore.getState().updateModel(jobId, modelId);
+        }
+      },
+    };
+  }, [caps.submissionOptionsLocked, caps.targetModelSelection, effectiveTargetSession, t]);
+
+  const handleHidePermissionModeControl = useCallback(async () => {
+    try {
+      await configManager.setConfig('app.flow_chat.show_permission_mode_control', false);
+    } catch (error) {
+      log.error('Failed to hide permission mode control', error);
+      notificationService.error(t('chatInput.permissionMode.hideControlFailed'));
+    }
+  }, [t]);
 
   React.useEffect(() => {
     if (!slashCommandState.isActive || slashCommandState.kind !== 'all' || derivedState?.isProcessing) {
@@ -1441,7 +2305,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({
     return () => {
       globalEventBus.off('mcp-app:message', handleMcpAppMessage);
     };
-  }, [addContext, clearPendingLargePastes, currentImageCount]);
+  }, [addContext, clearPendingLargePastes, currentImageCount, dispatchInput]);
 
   React.useEffect(() => {
     const handleInsertContextTag = (event: Event) => {
@@ -1476,7 +2340,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({
     return () => {
       window.removeEventListener('insert-context-tag', handleInsertContextTag);
     };
-  }, [inputState.isActive]);
+  }, [dispatchInput, inputState.isActive]);
 
   React.useEffect(() => {
     const fetchAvailableModes = async () => {
@@ -1639,6 +2503,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({
     derivedState?.queuedInput,
     effectiveTargetSessionId,
     clearPendingLargePastes,
+    dispatchInput,
   ]);
 
   React.useEffect(() => {
@@ -1761,10 +2626,10 @@ export const ChatInput: React.FC<ChatInputProps> = ({
         inputElement.removeEventListener('imagePaste', handleImagePaste);
       }
     };
-  }, [addContext, currentImageCount, inputState.isActive, t]);
+  }, [addContext, currentImageCount, dispatchInput, inputState.isActive, t]);
 
   React.useEffect(() => {
-    if (!effectiveTargetSessionId || !workspacePath) {
+    if (!effectiveTargetSessionId || !sessionBoundWorkspacePath) {
       return;
     }
 
@@ -1782,20 +2647,20 @@ export const ChatInput: React.FC<ChatInputProps> = ({
       const modifiedFiles = collectModifiedFilePathsFromTurns(
         [lastTurn],
         undefined,
-        workspacePath,
+        sessionBoundWorkspacePath,
       );
 
       if (modifiedFiles.length > 0) {
         log.debug('File modifications detected, updating recommendation context', { modifiedFiles });
         setRecommendationContext({
-          workspacePath,
+          workspacePath: sessionBoundWorkspacePath,
           sessionId: effectiveTargetSessionId,
           turnIndex: lastTurn.backendTurnIndex ?? session.dialogTurns.length - 1,
           modifiedFiles,
         });
       }
     }
-  }, [effectiveTargetSessionId, workspacePath, derivedState?.isProcessing]);
+  }, [effectiveTargetSessionId, sessionBoundWorkspacePath, derivedState?.isProcessing]);
 
   const getFilteredActions = useCallback(() => {
     if (isAcpInputSession) {
@@ -1831,12 +2696,12 @@ export const ChatInput: React.FC<ChatInputProps> = ({
         command: '/usage',
         label: t('chatInput.usageAction'),
       },
-      ...(canUseSkillsForTarget
+      ...(canReloadContext
         ? [{
             kind: 'action' as const,
-            id: 'reload-skills' as const,
-            command: '/reload-skills',
-            label: t('chatInput.reloadSkillsAction'),
+            id: 'reload' as const,
+            command: '/reload',
+            label: t('chatInput.reloadAction'),
           }]
         : []),
       ...(!derivedState?.isProcessing
@@ -1857,17 +2722,22 @@ export const ChatInput: React.FC<ChatInputProps> = ({
         : []),
     ];
     const q = (slashCommandState.query || '').trim().toLowerCase();
-    const visibleItems = items.filter(item => isChatInputActionVisibleForTarget({
-      actionId: item.id,
-      isSubagentTarget: isSubagentInputTarget,
-    }));
+    // The picker offers exactly what this session can execute. Without this,
+    // an unsupported command picked from the list falls through the per-op
+    // submit gates and is sent to the agent as literal prompt text.
+    const visibleItems = items.filter(item =>
+      (item.id === 'reload' || caps.ops.has(item.id))
+      && isChatInputActionVisibleForTarget({
+        actionId: item.id,
+        isSubagentTarget: isSubagentInputTarget,
+      }));
     if (!q) return visibleItems;
 
     return visibleItems.filter(i => {
       const cmd = i.command.slice(1).toLowerCase();
       return cmd.includes(q) || i.label.toLowerCase().includes(q);
     });
-  }, [canLaunchReview, canUseSkillsForTarget, derivedState?.isProcessing, isAcpInputSession, isBtwSession, isSubagentInputTarget, slashCommandState.query, t]);
+  }, [canLaunchReview, canReloadContext, caps.ops, derivedState?.isProcessing, isAcpInputSession, isBtwSession, isSubagentInputTarget, slashCommandState.query, t]);
 
   const getFilteredMcpPromptCommands = useCallback((): SlashMcpPromptItem[] => {
     if (isAcpInputSession) {
@@ -1889,6 +2759,21 @@ export const ChatInput: React.FC<ChatInputProps> = ({
     });
   }, [isAcpInputSession, mcpPromptCommands, slashCommandState.query]);
 
+  const getFilteredExternalPromptCommands = useCallback((): SlashExternalPromptCommandItem[] => {
+    if (isAcpInputSession
+      || derivedState?.isProcessing
+      || (inlineTriggerState.isActive && inlineTriggerState.startOffset > 0)) {
+      return [];
+    }
+    const q = (slashCommandState.query || '').trim().toLowerCase();
+    if (!q) {
+      return externalPromptCommands;
+    }
+    return externalPromptCommands.filter(item =>
+      item.command.slice(1).toLowerCase().includes(q)
+        || item.label.toLowerCase().includes(q));
+  }, [derivedState?.isProcessing, externalPromptCommands, inlineTriggerState, isAcpInputSession, slashCommandState.query]);
+
   const getFilteredAcpCommands = useCallback((): SlashAcpCommandItem[] => {
     return filterSlashCommands(acpAgentCommands, slashCommandState.query).map(command => ({
       kind: 'acpCommand',
@@ -1905,7 +2790,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({
 
     const q = (slashCommandState.query || '').trim().toLowerCase();
     const seenNames = new Set<string>();
-    return runtimeResolvedSkills
+    return userInvocableSkills
       .filter(skill => {
         const normalizedName = skill.name.trim();
         const normalizedNameKey = normalizedName.toLowerCase();
@@ -1929,7 +2814,9 @@ export const ChatInput: React.FC<ChatInputProps> = ({
         kind: 'skill' as const,
         id: skill.key,
         command: `/${skill.name}`,
-        label: skill.description || skill.name,
+        label: [skill.argumentHint?.trim(), skill.description || skill.name]
+          .filter(Boolean)
+          .join(' — '),
         skillName: skill.name,
       }))
       .sort((a, b) => {
@@ -1939,7 +2826,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({
         const bExact = bName === q ? 0 : bName.startsWith(q) ? 1 : 2;
         return aExact - bExact || aName.localeCompare(bName);
       });
-  }, [canUseSkillsForTarget, runtimeResolvedSkills, slashCommandState.query]);
+  }, [canUseSkillsForTarget, slashCommandState.query, userInvocableSkills]);
 
   const resolveTypedMcpPromptCommand = useCallback((text: string): SlashMcpPromptItem | null => {
     const trimmed = text.trim();
@@ -1964,6 +2851,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({
     }
 
     const actions = getFilteredActions();
+    const externalCommands = getFilteredExternalPromptCommands();
     const mcpPrompts = getFilteredMcpPromptCommands();
     const skills = getFilteredSkills();
     let modeList = incrementalCodeModes;
@@ -1980,8 +2868,8 @@ export const ChatInput: React.FC<ChatInputProps> = ({
       id: mode.id,
       name: mode.name,
     }));
-    return [...acpCommands, ...actions, ...mcpPrompts, ...modes, ...skills];
-  }, [canSwitchModes, getFilteredActions, getFilteredAcpCommands, getFilteredMcpPromptCommands, getFilteredSkills, incrementalCodeModes, isAcpInputSession, slashCommandState.query]);
+    return [...acpCommands, ...actions, ...externalCommands, ...mcpPrompts, ...modes, ...skills];
+  }, [canSwitchModes, getFilteredActions, getFilteredAcpCommands, getFilteredExternalPromptCommands, getFilteredMcpPromptCommands, getFilteredSkills, incrementalCodeModes, isAcpInputSession, slashCommandState.query]);
 
   const getActiveSlashPickerItems = useCallback((): SlashPickerItem[] => {
     if (slashCommandState.kind === 'actions') {
@@ -2013,13 +2901,33 @@ export const ChatInput: React.FC<ChatInputProps> = ({
     dispatchInput({ type: 'SET_VALUE', payload: text });
     inputValueRef.current = text;
 
-    const localSlashCommandsEnabled = !isAcpInputSession;
+    if (selectedExternalPromptCandidateId) {
+      const selected = externalPromptCommands.find(
+        item => item.candidateId === selectedExternalPromptCandidateId,
+      );
+      if (!selected || !isSlashCommand(text.trim(), selected.command as `/${string}`)) {
+        setSelectedExternalPromptCandidateId(undefined);
+      }
+    }
+    if (selectedNonExternalSlashCommand
+      && !isSlashCommand(text.trim(), selectedNonExternalSlashCommand as `/${string}`)) {
+      setSelectedNonExternalSlashCommand(undefined);
+      setSelectedNonExternalSlashCandidateId(undefined);
+    }
+
+    const promptSlashCommandsEnabled = !isAcpInputSession;
+    const localSlashCommandsEnabled = promptSlashCommandsEnabled && caps.localSlashCommands;
     const trimmed = text.trim();
-    const isBtwCommand = localSlashCommandsEnabled && isSlashCommand(trimmed, '/btw');
-    const isCompactCommand = localSlashCommandsEnabled && isSlashCommand(trimmed, '/compact');
-    const isGoalCommand = localSlashCommandsEnabled && isGoalSlashCommand(text);
-    const isUsageCommand = localSlashCommandsEnabled && isSlashCommand(trimmed, '/usage');
-    const isReviewCommand = localSlashCommandsEnabled && isReviewSlashCommand(text);
+    const isBtwCommand =
+      promptSlashCommandsEnabled && caps.ops.has('btw') && isSlashCommand(trimmed, '/btw');
+    const isCompactCommand =
+      promptSlashCommandsEnabled && caps.ops.has('compact') && isSlashCommand(trimmed, '/compact');
+    const isGoalCommand =
+      promptSlashCommandsEnabled && caps.ops.has('goal') && isGoalSlashCommand(text);
+    const isUsageCommand =
+      promptSlashCommandsEnabled && caps.ops.has('usage') && isSlashCommand(trimmed, '/usage');
+    const isReviewCommand =
+      promptSlashCommandsEnabled && caps.ops.has('review') && isReviewSlashCommand(text);
     const isProcessing = !!derivedState?.isProcessing;
 
     // Don't queue /btw or /goal while the main session is processing; they have dedicated flows.
@@ -2032,7 +2940,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({
       const hasWhitespace = /\s/.test(afterSlash);
       const pickerQuery = getSlashCommandPickerQuery(text);
       const query = pickerQuery ?? afterSlash.trimStart().split(/\s+/, 1)[0]?.toLowerCase?.() ?? '';
-      const matchedMcpPrompt = localSlashCommandsEnabled
+      const matchedMcpPrompt = promptSlashCommandsEnabled
         ? resolveTypedMcpPromptCommand(text)
         : null;
 
@@ -2091,7 +2999,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({
         selectedIndex: 0,
       });
     }
-  }, [contexts, derivedState, inputState.isActive, isAcpInputSession, prunePendingLargePastes, removeContext, resolveTypedMcpPromptCommand, setQueuedInput, slashCommandState.isActive, slashCommandState.kind]);
+  }, [contexts, derivedState, dispatchInput, externalPromptCommands, inputState.isActive, isAcpInputSession, prunePendingLargePastes, removeContext, resolveTypedMcpPromptCommand, selectedExternalPromptCandidateId, selectedNonExternalSlashCommand, setQueuedInput, slashCommandState.isActive, slashCommandState.kind, caps.localSlashCommands, caps.ops]);
 
   const submitBtwFromInput = useCallback(async () => {
     if (!derivedState) return;
@@ -2130,7 +3038,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({
         }),
         { duration: 4000 }
       );
-      pendingLargePastesRef.current = originalPendingLargePastes;
+      replacePendingLargePastes(originalPendingLargePastes);
       dispatchInput({ type: 'ACTIVATE' });
       dispatchInput({ type: 'SET_VALUE', payload: originalMessage });
       return;
@@ -2151,7 +3059,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({
 
       const { childSessionId } = await startBtwThread({
         parentSessionId: currentSessionId,
-        workspacePath,
+        workspacePath: sessionBoundWorkspacePath,
         question,
         imagePayload,
       });
@@ -2159,7 +3067,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({
       openBtwSessionInAuxPane({
         childSessionId,
         parentSessionId: currentSessionId,
-        workspacePath,
+        workspacePath: sessionBoundWorkspacePath,
         expand: true,
       });
       setInputTarget('btw');
@@ -2167,10 +3075,10 @@ export const ChatInput: React.FC<ChatInputProps> = ({
     } catch (e) {
       log.error('Failed to start /btw thread', { e });
       dispatchInput({ type: 'ACTIVATE' });
-      pendingLargePastesRef.current = originalPendingLargePastes;
+      replacePendingLargePastes(originalPendingLargePastes);
       dispatchInput({ type: 'SET_VALUE', payload: originalMessage });
     }
-  }, [clearPendingLargePastes, currentSessionId, derivedState, expandComposerSpecialTokens, imageContexts, inputState.value, isBtwSession, removeContext, setQueuedInput, t, workspacePath]);
+  }, [clearPendingLargePastes, currentSessionId, derivedState, dispatchInput, expandComposerSpecialTokens, imageContexts, inputState.value, isBtwSession, removeContext, replacePendingLargePastes, sessionBoundWorkspacePath, setQueuedInput, t]);
 
   const submitCompactFromInput = useCallback(async () => {
     if (!effectiveTargetSessionId || !effectiveTargetSession) {
@@ -2200,12 +3108,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({
     setSlashCommandState({ isActive: false, kind: 'modes', query: '', selectedIndex: 0 });
 
     try {
-      await agentAPI.compactSession({
-        sessionId: effectiveTargetSessionId,
-        workspacePath: effectiveTargetSession.workspacePath,
-        remoteConnectionId: effectiveTargetSession.remoteConnectionId,
-        remoteSshHost: effectiveTargetSession.remoteSshHost,
-      });
+      await FlowChatManager.getInstance().compactSession(effectiveTargetSessionId);
     } catch (error) {
       log.error('Failed to trigger /compact', {
         error,
@@ -2223,6 +3126,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({
     }
   }, [
     derivedState?.isProcessing,
+    dispatchInput,
     effectiveTargetSession,
     effectiveTargetSessionId,
     inputState.value,
@@ -2239,15 +3143,17 @@ export const ChatInput: React.FC<ChatInputProps> = ({
     }
 
     try {
-      const result = await runUsageReportCommand({
-        session: effectiveTargetSession,
-        isProcessing: !!derivedState?.isProcessing,
-        busyMessage: t('chatInput.usageBusy'),
-        noWorkspaceMessage: t('chatInput.usageNoWorkspace'),
-        failedTitle: t('chatInput.usageFailed'),
-        unknownErrorMessage: t('error.unknown'),
-        loadingMarkdown: t('usage.loading.markdown'),
-      });
+      const result = await FlowChatManager.getInstance().runSessionUsageReport(
+        effectiveTargetSessionId,
+        {
+          isProcessing: !!derivedState?.isProcessing,
+          busyMessage: t('chatInput.usageBusy'),
+          noWorkspaceMessage: t('chatInput.usageNoWorkspace'),
+          failedTitle: t('chatInput.usageFailed'),
+          unknownErrorMessage: t('error.unknown'),
+          loadingMarkdown: t('usage.loading.markdown'),
+        },
+      );
 
       if (result.inserted) {
         dispatchInput({ type: 'DEACTIVATE' });
@@ -2261,6 +3167,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({
     }
   }, [
     derivedState?.isProcessing,
+    dispatchInput,
     effectiveTargetSession,
     effectiveTargetSessionId,
     t,
@@ -2293,6 +3200,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({
       dispatchInput({ type: 'SET_VALUE', payload: message });
     }
   }, [
+    dispatchInput,
     effectiveTargetSession,
     effectiveTargetSessionId,
     inputState.value,
@@ -2366,6 +3274,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({
     }
   }, [
     derivedState?.isProcessing,
+    dispatchInput,
     effectiveTargetSession,
     effectiveTargetSessionId,
     inputState.value,
@@ -2413,6 +3322,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({
 
     dispatchInput({ type: 'DEACTIVATE' });
   }, [
+    dispatchInput,
     effectiveTargetSession,
     effectiveTargetSessionId,
     inputState.value,
@@ -2422,10 +3332,15 @@ export const ChatInput: React.FC<ChatInputProps> = ({
     threadGoalController,
   ]);
 
-  const submitReloadSkillsFromInput = useCallback(async () => {
+  const submitReloadFromInput = useCallback(async () => {
     const message = inputState.value.trim();
-    if (!/^\/reload-skills\s*$/i.test(message)) {
-      notificationService.warning(t('chatInput.reloadSkillsUsage'));
+    const parsed = parseReloadCommand(message);
+    if (!parsed || parsed.kind === 'invalid') {
+      notificationService.warning(t('chatInput.reloadUsage'));
+      return;
+    }
+    if (!effectiveTargetSessionId) {
+      notificationService.error(t('chatInput.reloadNoSession'));
       return;
     }
 
@@ -2434,34 +3349,36 @@ export const ChatInput: React.FC<ChatInputProps> = ({
     setSlashCommandState({ isActive: false, kind: 'modes', query: '', selectedIndex: 0 });
 
     try {
-      // Re-fetch skill configs with forceRefresh=true. The Tauri command
-      // (skill_api.rs::get_skill_configs) calls SkillRegistry::global().refresh()
-      // before serializing the result, so this single call both refreshes
-      // the registry cache and returns the new view. Pass workspacePath so
-      // workspace-level skills (`.bitfun/skills/`, `.cursor/skills/`, etc.)
-      // are included in the count — without it, the registry falls back
-      // to user + built-in slots only and the toast would undercount.
-      const skills = await configAPI.getSkillConfigs({
-        forceRefresh: true,
-        workspacePath: workspacePath || undefined,
+      await agentAPI.reloadSessionContext({
+        sessionId: effectiveTargetSessionId,
+        target: parsed.target,
       });
+      const successMessage = parsed.target === 'all'
+        ? t('chatInput.reloadAllDone')
+        : parsed.target === 'skills'
+          ? t('chatInput.reloadSkillsDone')
+          : t('chatInput.reloadInstructionsDone');
       notificationService.success(
-        t('chatInput.reloadSkillsDone', { count: skills.length }),
+        successMessage,
         { duration: 3000 }
       );
     } catch (error) {
-      log.error('Failed to trigger /reload-skills', { error });
+      log.error('Failed to reload session context', {
+        error,
+        sessionId: effectiveTargetSessionId,
+        target: parsed.target,
+      });
       dispatchInput({ type: 'ACTIVATE' });
       dispatchInput({ type: 'SET_VALUE', payload: message });
       notificationService.error(
         error instanceof Error ? error.message : t('error.unknown'),
         {
-          title: t('chatInput.reloadSkillsFailed'),
+          title: t('chatInput.reloadFailed'),
           duration: 5000,
         }
       );
     }
-  }, [inputState.value, setQueuedInput, t, workspacePath]);
+  }, [dispatchInput, effectiveTargetSessionId, inputState.value, setQueuedInput, t]);
 
   const submitReviewFromInput = useCallback(async () => {
     if (!canLaunchReview) {
@@ -2551,7 +3468,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({
         error,
         sessionId: effectiveTargetSessionId,
       });
-      pendingLargePastesRef.current = originalPendingLargePastes;
+      replacePendingLargePastes(originalPendingLargePastes);
       dispatchInput({ type: 'ACTIVATE' });
       dispatchInput({ type: 'SET_VALUE', payload: message });
       notificationService.error(
@@ -2570,11 +3487,13 @@ export const ChatInput: React.FC<ChatInputProps> = ({
     clearPendingLargePastes,
     confirmDeepReviewLaunch,
     currentReviewActivity,
+    dispatchInput,
     effectiveTargetSession,
     effectiveTargetSessionId,
     flowChatState,
     inputState.value,
     isBtwSession,
+    replacePendingLargePastes,
     setQueuedInput,
     t,
   ]);
@@ -2656,7 +3575,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({
         command: originalMessage,
         error,
       });
-      pendingLargePastesRef.current = originalPendingLargePastes;
+      replacePendingLargePastes(originalPendingLargePastes);
       dispatchInput({ type: 'ACTIVATE' });
       dispatchInput({ type: 'SET_VALUE', payload: originalMessage });
       notificationService.error(
@@ -2671,14 +3590,321 @@ export const ChatInput: React.FC<ChatInputProps> = ({
     clearPendingLargePastes,
     addToHistory,
     confirmPromptCacheGuardIfNeeded,
+    dispatchInput,
     effectiveTargetSessionId,
     inputState.value,
     loadMcpPromptCommands,
     resolveTypedMcpPromptCommand,
+    replacePendingLargePastes,
     sendMessage,
     setQueuedInput,
     t,
   ]);
+
+  const submitExternalPromptCommandFromInput = useCallback(async (
+    message: string,
+    originalMessage: string,
+    originalPendingLargePastes: PendingLargePasteMap,
+  ): Promise<boolean> => {
+    const submissionSessionId = effectiveTargetSessionId;
+    const submissionWorkspacePath = sessionBoundWorkspacePath;
+    const submissionComposerValue = inputValueRef.current;
+    const submissionTargetIsCurrent = () => isExternalPromptSubmissionTargetCurrent(
+      submissionSessionId,
+      effectiveTargetSessionIdRef.current,
+      submissionWorkspacePath,
+      workspacePathRef.current,
+    );
+    let composerCleared = false;
+    const trimmedMessage = message.trim();
+    const commandWhitespaceIndex = trimmedMessage.search(/\s/);
+    const command = trimmedMessage.startsWith('/')
+      ? (commandWhitespaceIndex === -1
+          ? trimmedMessage
+          : trimmedMessage.slice(0, commandWhitespaceIndex)).toLowerCase()
+      : '';
+    const externalCandidates = externalPromptCommands.filter(
+      item => item.command.toLowerCase() === command,
+    );
+    const nativeCommands = getSlashPickerItems()
+      .filter((item): item is Exclude<SlashPickerItem, SlashExternalPromptCommandItem> => (
+        item.kind !== 'externalCommand'
+      ))
+      .map(toNativePromptCommandDescriptor)
+      .filter(item => `/${item.commandName}` === command)
+      .filter((item, index, all) => (
+        all.findIndex(candidate => candidate.candidateId === item.candidateId) === index
+      ));
+    const reservedCommands = new Set(nativeCommands.map(item => `/${item.commandName}`));
+    const externalCandidateIds = new Set(
+      externalCandidates.map(candidate => candidate.candidateId),
+    );
+    const explicitNativeCandidate = selectedNonExternalSlashCommand === command
+      ? nativeCommands.find(candidate => (
+          candidate.candidateId === selectedNonExternalSlashCandidateId
+        ))
+      : undefined;
+
+    if (externalCandidates.length === 0) {
+      const unmatchedRoute = routeUnmatchedExternalPromptCommand({
+        hasNativeCommand: nativeCommands.length > 0,
+        catalogLoading: externalPromptCommandsLoading,
+        discoveryPending: externalPromptCommandsPending,
+        catalogIssue: externalPromptCommandsIssue,
+      });
+      if (unmatchedRoute === 'native' || unmatchedRoute === 'ordinary') return false;
+      notificationService.warning(t(unmatchedRoute === 'load_failed'
+        ? 'chatInput.externalCommandsLoadFailed'
+        : 'chatInput.externalCommandsLoading'));
+      return true;
+    }
+
+    if (explicitNativeCandidate) {
+      try {
+        const nativeConflictSnapshot = await externalSourcesAPI.getNativePromptCommandConflicts(
+          submissionWorkspacePath || undefined,
+          nativeCommands,
+        );
+        if (!submissionTargetIsCurrent()) return true;
+        const nativeConflict = nativeConflictSnapshot.conflicts.find(conflict => (
+          externalCandidateIds.has(conflict.externalCandidateId)
+        ));
+        const nativeReconfirmation = nativeConflictSnapshot.reconfirmations?.some(item => (
+          item.nativeCandidateId === explicitNativeCandidate.candidateId
+        ));
+        if ((nativeConflict
+          && nativeConflict.selectedCandidateId !== explicitNativeCandidate.candidateId)
+          || nativeReconfirmation) {
+          await externalSourcesAPI.setNativePromptCommandConflictChoice(
+            submissionWorkspacePath || undefined,
+            nativeCommands,
+            explicitNativeCandidate.candidateId,
+            nativeConflictSnapshot.preferenceRevision,
+          );
+        }
+      } catch (error) {
+        log.warn('Failed to persist native prompt command conflict choice', {
+          code: error instanceof ExternalSourceApiError ? error.code : 'internal',
+        });
+        if (!submissionTargetIsCurrent()) return true;
+        notificationService.warning(t('chatInput.nativeCommandChoiceNotSaved'));
+      }
+      if (!submissionTargetIsCurrent()) return true;
+      return false;
+    }
+
+    try {
+      const nativeConflictSnapshot = nativeCommands.length > 0
+        ? await externalSourcesAPI.getNativePromptCommandConflicts(
+            submissionWorkspacePath || undefined,
+            nativeCommands,
+          )
+        : undefined;
+      if (!submissionTargetIsCurrent()) return true;
+      const nativeConflict = nativeConflictSnapshot?.conflicts.find(conflict => (
+        externalCandidateIds.has(conflict.externalCandidateId)
+      ));
+      if (externalCandidates.length === 0) {
+        const requiresReconfirmation = nativeConflictSnapshot?.reconfirmations?.some(item => (
+          nativeCommands.some(commandItem => (
+            commandItem.candidateId === item.nativeCandidateId
+          ))
+        ));
+        if (requiresReconfirmation) {
+          notificationService.warning(t('chatInput.nativeCommandReconfirmationRequired'));
+          return true;
+        }
+        return false;
+      }
+      const persistedCandidateId = nativeConflict?.selectedCandidateId;
+      if (persistedCandidateId
+        && nativeCommands.some(candidate => candidate.candidateId === persistedCandidateId)) {
+        return false;
+      }
+      const selectedExternalCandidateId = selectedExternalPromptCandidateId
+        ?? (persistedCandidateId && externalCandidateIds.has(persistedCandidateId)
+          ? persistedCandidateId
+          : undefined);
+      const resolution = resolveExternalPromptCommandInvocation(
+        message,
+        externalPromptCommands,
+        reservedCommands,
+        selectedExternalCandidateId,
+      );
+      if (resolution.state === 'none') {
+        return false;
+      }
+      if (resolution.state === 'conflict') {
+        setSlashCommandState({
+          isActive: true,
+          kind: 'all',
+          query: resolution.command.slice(1),
+          selectedIndex: 0,
+        });
+        notificationService.warning(t('chatInput.selectHint'));
+        return true;
+      }
+      if (resolution.state === 'unavailable') {
+        notificationService.warning(
+          resolution.item.unavailableReason || t('chatInput.noMatchingCommand'),
+        );
+        return true;
+      }
+
+      let expectedPreferenceRevision = nativeConflictSnapshot?.preferenceRevision ?? 0;
+      let nativeConflictKey = nativeConflict?.conflictKey;
+      if (resolution.item.conflictKey) {
+        const snapshot = await externalSourcesAPI.setConflictChoice(
+          submissionWorkspacePath || undefined,
+          resolution.item.conflictKey,
+          resolution.item.candidateId,
+          resolution.item.expectedPreferenceRevision ?? 0,
+        );
+        expectedPreferenceRevision = snapshot.preferenceRevision ?? expectedPreferenceRevision;
+        if (!submissionTargetIsCurrent()) return true;
+      }
+      if (nativeConflict
+        && selectedExternalPromptCandidateId === resolution.item.candidateId
+        && nativeConflict.selectedCandidateId !== resolution.item.candidateId) {
+        const updatedNativeConflicts = await externalSourcesAPI.setNativePromptCommandConflictChoice(
+          submissionWorkspacePath || undefined,
+          nativeCommands,
+          resolution.item.candidateId,
+          expectedPreferenceRevision,
+        );
+        expectedPreferenceRevision = updatedNativeConflicts.preferenceRevision;
+        nativeConflictKey = updatedNativeConflicts.conflicts.find(conflict => (
+          conflict.externalCandidateId === resolution.item.candidateId
+        ))?.conflictKey;
+        if (!nativeConflictKey) {
+          throw new Error('Native prompt command conflict guard is unavailable');
+        }
+        if (!submissionTargetIsCurrent()) return true;
+      }
+      const nativeConflictGuard = nativeConflictKey ? {
+        conflictKey: nativeConflictKey,
+        expectedPreferenceRevision,
+      } : undefined;
+      let expanded = await externalSourcesAPI.expandPromptCommand(
+        submissionWorkspacePath || undefined,
+        resolution.item.command.slice(1),
+        resolution.arguments,
+        resolution.item.candidateId,
+        resolution.item.contentVersion,
+        nativeCommands,
+        nativeConflictGuard,
+      );
+      let shellReviewCount = 0;
+      while (expanded.state === 'review_required') {
+        if (shellReviewCount >= 2) {
+          throw new Error('Prompt command shell review changed repeatedly');
+        }
+        const decision = await reviewPromptCommandShell(
+          expanded.review,
+          (key, values) => t(key, values),
+        );
+        if (!decision || !submissionTargetIsCurrent()) return true;
+        shellReviewCount += 1;
+        expanded = await externalSourcesAPI.expandPromptCommand(
+          submissionWorkspacePath || undefined,
+          resolution.item.command.slice(1),
+          resolution.arguments,
+          resolution.item.candidateId,
+          resolution.item.contentVersion,
+          nativeCommands,
+          nativeConflictGuard,
+          decision,
+        );
+      }
+      if (!submissionTargetIsCurrent()) return true;
+      const executionTarget = expanded.executionTarget;
+      if (executionTarget.kind === 'fresh_external_subagent' && contexts.length > 0) {
+        notificationService.warning(t('chatInput.externalCommandContextUnsupported'));
+        return true;
+      }
+      const expandedCharCount = getCharacterCount(expanded.content);
+      if (expandedCharCount > CHAT_INPUT_CONFIG.largePaste.maxMessageChars) {
+        notificationService.error(
+          t('input.messageTooLarge', {
+            max: CHAT_INPUT_CONFIG.largePaste.maxMessageChars,
+            count: expandedCharCount,
+          }),
+          { duration: 4000 },
+        );
+        return true;
+      }
+      if (!(await confirmPromptCacheGuardIfNeeded())) {
+        return true;
+      }
+      if (!submissionTargetIsCurrent()) return true;
+
+      if (submissionSessionId) {
+        addToHistory(submissionSessionId, message);
+      }
+      if (externalPromptComposerIsUnchanged(
+        submissionComposerValue,
+        inputValueRef.current,
+      )) {
+        setHistoryIndex(-1);
+        setSavedDraft('');
+        dispatchInput({ type: 'CLEAR_VALUE' });
+        composerCleared = true;
+        clearPendingLargePastes();
+        setQueuedInput(null);
+        setSelectedExternalPromptCandidateId(undefined);
+        setSelectedNonExternalSlashCommand(undefined);
+        setSelectedNonExternalSlashCandidateId(undefined);
+      }
+      await sendMessage(expanded.content, {
+        displayMessage: originalMessage,
+        ...(executionTarget.kind === 'fresh_external_subagent'
+          ? { execution: executionTarget }
+          : {}),
+      });
+      if (!submissionTargetIsCurrent()) return true;
+      if (composerCleared && inputValueRef.current === '') {
+        dispatchInput({ type: 'DEACTIVATE' });
+      }
+    } catch (error) {
+      log.warn('External prompt command invocation failed', {
+        code: error instanceof ExternalSourceApiError ? error.code : 'internal',
+      });
+      if (!submissionTargetIsCurrent()) {
+        if (composerCleared && submissionSessionId) {
+          const composer = sessionComposerStore.getState();
+          if (composer.getDraft(submissionSessionId)?.value === '') {
+            composer.setValue(submissionSessionId, originalMessage);
+            composer.setPendingLargePastes(submissionSessionId, originalPendingLargePastes);
+          }
+        }
+        return true;
+      }
+      const restoreSubmittedComposer = composerCleared
+        ? inputValueRef.current === ''
+        : externalPromptComposerIsUnchanged(
+            submissionComposerValue,
+            inputValueRef.current,
+          );
+      if (restoreSubmittedComposer) {
+        replacePendingLargePastes(originalPendingLargePastes);
+        dispatchInput({ type: 'ACTIVATE' });
+        dispatchInput({ type: 'SET_VALUE', payload: originalMessage });
+      }
+      if (error instanceof ExternalSourceApiError
+        && (error.code === 'stale_revision'
+          || error.code === 'conflict'
+          || error.code === 'not_found')) {
+        setSelectedExternalPromptCandidateId(undefined);
+        setSelectedNonExternalSlashCandidateId(undefined);
+        void refreshExternalPromptCommands(false, true);
+      }
+      notificationService.error(
+        error instanceof ExternalSourceApiError ? error.detail : t('error.unknown'),
+        { duration: 5000 },
+      );
+    }
+    return true;
+  }, [addToHistory, clearPendingLargePastes, confirmPromptCacheGuardIfNeeded, contexts, dispatchInput, effectiveTargetSessionId, externalPromptCommands, externalPromptCommandsIssue, externalPromptCommandsLoading, externalPromptCommandsPending, getSlashPickerItems, refreshExternalPromptCommands, replacePendingLargePastes, selectedExternalPromptCandidateId, selectedNonExternalSlashCandidateId, selectedNonExternalSlashCommand, sendMessage, sessionBoundWorkspacePath, setQueuedInput, t]);
 
   const handleCancelCurrentTask = useCallback(async () => {
     if (effectiveTargetSessionId) {
@@ -2692,11 +3918,12 @@ export const ChatInput: React.FC<ChatInputProps> = ({
     setIsModelSwitching(loading);
   }, []);
   
-  const handleSendOrCancel = useCallback(async () => {
+  const handleSendOrCancel = useCallback(async (messageOverride?: string) => {
     if (!derivedState) return;
+    if (caps.transferInFlight) return;
     
     const { sendButtonMode } = derivedState;
-    const draftTrimmed = inputState.value.trim();
+    const draftTrimmed = (messageOverride ?? inputState.value).trim();
 
     // While generating, an empty control in `cancel` mode means stop. If the user has typed a follow-up,
     // never treat this path as cancel — that would call cancel_dialog_turn and abort the current round early.
@@ -2716,75 +3943,110 @@ export const ChatInput: React.FC<ChatInputProps> = ({
     if (!draftTrimmed) return;
     
     const originalMessage = draftTrimmed;
+    const submissionSessionId = effectiveTargetSessionId;
+    const composerPresentation = messageOverride === undefined
+      ? richTextInputRef.current?.getComposerPresentation?.() ?? null
+      : null;
+    const persistedComposerPresentation = hasComposerPresentationReferences(composerPresentation)
+      ? composerPresentation
+      : null;
     const originalPendingLargePastes = { ...pendingLargePastesRef.current };
-    const message = expandComposerSpecialTokens(originalMessage);
+    const expandedMessage = expandComposerSpecialTokens(
+      persistedComposerPresentation
+        ? composerPresentationToModelText(persistedComposerPresentation)
+        : originalMessage,
+    );
+    const message = expandedMessage || (persistedComposerPresentation
+      ? 'Use the referenced session transcript as context.'
+      : expandedMessage);
     const messageCharCount = getCharacterCount(message);
-    const localSlashCommandsEnabled = !isAcpInputSession;
+    // Voice transcripts are always message content; they must not accidentally execute local commands.
+    const promptSlashCommandsEnabled =
+      !isAcpInputSession &&
+      messageOverride === undefined;
+    const localSlashCommandsEnabled =
+      promptSlashCommandsEnabled &&
+      caps.localSlashCommands;
+    const parsedReload = messageOverride === undefined
+      ? parseReloadCommand(message)
+      : null;
 
-    if (localSlashCommandsEnabled && isSlashCommand(message, '/btw')) {
+    if (promptSlashCommandsEnabled && await submitExternalPromptCommandFromInput(
+      message,
+      originalMessage,
+      originalPendingLargePastes,
+    )) {
+      return;
+    }
+
+    if (promptSlashCommandsEnabled && caps.ops.has('btw') && isSlashCommand(message, '/btw')) {
       // When idle, /btw can be sent via the normal send button.
       await submitBtwFromInput();
       return;
     }
 
-    if (localSlashCommandsEnabled && isGoalSlashCommand(message)) {
+    if (promptSlashCommandsEnabled && caps.ops.has('goal') && isGoalSlashCommand(message)) {
       await submitGoalFromInput();
       return;
     }
 
-    if (localSlashCommandsEnabled && /^\/compact\s*$/i.test(message)) {
+    if (promptSlashCommandsEnabled && caps.ops.has('compact') && /^\/compact\s*$/i.test(message)) {
       await submitCompactFromInput();
       return;
     }
 
-    if (localSlashCommandsEnabled && /^\/usage\s*$/i.test(message)) {
+    if (promptSlashCommandsEnabled && caps.ops.has('usage') && /^\/usage\s*$/i.test(message)) {
       await submitUsageFromInput();
       return;
     }
 
-    if (localSlashCommandsEnabled && /^\/init\s*$/i.test(message)) {
+    if (promptSlashCommandsEnabled && caps.ops.has('init') && /^\/init\s*$/i.test(message)) {
       await submitInitFromInput();
       return;
     }
 
-    if (localSlashCommandsEnabled && isReviewSlashCommand(message)) {
+    if (promptSlashCommandsEnabled && caps.ops.has('review') && isReviewSlashCommand(message)) {
       await submitReviewFromInput();
       return;
     }
 
-    if (localSlashCommandsEnabled && /^\/reload-skills\s*$/i.test(message)) {
-      await submitReloadSkillsFromInput();
+    if (parsedReload && !reloadContextSupported) {
+      notificationService.warning(t('chatInput.reloadDesktopOnly'));
+      return;
+    }
+    if (parsedReload?.kind === 'reload') {
+      await submitReloadFromInput();
       return;
     }
 
-    if (localSlashCommandsEnabled && resolveTypedMcpPromptCommand(message)) {
+    if (promptSlashCommandsEnabled && resolveTypedMcpPromptCommand(message)) {
       await submitMcpPromptFromInput();
       return;
     }
 
-    if (localSlashCommandsEnabled && isSlashCommand(message, '/compact')) {
+    if (promptSlashCommandsEnabled && caps.ops.has('compact') && isSlashCommand(message, '/compact')) {
       notificationService.warning(
         t('chatInput.compactUsage')
       );
       return;
     }
 
-    if (localSlashCommandsEnabled && isSlashCommand(message, '/usage')) {
+    if (promptSlashCommandsEnabled && caps.ops.has('usage') && isSlashCommand(message, '/usage')) {
       notificationService.warning(
         t('chatInput.usageCommandUsage')
       );
       return;
     }
 
-    if (localSlashCommandsEnabled && isSlashCommand(message, '/init')) {
+    if (promptSlashCommandsEnabled && caps.ops.has('init') && isSlashCommand(message, '/init')) {
       notificationService.warning(
         t('chatInput.initUsage')
       );
       return;
     }
 
-    if (localSlashCommandsEnabled && isSlashCommand(message, '/reload-skills')) {
-      notificationService.warning(t('chatInput.reloadSkillsUsage'));
+    if (localSlashCommandsEnabled && parsedReload?.kind === 'invalid') {
+      notificationService.warning(t('chatInput.reloadUsage'));
       return;
     }
     
@@ -2796,7 +4058,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({
         }),
         { duration: 4000 }
       );
-      pendingLargePastesRef.current = originalPendingLargePastes;
+      replacePendingLargePastes(originalPendingLargePastes);
       dispatchInput({ type: 'ACTIVATE' });
       dispatchInput({ type: 'SET_VALUE', payload: originalMessage });
       return;
@@ -2818,35 +4080,75 @@ export const ChatInput: React.FC<ChatInputProps> = ({
     clearPendingLargePastes();
     // Clear machine queue too; otherwise the queuedInput→input sync effect puts the text back after send.
     setQueuedInput(null);
+    const clearedComposerRevision = submissionSessionId
+      ? composerMutationRevision(submissionSessionId)
+      : 0;
 
     try {
-      await sendMessage(message, {
-        displayMessage: originalMessage,
-      });
+      const transport = await submitThroughChatInputRegistration(
+        registration,
+        {
+          text: message,
+          displayText: originalMessage,
+          contexts: [...contexts],
+          composerPresentation: persistedComposerPresentation,
+          sessionId: effectiveTargetSessionId || undefined,
+          workspacePath: workspacePath || undefined,
+        },
+        () => sendMessage(message, {
+          displayMessage: originalMessage,
+          composerPresentation: persistedComposerPresentation,
+        }),
+      );
+      if (transport === 'registered') {
+        clearContexts();
+        onSendMessage?.(message);
+      }
       clearPendingLargePastes();
       dispatchInput({ type: 'CLEAR_VALUE' });
       dispatchInput({ type: 'DEACTIVATE' });
     } catch (error) {
       log.error('Failed to send message', { error });
-      pendingLargePastesRef.current = originalPendingLargePastes;
-      dispatchInput({ type: 'ACTIVATE' });
-      dispatchInput({ type: 'SET_VALUE', payload: originalMessage });
-      if (derivedState?.isProcessing) {
-        setQueuedInput(originalMessage);
+      const recoveryTarget = failedSubmissionRecoveryTarget(
+        submissionSessionId,
+        effectiveTargetSessionIdRef.current,
+        clearedComposerRevision,
+        submissionSessionId ? composerMutationRevision(submissionSessionId) : 0,
+      );
+      if (recoveryTarget === 'current') {
+        replacePendingLargePastes(originalPendingLargePastes);
+        dispatchInput({ type: 'ACTIVATE' });
+        dispatchInput({ type: 'SET_VALUE', payload: originalMessage });
+        if (derivedState?.isProcessing) {
+          setQueuedInput(originalMessage);
+        }
+      } else if (recoveryTarget === 'stored' && submissionSessionId) {
+        const composer = sessionComposerStore.getState();
+        composer.setValue(submissionSessionId, originalMessage);
+        composer.setPendingLargePastes(submissionSessionId, originalPendingLargePastes);
       }
     }
   }, [
     isModelSwitching,
+    caps.transferInFlight,
     inputState.value,
     derivedState,
+    dispatchInput,
     handleCancelCurrentTask,
     transition,
     sendMessage,
+    registration,
+    contexts,
+    workspacePath,
+    clearContexts,
+    onSendMessage,
     addToHistory,
     effectiveTargetSessionId,
     clearPendingLargePastes,
     expandComposerSpecialTokens,
     isAcpInputSession,
+    richTextInputRef,
+    replacePendingLargePastes,
     setQueuedInput,
     submitBtwFromInput,
     submitGoalFromInput,
@@ -2855,10 +4157,15 @@ export const ChatInput: React.FC<ChatInputProps> = ({
     submitInitFromInput,
     submitReviewFromInput,
     submitMcpPromptFromInput,
-    submitReloadSkillsFromInput,
+    submitReloadFromInput,
+    reloadContextSupported,
     confirmPromptCacheGuardIfNeeded,
     t,
     resolveTypedMcpPromptCommand,
+    submitExternalPromptCommandFromInput,
+    caps.localSlashCommands,
+    caps.ops,
+    composerMutationRevision,
   ]);
   
   const getFilteredIncrementalModes = useCallback(() => {
@@ -2945,22 +4252,136 @@ export const ChatInput: React.FC<ChatInputProps> = ({
     }
   }, [t, userDefaultModeId]);
   
+  const persistExplicitNativePromptCommandChoice = useCallback(async (
+    descriptor: NativePromptCommandDescriptor,
+    nativeCommands: NativePromptCommandDescriptor[],
+    operationIsCurrent: () => boolean,
+  ): Promise<boolean> => {
+    const capturedSessionId = effectiveTargetSessionId;
+    const capturedWorkspacePath = sessionBoundWorkspacePath;
+    const targetIsCurrent = () => isExternalPromptSubmissionTargetCurrent(
+      capturedSessionId,
+      effectiveTargetSessionIdRef.current,
+      capturedWorkspacePath,
+      workspacePathRef.current,
+    );
+    if (externalPromptCommandsIssue === 'host_unavailable') {
+      return targetIsCurrent() && operationIsCurrent();
+    }
+    try {
+      const snapshot = await externalSourcesAPI.getNativePromptCommandConflicts(
+        capturedWorkspacePath || undefined,
+        nativeCommands,
+      );
+      if (!targetIsCurrent() || !operationIsCurrent()) return false;
+      const conflict = snapshot.conflicts.find(item => (
+        item.commandName === descriptor.commandName
+      ));
+      const requiresReconfirmation = snapshot.reconfirmations?.some(item => (
+        item.nativeCandidateId === descriptor.candidateId
+      ));
+      if ((conflict && conflict.selectedCandidateId !== descriptor.candidateId)
+        || requiresReconfirmation) {
+        await externalSourcesAPI.setNativePromptCommandConflictChoice(
+          capturedWorkspacePath || undefined,
+          nativeCommands,
+          descriptor.candidateId,
+          snapshot.preferenceRevision,
+        );
+        if (!targetIsCurrent() || !operationIsCurrent()) return false;
+      }
+    } catch (error) {
+      log.warn('Failed to persist native prompt command conflict choice', {
+        code: error instanceof ExternalSourceApiError ? error.code : 'internal',
+      });
+      if (targetIsCurrent() && operationIsCurrent()) {
+        notificationService.warning(t('chatInput.nativeCommandChoiceNotSaved'));
+      }
+    }
+    return targetIsCurrent() && operationIsCurrent();
+  }, [effectiveTargetSessionId, externalPromptCommandsIssue, sessionBoundWorkspacePath, t]);
+
   const selectSlashCommandMode = useCallback((modeId: string) => {
-    requestModeChange(modeId);
-    
-    dispatchInput({ type: 'CLEAR_VALUE' });
-    setSlashCommandState({
-      isActive: false,
-      kind: 'modes',
-      query: '',
-      selectedIndex: 0,
-    });
-  }, [requestModeChange]);
+    // Same gating as the mode dropdown; slash commands must not bypass it.
+    if (modeId === 'ComputerUse' && !computerUseEnabled) {
+      notificationService.warning(t('chatInput.computerUseDisabled'));
+      return;
+    }
+    const operationGeneration = ++nativePromptModeSelectionGenerationRef.current;
+    const operationIsCurrent = () => (
+      nativePromptModeSelectionGenerationRef.current === operationGeneration
+    );
+    const descriptor = {
+      commandName: modeId.toLowerCase(),
+      candidateId: nativePromptCommandCandidateId('mode', modeId),
+      behaviorVersion: JSON.stringify({ kind: 'mode', id: modeId }),
+    };
+    const nativeCommands = getSlashPickerItems()
+      .filter((item): item is Exclude<SlashPickerItem, SlashExternalPromptCommandItem> => (
+        item.kind !== 'externalCommand'
+      ))
+      .map(toNativePromptCommandDescriptor)
+      .filter(item => item.commandName === descriptor.commandName)
+      .filter((item, index, all) => (
+        all.findIndex(candidate => candidate.candidateId === item.candidateId) === index
+      ));
+    const previousOperation = nativePromptModeSelectionQueueRef.current;
+    const operation = (async () => {
+      await previousOperation;
+      if (!operationIsCurrent()) return false;
+      return persistExplicitNativePromptCommandChoice(
+        descriptor,
+        nativeCommands,
+        operationIsCurrent,
+      );
+    })();
+    nativePromptModeSelectionQueueRef.current = operation.then(() => undefined, () => undefined);
+    void (async () => {
+      if (!await operation) return;
+      requestModeChange(modeId);
+      setSelectedExternalPromptCandidateId(undefined);
+      setSelectedNonExternalSlashCommand(undefined);
+      setSelectedNonExternalSlashCandidateId(undefined);
+
+      if (getInlineSlashCommandPickerQuery(inlineTriggerState) !== null) {
+        const controller = richTextInputRef.current as (HTMLDivElement & {
+          replaceActiveInlineTrigger?: (replacementText: string) => void;
+        }) | null;
+        controller?.replaceActiveInlineTrigger?.('');
+        setSlashCommandState({ isActive: false, kind: 'modes', query: '', selectedIndex: 0 });
+        return;
+      }
+
+      dispatchInput({ type: 'CLEAR_VALUE' });
+      setSlashCommandState({
+        isActive: false,
+        kind: 'modes',
+        query: '',
+        selectedIndex: 0,
+      });
+    })();
+  }, [computerUseEnabled, dispatchInput, getSlashPickerItems, inlineTriggerState, persistExplicitNativePromptCommandChoice, requestModeChange, t]);
 
   const selectSlashCommandAction = useCallback((actionId: SlashActionId) => {
     const raw = inputState.value || '';
     const next = resolveSlashActionInputValue(actionId, raw, isBtwSession);
     if (next === null) {
+      return;
+    }
+    nativePromptModeSelectionGenerationRef.current += 1;
+    setSelectedExternalPromptCandidateId(undefined);
+    setSelectedNonExternalSlashCommand(next.trim().split(/\s+/, 1)[0]?.toLowerCase());
+    setSelectedNonExternalSlashCandidateId(
+      nativePromptCommandCandidateId('action', actionId),
+    );
+
+    if (getInlineSlashCommandPickerQuery(inlineTriggerState) !== null) {
+      const controller = richTextInputRef.current as (HTMLDivElement & {
+        replaceActiveInlineTrigger?: (replacementText: string) => void;
+      }) | null;
+      controller?.replaceActiveInlineTrigger?.(next.trimEnd());
+      setQueuedInput(null);
+      setSlashCommandState({ isActive: false, kind: 'modes', query: '', selectedIndex: 0 });
       return;
     }
 
@@ -2971,9 +4392,48 @@ export const ChatInput: React.FC<ChatInputProps> = ({
     setQueuedInput(null);
     setSlashCommandState({ isActive: false, kind: 'modes', query: '', selectedIndex: 0 });
     window.setTimeout(() => richTextInputRef.current?.focus(), 0);
-  }, [inputState.value, isBtwSession, setQueuedInput]);
+  }, [dispatchInput, inlineTriggerState, inputState.value, isBtwSession, setQueuedInput]);
+
+  const selectSlashExternalPromptCommand = useCallback((item: SlashExternalPromptCommandItem) => {
+    if (!item.available) {
+      notificationService.warning(item.unavailableReason || t('chatInput.noMatchingCommand'));
+      return;
+    }
+    nativePromptModeSelectionGenerationRef.current += 1;
+    setSelectedExternalPromptCandidateId(item.candidateId);
+    setSelectedNonExternalSlashCommand(undefined);
+    setSelectedNonExternalSlashCandidateId(undefined);
+    const replacement = `${item.command} `;
+    if (getInlineSlashCommandPickerQuery(inlineTriggerState) !== null) {
+      const controller = richTextInputRef.current as (HTMLDivElement & {
+        replaceActiveInlineTrigger?: (replacementText: string) => void;
+      }) | null;
+      controller?.replaceActiveInlineTrigger?.(item.command);
+    } else {
+      dispatchInput({ type: 'SET_VALUE', payload: replacement });
+      inputValueRef.current = replacement;
+    }
+    setQueuedInput(null);
+    setSlashCommandState({ isActive: false, kind: 'modes', query: '', selectedIndex: 0 });
+    window.setTimeout(() => richTextInputRef.current?.focus(), 0);
+  }, [dispatchInput, inlineTriggerState, setQueuedInput, t]);
 
   const selectSlashPromptCommand = useCallback((item: SlashMcpPromptItem) => {
+    nativePromptModeSelectionGenerationRef.current += 1;
+    setSelectedExternalPromptCandidateId(undefined);
+    setSelectedNonExternalSlashCommand(item.command.toLowerCase());
+    setSelectedNonExternalSlashCandidateId(
+      nativePromptCommandCandidateId(item.kind, item.id),
+    );
+    if (getInlineSlashCommandPickerQuery(inlineTriggerState) !== null) {
+      const controller = richTextInputRef.current as (HTMLDivElement & {
+        replaceActiveInlineTrigger?: (replacementText: string) => void;
+      }) | null;
+      controller?.replaceActiveInlineTrigger?.(item.command);
+      setQueuedInput(null);
+      setSlashCommandState({ isActive: false, kind: 'modes', query: '', selectedIndex: 0 });
+      return;
+    }
     const hasArguments = item.arguments.length > 0;
     dispatchInput({
       type: 'SET_VALUE',
@@ -2982,14 +4442,29 @@ export const ChatInput: React.FC<ChatInputProps> = ({
     setQueuedInput(null);
     setSlashCommandState({ isActive: false, kind: 'modes', query: '', selectedIndex: 0 });
     window.setTimeout(() => richTextInputRef.current?.focus(), 0);
-  }, [setQueuedInput]);
+  }, [dispatchInput, inlineTriggerState, setQueuedInput]);
 
   const selectSlashAcpCommand = useCallback((item: SlashAcpCommandItem) => {
+    nativePromptModeSelectionGenerationRef.current += 1;
+    setSelectedExternalPromptCandidateId(undefined);
+    setSelectedNonExternalSlashCommand(item.command.toLowerCase());
+    setSelectedNonExternalSlashCandidateId(
+      nativePromptCommandCandidateId(item.kind, item.id),
+    );
+    if (getInlineSlashCommandPickerQuery(inlineTriggerState) !== null) {
+      const controller = richTextInputRef.current as (HTMLDivElement & {
+        replaceActiveInlineTrigger?: (replacementText: string) => void;
+      }) | null;
+      controller?.replaceActiveInlineTrigger?.(acpSlashCommandText(item.id));
+      setQueuedInput(null);
+      setSlashCommandState({ isActive: false, kind: 'modes', query: '', selectedIndex: 0 });
+      return;
+    }
     dispatchInput({ type: 'SET_VALUE', payload: acpSlashCommandText(item.id) });
     setQueuedInput(null);
     setSlashCommandState({ isActive: false, kind: 'modes', query: '', selectedIndex: 0 });
     window.setTimeout(() => richTextInputRef.current?.focus(), 0);
-  }, [setQueuedInput]);
+  }, [dispatchInput, inlineTriggerState, setQueuedInput]);
 
   const getRichTextInlineTriggerController = useCallback(() => {
     return richTextInputRef.current as (HTMLDivElement & {
@@ -3000,6 +4475,12 @@ export const ChatInput: React.FC<ChatInputProps> = ({
   }, []);
 
   const selectSlashSkill = useCallback((item: SlashSkillItem) => {
+    nativePromptModeSelectionGenerationRef.current += 1;
+    setSelectedExternalPromptCandidateId(undefined);
+    setSelectedNonExternalSlashCommand(item.command.toLowerCase());
+    setSelectedNonExternalSlashCandidateId(
+      nativePromptCommandCandidateId(item.kind, item.id),
+    );
     const replaceInlineTrigger = getRichTextInlineTriggerController()?.replaceActiveInlineTrigger;
 
     if (inlineTriggerState.isActive) {
@@ -3016,7 +4497,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({
     setQueuedInput(null);
     setSlashCommandState({ isActive: false, kind: 'modes', query: '', selectedIndex: 0 });
     window.setTimeout(() => richTextInputRef.current?.focus(), 0);
-  }, [getRichTextInlineTriggerController, inlineTriggerState.isActive, inputState.value, setQueuedInput]);
+  }, [dispatchInput, getRichTextInlineTriggerController, inlineTriggerState.isActive, inputState.value, setQueuedInput]);
 
   const handleBoostStartBtw = useCallback(
     (e: React.SyntheticEvent) => {
@@ -3045,12 +4526,15 @@ export const ChatInput: React.FC<ChatInputProps> = ({
         const sessionMode = currentSessionId
           ? FlowChatStore.getInstance().getState().sessions.get(currentSessionId)?.mode
           : undefined;
-        await FlowChatManager.getInstance().createChatSession({}, sessionMode);
+        await FlowChatManager.getInstance().createChatSession(
+          flowChatSessionConfigForCurrentWorkspace(workspace),
+          sessionMode,
+        );
       } catch (error) {
         log.error('Failed to create new session from boost menu', { error });
       }
     },
-    [currentSessionId]
+    [currentSessionId, workspace]
   );
 
   const handleKeyDown = useCallback((e: React.KeyboardEvent) => {
@@ -3179,6 +4663,8 @@ export const ChatInput: React.FC<ChatInputProps> = ({
               const item = items[slashCommandState.selectedIndex] as SlashPickerItem;
               if (item.kind === 'mode') {
                 selectSlashCommandMode(item.id);
+              } else if (item.kind === 'externalCommand') {
+                selectSlashExternalPromptCommand(item);
               } else if (item.kind === 'mcpPrompt') {
                 selectSlashPromptCommand(item);
               } else if (item.kind === 'acpCommand') {
@@ -3216,6 +4702,8 @@ export const ChatInput: React.FC<ChatInputProps> = ({
               const item = items[slashCommandState.selectedIndex] as SlashPickerItem;
               if (item.kind === 'mode') {
                 selectSlashCommandMode(item.id);
+              } else if (item.kind === 'externalCommand') {
+                selectSlashExternalPromptCommand(item);
               } else if (item.kind === 'mcpPrompt') {
                 selectSlashPromptCommand(item);
               } else if (item.kind === 'acpCommand') {
@@ -3349,7 +4837,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({
       e.preventDefault();
       void handleCancelCurrentTask();
     }
-  }, [handleSendOrCancel, submitBtwFromInput, submitGoalFromInput, derivedState, handleCancelCurrentTask, slashCommandState, getFilteredIncrementalModes, getActiveSlashPickerItems, selectSlashCommandMode, selectSlashCommandAction, selectSlashPromptCommand, selectSlashAcpCommand, selectSlashSkill, canSwitchModes, getRichTextInlineTriggerController, historyIndex, inputHistory, savedDraft, inputState.value, currentSessionId, isBtwSession, showTargetSwitcher, setInputTarget, removeContext, t]);
+  }, [handleSendOrCancel, submitBtwFromInput, submitGoalFromInput, derivedState, dispatchInput, handleCancelCurrentTask, slashCommandState, getFilteredIncrementalModes, getActiveSlashPickerItems, selectSlashCommandMode, selectSlashCommandAction, selectSlashExternalPromptCommand, selectSlashPromptCommand, selectSlashAcpCommand, selectSlashSkill, canSwitchModes, getRichTextInlineTriggerController, historyIndex, inputHistory, savedDraft, inputState.value, currentSessionId, isBtwSession, showTargetSwitcher, setInputTarget, removeContext, t]);
 
   const handleImeCompositionStart = useCallback(() => {
     isImeComposingRef.current = true;
@@ -3404,24 +4892,6 @@ export const ChatInput: React.FC<ChatInputProps> = ({
     });
   }, []);
 
-  // Space-to-focus: when no editable element is focused, Space key focuses the input.
-  useEffect(() => {
-    const handleGlobalKeyDown = (e: KeyboardEvent) => {
-      if (e.key !== ' ') return;
-      const target = e.target as HTMLElement;
-      const isEditable =
-        target.tagName === 'INPUT' ||
-        target.tagName === 'TEXTAREA' ||
-        target.isContentEditable ||
-        target.closest('[contenteditable="true"]') !== null;
-      if (isEditable) return;
-      e.preventDefault();
-      focusRichTextInputSoon();
-    };
-    document.addEventListener('keydown', handleGlobalKeyDown, true);
-    return () => document.removeEventListener('keydown', handleGlobalKeyDown, true);
-  }, [focusRichTextInputSoon]);
-
   const insertSkillIntoInput = useCallback(
     (skillName: string) => {
       dispatchInput({ type: 'ACTIVATE' });
@@ -3439,7 +4909,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({
       dispatchMode({ type: 'CLOSE_DROPDOWN' });
       focusRichTextInputSoon();
     },
-    [clearSkillsTimer, focusRichTextInputSoon, getRichTextInlineTriggerController, inputState.value]
+    [clearSkillsTimer, dispatchInput, focusRichTextInputSoon, getRichTextInlineTriggerController, inputState.value]
   );
 
   const handleBoostPickImage = useCallback(
@@ -3463,7 +4933,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({
         }
       });
     });
-  }, []);
+  }, [dispatchInput]);
 
   const handleOpenSkillsLibrary = useCallback(
     (e: React.MouseEvent) => {
@@ -3489,79 +4959,108 @@ export const ChatInput: React.FC<ChatInputProps> = ({
   }, []);
 
 
+  const voiceInput = useComposerVoiceInput({
+    activateInput: () => dispatchInput({ type: 'ACTIVATE' }),
+    focusInputSoon: () => {
+      window.requestAnimationFrame(() => richTextInputRef.current?.focus());
+    },
+    insertText: (text) => {
+      const current = inputState.value.trim();
+      const mergedText = current ? `${inputState.value.trimEnd()} ${text}` : text;
+      dispatchInput({
+        type: 'SET_VALUE',
+        payload: mergedText,
+      });
+      return mergedText;
+    },
+    submitText: async (text) => {
+      await handleSendOrCancel(text);
+    },
+  });
+
   const renderActionButton = () => {
-    if (!derivedState) return <IconButton className="bitfun-chat-input__send-button" disabled size="small"><ArrowUp size={11} /></IconButton>;
+    if (!derivedState) return <span className="bitfun-chat-input__send-action" data-bf-component="chat-input" data-bf-part="sendButton" data-bf-action="send" data-bf-state="disabled"><IconButton className="bitfun-chat-input__send-button" disabled size="small"><ArrowUp size={11} /></IconButton></span>;
 
     const { sendButtonMode, hasQueuedInput } = derivedState;
     
     if (sendButtonMode === 'cancel') {
       return (
-        <Tooltip content={t('input.stopGeneration')}>
-          <div
-            className="bitfun-chat-input__send-button bitfun-chat-input__send-button--breathing"
-            onClick={handleSendOrCancel}
-            data-testid="chat-input-cancel-btn"
-          >
-            <div className="bitfun-chat-input__breathing-circle" />
-            {hasQueuedInput && <span className="bitfun-chat-input__queued-badge">1</span>}
-          </div>
-        </Tooltip>
+        <span className="bitfun-chat-input__send-action" data-bf-component="chat-input" data-bf-part="sendButton" data-bf-action="cancel">
+          <Tooltip content={t('input.stopGeneration')}>
+            <div
+              className="bitfun-chat-input__send-button bitfun-chat-input__send-button--breathing"
+              onClick={() => void handleSendOrCancel()}
+              data-testid="chat-input-cancel-btn"
+            >
+              <div className="bitfun-chat-input__breathing-circle" />
+              {hasQueuedInput && <span className="bitfun-chat-input__queued-badge" data-bf-component="chat-input" data-bf-part="queuedBadge">1</span>}
+            </div>
+          </Tooltip>
+        </span>
       );
     }
-    
+
     if (sendButtonMode === 'retry') {
       return (
-        <IconButton
-          className="bitfun-chat-input__send-button bitfun-chat-input__send-button--retry"
-          onClick={handleSendOrCancel}
-          disabled={isModelSwitching}
-          tooltip={t('input.retry')}
-          size="small"
-        >
-          <RotateCcw size={11} />
-        </IconButton>
+        <span className="bitfun-chat-input__send-action" data-bf-component="chat-input" data-bf-part="sendButton" data-bf-action="retry" data-bf-state={isModelSwitching || caps.transferInFlight ? 'disabled' : undefined}>
+          <IconButton
+            className="bitfun-chat-input__send-button bitfun-chat-input__send-button--retry"
+            onClick={() => void handleSendOrCancel()}
+            disabled={isModelSwitching || caps.transferInFlight}
+            tooltip={t('input.retry')}
+            size="small"
+          >
+            <RotateCcw size={11} />
+          </IconButton>
+        </span>
       );
     }
 
     if (sendButtonMode === 'split') {
       return (
-        <div className="bitfun-chat-input__split-actions">
-          <Tooltip content={t('input.stopGeneration')}>
-            <div
-              className="bitfun-chat-input__send-button bitfun-chat-input__send-button--breathing"
-              onClick={() => {
-                void handleCancelCurrentTask();
-              }}
-              data-testid="chat-input-cancel-btn"
+        <div data-bf-component="chat-input" data-bf-part="sendActions" data-bf-action="split" className="bitfun-chat-input__split-actions">
+          <span className="bitfun-chat-input__send-action" data-bf-component="chat-input" data-bf-part="sendButton" data-bf-action="cancel">
+            <Tooltip content={t('input.stopGeneration')}>
+              <div
+                className="bitfun-chat-input__send-button bitfun-chat-input__send-button--breathing"
+                onClick={() => {
+                  void handleCancelCurrentTask();
+                }}
+                data-testid="chat-input-cancel-btn"
+              >
+                <div className="bitfun-chat-input__breathing-circle" />
+              </div>
+            </Tooltip>
+          </span>
+          <span className="bitfun-chat-input__send-action" data-bf-component="chat-input" data-bf-part="sendButton" data-bf-action="send" data-bf-state={!inputState.value.trim() || isModelSwitching || caps.transferInFlight ? 'disabled' : undefined}>
+            <IconButton
+              className="bitfun-chat-input__send-button"
+              onClick={() => void handleSendOrCancel()}
+              disabled={!inputState.value.trim() || isModelSwitching || caps.transferInFlight}
+              data-testid="chat-input-send-btn"
+              tooltip={t('input.sendShortcut')}
+              size="small"
             >
-              <div className="bitfun-chat-input__breathing-circle" />
-            </div>
-          </Tooltip>
-          <IconButton
-            className="bitfun-chat-input__send-button"
-            onClick={handleSendOrCancel}
-            disabled={!inputState.value.trim() || isModelSwitching}
-            data-testid="chat-input-send-btn"
-            tooltip={t('input.sendShortcut')}
-            size="small"
-          >
-            <ArrowUp size={11} />
-          </IconButton>
+              <ArrowUp size={11} />
+            </IconButton>
+          </span>
         </div>
       );
     }
     
     return (
-      <IconButton
-        className="bitfun-chat-input__send-button"
-        onClick={handleSendOrCancel}
-        disabled={!inputState.value.trim() || isModelSwitching}
-        data-testid="chat-input-send-btn"
-        tooltip={t('input.sendShortcut')}
-        size="small"
-      >
-        <ArrowUp size={11} />
-      </IconButton>
+      <span className="bitfun-chat-input__send-action" data-bf-component="chat-input" data-bf-part="sendButton" data-bf-action="send" data-bf-state={!inputState.value.trim() || isModelSwitching || caps.transferInFlight ? 'disabled' : undefined}>
+        <IconButton
+          className="bitfun-chat-input__send-button"
+          onClick={() => void handleSendOrCancel()}
+          disabled={!inputState.value.trim() || isModelSwitching || caps.transferInFlight}
+          data-testid="chat-input-send-btn"
+          tooltip={t('input.sendShortcut')}
+          size="small"
+        >
+          <ArrowUp size={11} />
+        </IconButton>
+      </span>
     );
   };
 
@@ -3592,8 +5091,15 @@ export const ChatInput: React.FC<ChatInputProps> = ({
       >
         <div 
           ref={containerRef}
-          className={`bitfun-chat-input ${isMultiLine ? 'bitfun-chat-input--multi-line' : 'bitfun-chat-input--capsule'} ${derivedState?.isProcessing ? 'bitfun-chat-input--processing' : ''} ${className}`}
+          className={`bitfun-chat-input ${isMultiLine ? 'bitfun-chat-input--multi-line' : 'bitfun-chat-input--capsule'} ${derivedState?.isProcessing || caps.transferInFlight ? 'bitfun-chat-input--processing' : ''} ${className}`}
+          data-bf-component="chat-input"
+          data-bf-part="root"
+          data-bf-state={[
+            isMultiLine && 'multiline',
+            (derivedState?.isProcessing || caps.transferInFlight) && 'processing',
+          ].filter(Boolean).join(' ')}
           data-testid="chat-input-container"
+          aria-busy={caps.transferInFlight}
         >
         {recommendationContext && (
           <SmartRecommendations
@@ -3604,46 +5110,56 @@ export const ChatInput: React.FC<ChatInputProps> = ({
 
         <PendingQueuePanel sessionId={effectiveTargetSessionId || undefined} />
 
-        <div className="bitfun-chat-input__container">
+        <div className="bitfun-chat-input__container" data-bf-component="chat-input" data-bf-part="container">
           <AcpPlanPanel entries={acpPlanEntries} />
-          <div className={`bitfun-chat-input__box ${isMultiLine ? 'bitfun-chat-input__box--multi-line' : 'bitfun-chat-input__box--capsule'}`}>
+          <div className={`bitfun-chat-input__box ${isMultiLine ? 'bitfun-chat-input__box--multi-line' : 'bitfun-chat-input__box--capsule'}`} data-bf-component="chat-input" data-bf-part="box">
             {showTargetSwitcher && (
-              <div className="bitfun-chat-input__target-switcher" data-testid="chat-input-target-switcher">
-                <span className="bitfun-chat-input__target-switcher-label">{t('chatInput.conversationTarget')}</span>
+              <div className="bitfun-chat-input__target-switcher" data-bf-component="chat-input" data-bf-part="targetSwitcher" data-testid="chat-input-target-switcher">
+                <span className="bitfun-chat-input__target-switcher-label" data-bf-component="chat-input" data-bf-part="targetLabel">{t('chatInput.conversationTarget')}</span>
                 <button
                   type="button"
                   tabIndex={-1}
                   className={`bitfun-chat-input__target-tab ${inputTarget === 'main' ? 'bitfun-chat-input__target-tab--active' : ''}`}
+                  data-bf-component="chat-input"
+                  data-bf-part="target"
+                  data-bf-target="main"
+                  data-bf-state={inputTarget === 'main' ? 'selected' : ''}
                   onClick={() => setInputTarget('main')}
                 >
                   {t('chatInput.targetMain')}
                   {inputTarget === 'main' && currentSessionTitle && (
-                    <span className="bitfun-chat-input__target-tab-name">{currentSessionTitle}</span>
+                    <span className="bitfun-chat-input__target-tab-name" data-bf-component="chat-input" data-bf-part="targetName">{currentSessionTitle}</span>
                   )}
                 </button>
                 <button
                   type="button"
                   tabIndex={-1}
                   className={`bitfun-chat-input__target-tab ${inputTarget === 'btw' ? 'bitfun-chat-input__target-tab--active' : ''}`}
+                  data-bf-component="chat-input"
+                  data-bf-part="target"
+                  data-bf-target="btw"
+                  data-bf-state={inputTarget === 'btw' ? 'selected' : ''}
                   onClick={() => setInputTarget('btw')}
                 >
                   {activeBtwTargetLabel}
                   {inputTarget === 'btw' && activeBtwSessionTitle && (
-                    <span className="bitfun-chat-input__target-tab-name">{activeBtwSessionTitle}</span>
+                    <span className="bitfun-chat-input__target-tab-name" data-bf-component="chat-input" data-bf-part="targetName">{activeBtwSessionTitle}</span>
                   )}
                 </button>
               </div>
             )}
-            <div className="bitfun-chat-input__input-area">
+            <div className="bitfun-chat-input__input-area" data-bf-component="chat-input" data-bf-part="area">
               {imageContexts.length > 0 && (
                 <div
                   className="bitfun-chat-input__image-strip"
+                  data-bf-component="chat-input"
+                  data-bf-part="imageStrip"
                   data-testid="chat-input-image-strip"
                 >
                   {imageContexts.map(image => {
                     const previewUrl = image.thumbnailUrl || image.dataUrl;
                     return (
-                      <div
+                      <div data-bf-component="chat-input" data-bf-part="image"
                         key={image.id}
                         className="bitfun-chat-input__image-chip"
                         title={image.imageName}
@@ -3651,17 +5167,21 @@ export const ChatInput: React.FC<ChatInputProps> = ({
                         {previewUrl ? (
                           <img
                             className="bitfun-chat-input__image-chip-thumb"
+                            data-bf-component="chat-input"
+                            data-bf-part="imagePreview"
                             src={previewUrl}
                             alt={image.imageName}
                           />
                         ) : (
-                          <div className="bitfun-chat-input__image-chip-thumb bitfun-chat-input__image-chip-thumb--placeholder">
+                          <div className="bitfun-chat-input__image-chip-thumb bitfun-chat-input__image-chip-thumb--placeholder" data-bf-component="chat-input" data-bf-part="imagePreview">
                             <Image size={14} />
                           </div>
                         )}
                         <button
                           type="button"
                           className="bitfun-chat-input__image-chip-remove"
+                          data-bf-component="chat-input"
+                          data-bf-part="imageRemove"
                           aria-label={t('input.removeImage')}
                           onClick={(e) => {
                             e.stopPropagation();
@@ -3676,7 +5196,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({
                 </div>
               )}
               {showPlaceholder && (
-                <span className="bitfun-chat-input__placeholder" aria-hidden>
+                <span className="bitfun-chat-input__placeholder" data-bf-component="chat-input" data-bf-part="placeholder" aria-hidden>
                   {t('input.placeholder')}
                 </span>
               )}
@@ -3689,7 +5209,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({
                 onCompositionStart={handleImeCompositionStart}
                 onCompositionEnd={handleImeCompositionEnd}
                 placeholder=""
-                disabled={false}
+                disabled={caps.transferInFlight}
                 contexts={contexts}
                 onRemoveContext={removeContext}
                 onMentionStateChange={setMentionState}
@@ -3701,8 +5221,12 @@ export const ChatInput: React.FC<ChatInputProps> = ({
               <FileMentionPicker
                 isOpen={mentionState.isActive}
                 searchQuery={mentionState.query}
-                workspacePath={workspacePath}
-                onSelect={(context: FileContext | DirectoryContext) => {
+                workspacePath={sessionBoundWorkspacePath}
+                workspaceId={hasRegisteredWorkspace
+                  ? undefined
+                  : effectiveTargetSession?.workspaceId || workspace?.id}
+                excludeSessionId={effectiveTargetSessionId || undefined}
+                onSelect={(context: FileContext | DirectoryContext | SessionReferenceContext) => {
                   addContext(context);
                   
                   if (richTextInputRef.current && (richTextInputRef.current as any).insertTagReplacingMention) {
@@ -3721,26 +5245,30 @@ export const ChatInput: React.FC<ChatInputProps> = ({
                 if (slashCommandState.kind === 'actions') {
                   const actions = getFilteredActions();
                   return (
-                    <div className="bitfun-chat-input__slash-command-picker">
-                      <div className="bitfun-chat-input__slash-command-header">
+                    <div data-bf-component="chat-input" data-bf-part="commandPicker" data-bf-command="actions" data-bf-state="open" className="bitfun-chat-input__slash-command-picker">
+                      <div className="bitfun-chat-input__slash-command-header" data-bf-component="chat-input" data-bf-part="commandHeader">
                         <span>{t('chatInput.quickAction')}</span>
                         <span className="bitfun-chat-input__slash-command-hint">{t('chatInput.selectHint')}</span>
                       </div>
-                      <div className="bitfun-chat-input__slash-command-list">
+                      <div className="bitfun-chat-input__slash-command-list" data-bf-component="chat-input" data-bf-part="commandList">
                         {actions.length > 0 ? (
                           actions.map((action, index) => (
                             <div
+                              data-bf-component="chat-input"
+                              data-bf-part="commandItem"
+                              data-bf-command-item-kind="action"
+                              data-bf-state={index === slashCommandState.selectedIndex ? 'selected' : ''}
                               key={action.id}
                               className={`bitfun-chat-input__slash-command-item ${index === slashCommandState.selectedIndex ? 'bitfun-chat-input__slash-command-item--selected' : ''}`}
                               onClick={() => selectSlashCommandAction(action.id)}
                               onMouseEnter={() => setSlashCommandState(prev => ({ ...prev, selectedIndex: index }))}
                             >
-                              <span className="bitfun-chat-input__slash-command-name">{action.command}</span>
-                              <span className="bitfun-chat-input__slash-command-label">{action.label}</span>
+                              <span className="bitfun-chat-input__slash-command-name" data-bf-component="chat-input" data-bf-part="commandName">{action.command}</span>
+                              <span className="bitfun-chat-input__slash-command-label" data-bf-component="chat-input" data-bf-part="commandLabel">{action.label}</span>
                             </div>
                           ))
                         ) : (
-                          <div className="bitfun-chat-input__slash-command-empty">
+                          <div className="bitfun-chat-input__slash-command-empty" data-bf-component="chat-input" data-bf-part="commandEmpty">
                             {t('chatInput.noMatchingCommand')}
                           </div>
                         )}
@@ -3754,14 +5282,14 @@ export const ChatInput: React.FC<ChatInputProps> = ({
                   const firstModeIndex = items.findIndex(item => item.kind === 'mode');
                   const firstSkillIndex = items.findIndex(item => item.kind === 'skill');
                   return (
-                    <div className="bitfun-chat-input__slash-command-picker">
-                      <div className="bitfun-chat-input__slash-command-header">
+                    <div data-bf-component="chat-input" data-bf-part="commandPicker" data-bf-command="all" data-bf-state="open" className="bitfun-chat-input__slash-command-picker">
+                      <div className="bitfun-chat-input__slash-command-header" data-bf-component="chat-input" data-bf-part="commandHeader">
                         <span>{t('chatInput.commands')}</span>
                         <span className="bitfun-chat-input__slash-command-hint">{t('chatInput.selectHint')}</span>
                       </div>
-                      <div className="bitfun-chat-input__slash-command-list">
+                      <div className="bitfun-chat-input__slash-command-list" data-bf-component="chat-input" data-bf-part="commandList">
                         {items.length === 0 && (mcpPromptCommandsLoading || resolvedModeSkillsLoading) ? (
-                          <div className="bitfun-chat-input__slash-command-empty">
+                          <div className="bitfun-chat-input__slash-command-empty" data-bf-component="chat-input" data-bf-part="commandEmpty">
                             {resolvedModeSkillsLoading && !mcpPromptCommandsLoading
                               ? t('chatInput.boostSkillsLoading')
                               : t('chatInput.loadingMcpPrompts')}
@@ -3780,7 +5308,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({
                             return (
                               <React.Fragment key={`${item.kind}-${item.id}`}>
                                 {index === firstModeIndex && (
-                                  <div className="bitfun-chat-input__slash-command-section">
+                                  <div className="bitfun-chat-input__slash-command-section" data-bf-component="chat-input" data-bf-part="commandSection">
                                     <span className="bitfun-chat-input__slash-command-section-line" aria-hidden />
                                     <span className="bitfun-chat-input__slash-command-section-title">
                                       {t('chatInput.modeSection')}
@@ -3789,7 +5317,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({
                                   </div>
                                 )}
                                 {index === firstSkillIndex && (
-                                  <div className="bitfun-chat-input__slash-command-section">
+                                  <div className="bitfun-chat-input__slash-command-section" data-bf-component="chat-input" data-bf-part="commandSection">
                                     <span className="bitfun-chat-input__slash-command-section-line" aria-hidden />
                                     <span className="bitfun-chat-input__slash-command-section-title">
                                       {t('chatInput.boostSkills')}
@@ -3798,6 +5326,13 @@ export const ChatInput: React.FC<ChatInputProps> = ({
                                   </div>
                                 )}
                                 <div
+                                  data-bf-component="chat-input"
+                                  data-bf-part="commandItem"
+                                  data-bf-command-item-kind={item.kind === 'mcpPrompt' ? 'mcp' : item.kind === 'externalCommand' || item.kind === 'acpCommand' ? 'action' : item.kind}
+                                  data-bf-state={[
+                                    index === slashCommandState.selectedIndex && 'selected',
+                                    item.kind === 'mode' && item.id === modeState.current && 'current',
+                                  ].filter(Boolean).join(' ')}
                                   className={`bitfun-chat-input__slash-command-item ${index === slashCommandState.selectedIndex ? 'bitfun-chat-input__slash-command-item--selected' : ''} ${item.kind === 'mode' && item.id === modeState.current ? 'bitfun-chat-input__slash-command-item--active' : ''}`}
                                   title={`${commandText}\n${labelText}`}
                                   onClick={() => {
@@ -3805,6 +5340,8 @@ export const ChatInput: React.FC<ChatInputProps> = ({
                                       selectSlashCommandMode(item.id);
                                     } else if (item.kind === 'skill') {
                                       selectSlashSkill(item);
+                                    } else if (item.kind === 'externalCommand') {
+                                      selectSlashExternalPromptCommand(item);
                                     } else if (item.kind === 'mcpPrompt') {
                                       selectSlashPromptCommand(item);
                                     } else if (item.kind === 'acpCommand') {
@@ -3815,24 +5352,26 @@ export const ChatInput: React.FC<ChatInputProps> = ({
                                   }}
                                   onMouseEnter={() => setSlashCommandState(prev => ({ ...prev, selectedIndex: index }))}
                                 >
-                                  <span className="bitfun-chat-input__slash-command-name">
+                                  <span className="bitfun-chat-input__slash-command-name" data-bf-component="chat-input" data-bf-part="commandName">
                                     {commandText}
                                   </span>
                                   <span
                                     className={`bitfun-chat-input__slash-command-label ${item.kind === 'skill' ? 'bitfun-chat-input__slash-command-label--single-line' : ''}`}
+                                    data-bf-component="chat-input"
+                                    data-bf-part="commandLabel"
                                   >
                                     {labelText}
                                   </span>
-                                  {item.kind === 'mode' && item.id === modeState.current && <span className="bitfun-chat-input__slash-command-current">{t('chatInput.current')}</span>}
+                                  {item.kind === 'mode' && item.id === modeState.current && <span className="bitfun-chat-input__slash-command-current" data-bf-component="chat-input" data-bf-part="commandCurrent">{t('chatInput.current')}</span>}
                                 </div>
                               </React.Fragment>
                             );
                           })
-                        ) : (
-                          <div className="bitfun-chat-input__slash-command-empty">
+                        ) : !externalPromptCommandsIssue ? (
+                          <div className="bitfun-chat-input__slash-command-empty" data-bf-component="chat-input" data-bf-part="commandEmpty">
                             {t('chatInput.noMatchingCommand')}
                           </div>
-                        )}
+                        ) : null}
                       </div>
                     </div>
                   );
@@ -3841,14 +5380,14 @@ export const ChatInput: React.FC<ChatInputProps> = ({
                 if (slashCommandState.kind === 'skills') {
                   const items = getActiveSlashPickerItems();
                   return (
-                    <div className="bitfun-chat-input__slash-command-picker">
-                      <div className="bitfun-chat-input__slash-command-header">
+                    <div data-bf-component="chat-input" data-bf-part="commandPicker" data-bf-command="skills" data-bf-state="open" className="bitfun-chat-input__slash-command-picker">
+                      <div className="bitfun-chat-input__slash-command-header" data-bf-component="chat-input" data-bf-part="commandHeader">
                         <span>{t('chatInput.boostSkills')}</span>
                         <span className="bitfun-chat-input__slash-command-hint">{t('chatInput.selectHint')}</span>
                       </div>
-                      <div className="bitfun-chat-input__slash-command-list">
+                      <div className="bitfun-chat-input__slash-command-list" data-bf-component="chat-input" data-bf-part="commandList">
                         {items.length === 0 && resolvedModeSkillsLoading ? (
-                          <div className="bitfun-chat-input__slash-command-empty">
+                          <div className="bitfun-chat-input__slash-command-empty" data-bf-component="chat-input" data-bf-part="commandEmpty">
                             {t('chatInput.boostSkillsLoading')}
                           </div>
                         ) : items.length > 0 ? (
@@ -3863,7 +5402,12 @@ export const ChatInput: React.FC<ChatInputProps> = ({
                                   : item.label;
 
                             return (
-                              <div
+                              <div data-bf-component="chat-input" data-bf-part="commandItem"
+                                data-bf-command-item-kind={item.kind === 'mcpPrompt' ? 'mcp' : item.kind === 'externalCommand' || item.kind === 'acpCommand' ? 'action' : item.kind}
+                                data-bf-state={[
+                                  index === slashCommandState.selectedIndex && 'selected',
+                                  item.kind === 'mode' && item.id === modeState.current && 'current',
+                                ].filter(Boolean).join(' ')}
                                 key={`${item.kind}-${item.id}`}
                                 className={`bitfun-chat-input__slash-command-item ${index === slashCommandState.selectedIndex ? 'bitfun-chat-input__slash-command-item--selected' : ''} ${item.kind === 'mode' && item.id === modeState.current ? 'bitfun-chat-input__slash-command-item--active' : ''}`}
                                 title={`${commandText}\n${labelText}`}
@@ -3872,6 +5416,8 @@ export const ChatInput: React.FC<ChatInputProps> = ({
                                     selectSlashCommandMode(item.id);
                                   } else if (item.kind === 'skill') {
                                     selectSlashSkill(item);
+                                  } else if (item.kind === 'externalCommand') {
+                                    selectSlashExternalPromptCommand(item);
                                   } else if (item.kind === 'mcpPrompt') {
                                     selectSlashPromptCommand(item);
                                   } else if (item.kind === 'acpCommand') {
@@ -3882,20 +5428,22 @@ export const ChatInput: React.FC<ChatInputProps> = ({
                                 }}
                                 onMouseEnter={() => setSlashCommandState(prev => ({ ...prev, selectedIndex: index }))}
                               >
-                                <span className="bitfun-chat-input__slash-command-name">
+                                <span className="bitfun-chat-input__slash-command-name" data-bf-component="chat-input" data-bf-part="commandName">
                                   {commandText}
                                 </span>
                                 <span
                                   className={`bitfun-chat-input__slash-command-label ${item.kind === 'skill' ? 'bitfun-chat-input__slash-command-label--single-line' : ''}`}
+                                  data-bf-component="chat-input"
+                                  data-bf-part="commandLabel"
                                 >
                                   {labelText}
                                 </span>
-                                {item.kind === 'mode' && item.id === modeState.current && <span className="bitfun-chat-input__slash-command-current">{t('chatInput.current')}</span>}
+                                {item.kind === 'mode' && item.id === modeState.current && <span className="bitfun-chat-input__slash-command-current" data-bf-component="chat-input" data-bf-part="commandCurrent">{t('chatInput.current')}</span>}
                               </div>
                             );
                           })
                         ) : (
-                          <div className="bitfun-chat-input__slash-command-empty">
+                          <div className="bitfun-chat-input__slash-command-empty" data-bf-component="chat-input" data-bf-part="commandEmpty">
                             {t('chatInput.noMatchingCommand')}
                           </div>
                         )}
@@ -3908,27 +5456,34 @@ export const ChatInput: React.FC<ChatInputProps> = ({
 
                 const filteredModes = getFilteredIncrementalModes();
                 return (
-                  <div className="bitfun-chat-input__slash-command-picker">
-                    <div className="bitfun-chat-input__slash-command-header">
+                  <div data-bf-component="chat-input" data-bf-part="commandPicker" data-bf-command="modes" data-bf-state="open" className="bitfun-chat-input__slash-command-picker">
+                    <div className="bitfun-chat-input__slash-command-header" data-bf-component="chat-input" data-bf-part="commandHeader">
                       <span>{t('chatInput.addModeMenuTitle')}</span>
                       <span className="bitfun-chat-input__slash-command-hint">{t('chatInput.selectHint')}</span>
                     </div>
-                    <div className="bitfun-chat-input__slash-command-list">
+                    <div className="bitfun-chat-input__slash-command-list" data-bf-component="chat-input" data-bf-part="commandList">
                       {filteredModes.length > 0 ? (
                         filteredModes.map((mode, index) => (
                           <div
+                            data-bf-component="chat-input"
+                            data-bf-part="commandItem"
+                            data-bf-command-item-kind="mode"
+                            data-bf-state={[
+                              index === slashCommandState.selectedIndex && 'selected',
+                              mode.id === modeState.current && 'current',
+                            ].filter(Boolean).join(' ')}
                             key={mode.id}
                             className={`bitfun-chat-input__slash-command-item ${index === slashCommandState.selectedIndex ? 'bitfun-chat-input__slash-command-item--selected' : ''} ${mode.id === modeState.current ? 'bitfun-chat-input__slash-command-item--active' : ''}`}
                             onClick={() => selectSlashCommandMode(mode.id)}
                             onMouseEnter={() => setSlashCommandState(prev => ({ ...prev, selectedIndex: index }))}
                           >
-                            <span className="bitfun-chat-input__slash-command-name">/{mode.id}</span>
-                            <span className="bitfun-chat-input__slash-command-label">{mode.name}</span>
-                            {mode.id === modeState.current && <span className="bitfun-chat-input__slash-command-current">{t('chatInput.current')}</span>}
+                            <span className="bitfun-chat-input__slash-command-name" data-bf-component="chat-input" data-bf-part="commandName">/{mode.id}</span>
+                            <span className="bitfun-chat-input__slash-command-label" data-bf-component="chat-input" data-bf-part="commandLabel">{mode.name}</span>
+                            {mode.id === modeState.current && <span className="bitfun-chat-input__slash-command-current" data-bf-component="chat-input" data-bf-part="commandCurrent">{t('chatInput.current')}</span>}
                           </div>
                         ))
                       ) : (
-                        <div className="bitfun-chat-input__slash-command-empty">
+                        <div className="bitfun-chat-input__slash-command-empty" data-bf-component="chat-input" data-bf-part="commandEmpty">
                           {t('chatInput.noMatchingMode')}
                         </div>
                       )}
@@ -3938,32 +5493,36 @@ export const ChatInput: React.FC<ChatInputProps> = ({
               })()}
             </div>
             
-            <div className="bitfun-chat-input__actions">
-              <div className="bitfun-chat-input__actions-left">
-                <div className="bitfun-chat-input__agent-boost" ref={agentBoostRef}>
+            <div className="bitfun-chat-input__actions" data-bf-component="chat-input" data-bf-part="actions">
+              <div className="bitfun-chat-input__actions-left" data-bf-component="chat-input" data-bf-part="actionsLeft">
+                <div className="bitfun-chat-input__agent-boost" data-bf-component="chat-input" data-bf-part="boost" ref={agentBoostRef}>
                   {!isAcpTargetSession && (
-                    <Tooltip content={t('chatInput.addBoostTooltip')}>
-                      <IconButton
-                        className="bitfun-chat-input__agent-boost-add"
-                        variant="ghost"
-                        size="xs"
-                        aria-haspopup="menu"
-                        aria-expanded={modeState.dropdownOpen}
-                        onClick={e => {
-                          e.stopPropagation();
-                          dispatchMode({ type: 'TOGGLE_DROPDOWN' });
-                        }}
-                      >
-                        <Plus size={14} strokeWidth={2.25} />
-                      </IconButton>
-                    </Tooltip>
+                    <span data-bf-component="chat-input" data-bf-part="boostTrigger" data-bf-state={modeState.dropdownOpen ? 'open' : undefined}>
+                      <Tooltip content={t('chatInput.addBoostTooltip')}>
+                        <IconButton
+                          className="bitfun-chat-input__agent-boost-add"
+                          variant="ghost"
+                          size="xs"
+                          aria-haspopup="menu"
+                          aria-expanded={modeState.dropdownOpen}
+                          onClick={e => {
+                            e.stopPropagation();
+                            dispatchMode({ type: 'TOGGLE_DROPDOWN' });
+                          }}
+                        >
+                          <Plus size={14} strokeWidth={2.25} />
+                        </IconButton>
+                      </Tooltip>
+                    </span>
                   )}
 
                   {(canSwitchModes || isAcpTargetSession) && modeState.current !== 'agentic' && (
                     <div
                       className={`bitfun-chat-input__agent-capsule bitfun-chat-input__agent-capsule--${modeState.current === 'debug' ? 'debug' : modeState.current}`}
+                      data-bf-component="chat-input"
+                      data-bf-part="modeChip"
                     >
-                      <span className="bitfun-chat-input__agent-capsule-label">
+                      <span className="bitfun-chat-input__agent-capsule-label" data-bf-component="chat-input" data-bf-part="modeChipLabel">
                         {t(`chatInput.modeNames.${modeState.current}`, { defaultValue: '' }) ||
                           modeState.available.find(m => m.id === modeState.current)?.name ||
                           modeState.current}
@@ -3972,6 +5531,8 @@ export const ChatInput: React.FC<ChatInputProps> = ({
                         <button
                           type="button"
                           className="bitfun-chat-input__agent-capsule-close"
+                          data-bf-component="chat-input"
+                          data-bf-part="modeChipRemove"
                           aria-label={t('chatInput.resetToAgentic')}
                           onClick={e => {
                             e.stopPropagation();
@@ -3986,10 +5547,10 @@ export const ChatInput: React.FC<ChatInputProps> = ({
                   )}
 
                   {modeState.dropdownOpen && (
-                    <div className="bitfun-chat-input__mode-dropdown bitfun-chat-input__mode-dropdown--agent-boost">
+                    <div className="bitfun-chat-input__mode-dropdown bitfun-chat-input__mode-dropdown--agent-boost" data-bf-component="chat-input" data-bf-part="boostMenu" data-bf-state="open">
                       {canSwitchModes && (
                         <>
-                          <div className="bitfun-chat-input__boost-section">
+                          <div className="bitfun-chat-input__boost-section" data-bf-component="chat-input" data-bf-part="boostSection">
                             {incrementalCodeModes.length > 0 && (
                               incrementalCodeModes.map(modeOption => {
                                 const modeDisabled = modeOption.id === 'ComputerUse' && !computerUseEnabled;
@@ -4008,22 +5569,45 @@ export const ChatInput: React.FC<ChatInputProps> = ({
                                 return (
                                   <Tooltip key={modeOption.id} content={modeDescription} placement="left">
                                     <div
+                                      data-bf-component="chat-input"
+                                      data-bf-part="boostItem"
+                                      data-bf-boost-item-kind="mode"
+                                      data-bf-state={[
+                                        modeState.current === modeOption.id && 'selected',
+                                        modeDisabled && 'disabled',
+                                      ].filter(Boolean).join(' ')}
                                       className={`bitfun-chat-input__mode-option ${modeState.current === modeOption.id ? 'bitfun-chat-input__mode-option--active' : ''}${modeDisabled ? ' bitfun-chat-input__mode-option--disabled' : ''}`}
+                                      role="menuitemradio"
+                                      aria-checked={modeState.current === modeOption.id}
+                                      aria-disabled={modeDisabled}
+                                      tabIndex={modeDisabled ? -1 : 0}
                                       onClick={e => {
                                         e.stopPropagation();
                                         if (modeDisabled) return;
                                         requestModeChange(modeOption.id);
                                       }}
+                                      onKeyDown={e => {
+                                        if (modeDisabled || (e.key !== 'Enter' && e.key !== ' ')) return;
+                                        e.preventDefault();
+                                        e.stopPropagation();
+                                        requestModeChange(modeOption.id);
+                                      }}
                                     >
-                                      <span className="bitfun-chat-input__mode-option-name">{modeName}</span>
-                                      <span className="bitfun-chat-input__mode-option-actions">
+                                      <span className="bitfun-chat-input__mode-option-name" data-bf-component="chat-input" data-bf-part="boostItemLabel">{modeName}</span>
+                                      <span className="bitfun-chat-input__mode-option-actions" data-bf-component="chat-input" data-bf-part="boostItemMeta">
                                         {modeState.current === modeOption.id && (
-                                          <span className="bitfun-chat-input__slash-command-current">{t('chatInput.current')}</span>
+                                          <span className="bitfun-chat-input__slash-command-current" data-bf-component="chat-input" data-bf-part="commandCurrent">{t('chatInput.current')}</span>
                                         )}
                                         <Tooltip content={defaultModeTooltip} placement="left">
                                           <button
                                             type="button"
                                             className={`bitfun-chat-input__mode-default-button${isDefaultMode ? ' bitfun-chat-input__mode-default-button--active' : ''}`}
+                                            data-bf-component="chat-input"
+                                            data-bf-part="boostDefaultAction"
+                                            data-bf-state={[
+                                              isDefaultMode && 'current',
+                                              defaultModeSavingId === modeOption.id && 'pending',
+                                            ].filter(Boolean).join(' ')}
                                             disabled={defaultModeSavingId === modeOption.id}
                                             aria-label={defaultModeTooltip}
                                             onClick={e => {
@@ -4042,39 +5626,60 @@ export const ChatInput: React.FC<ChatInputProps> = ({
                             )}
                           </div>
 
-                          <div className="bitfun-chat-input__boost-section-divider" aria-hidden />
+                          <div className="bitfun-chat-input__boost-section-divider" data-bf-component="chat-input" data-bf-part="boostDivider" aria-hidden />
                         </>
                       )}
 
-                      <div className="bitfun-chat-input__boost-section">
+                      <div className="bitfun-chat-input__boost-section" data-bf-component="chat-input" data-bf-part="boostSection">
                         <div
-                          role="button"
+                          role="menuitem"
                           tabIndex={0}
                           className="bitfun-chat-input__boost-context-row"
+                          data-bf-component="chat-input"
+                          data-bf-part="boostItem"
+                          data-bf-boost-item-kind="context"
                           onClick={handleBoostOpenAtContext}
-                          onKeyDown={e => e.key === 'Enter' && handleBoostOpenAtContext(e)}
+                          onKeyDown={e => {
+                            if (e.key !== 'Enter' && e.key !== ' ') return;
+                            e.preventDefault();
+                            handleBoostOpenAtContext(e);
+                          }}
                         >
                           <Files size={14} className="bitfun-chat-input__boost-context-icon" aria-hidden />
                           <span>{t('chatInput.boostAddContext')}</span>
                         </div>
 
                         <div
-                          role="button"
+                          role="menuitem"
                           tabIndex={0}
                           className="bitfun-chat-input__boost-context-row"
+                          data-bf-component="chat-input"
+                          data-bf-part="boostItem"
+                          data-bf-boost-item-kind="context"
                           onClick={handleBoostPickImage}
-                          onKeyDown={e => e.key === 'Enter' && handleBoostPickImage(e as any)}
+                          onKeyDown={e => {
+                            if (e.key !== 'Enter' && e.key !== ' ') return;
+                            e.preventDefault();
+                            handleBoostPickImage(e as any);
+                          }}
                         >
                           <Image size={14} className="bitfun-chat-input__boost-context-icon" aria-hidden />
                           <span>{t('input.addImage')}</span>
                         </div>
 
                         <div
-                          role="button"
+                          role="menuitem"
                           tabIndex={0}
                           className="bitfun-chat-input__boost-context-row"
+                          data-bf-component="chat-input"
+                          data-bf-part="boostItem"
+                          data-bf-boost-item-kind="context"
                           onClick={handleOpenCreateCustomMode}
-                          onKeyDown={e => e.key === 'Enter' && handleOpenCreateCustomMode(e)}
+                          onKeyDown={e => {
+                            if (e.key !== 'Enter' && e.key !== ' ') return;
+                            e.preventDefault();
+                            handleOpenCreateCustomMode(e);
+                          }}
                         >
                           <BotMessageSquare size={14} className="bitfun-chat-input__boost-context-icon" aria-hidden />
                           <span>{t('chatInput.createCustomMode')}</span>
@@ -4088,11 +5693,25 @@ export const ChatInput: React.FC<ChatInputProps> = ({
                             onMouseLeave={closeSkillsFlyout}
                           >
                             <div
-                              role="button"
+                              role="menuitem"
                               tabIndex={0}
                               className="bitfun-chat-input__boost-submenu-trigger"
+                              data-bf-component="chat-input"
+                              data-bf-part="boostSubmenuTrigger"
+                              data-bf-state={skillsFlyoutOpen ? 'open' : undefined}
                               aria-haspopup="menu"
                               aria-expanded={skillsFlyoutOpen}
+                              onKeyDown={e => {
+                                if (e.key === 'Escape') {
+                                  e.preventDefault();
+                                  clearSkillsTimer();
+                                  setSkillsFlyoutOpen(false);
+                                  return;
+                                }
+                                if (e.key !== 'Enter' && e.key !== ' ' && e.key !== 'ArrowRight') return;
+                                e.preventDefault();
+                                openSkillsFlyout();
+                              }}
                             >
                               <span className="bitfun-chat-input__boost-submenu-trigger-main">
                                 <Sparkles size={14} className="bitfun-chat-input__boost-context-icon" aria-hidden />
@@ -4110,22 +5729,25 @@ export const ChatInput: React.FC<ChatInputProps> = ({
                               onMouseEnter={openSkillsFlyout}
                               onMouseLeave={closeSkillsFlyout}
                             >
-                              <div className="bitfun-chat-input__boost-submenu-panel">
+                              <div className="bitfun-chat-input__boost-submenu-panel" data-bf-component="chat-input" data-bf-part="boostSubmenuPanel" data-bf-state={skillsFlyoutOpen ? 'open' : undefined}>
                                 {resolvedModeSkillsLoading ? (
-                                  <div className="bitfun-chat-input__boost-submenu-loading">
+                                  <div className="bitfun-chat-input__boost-submenu-loading" data-bf-component="chat-input" data-bf-part="boostSubmenuState" data-bf-state="loading">
                                     <Loader2 size={14} className="bitfun-chat-input__boost-submenu-spinner" aria-hidden />
                                     <span>{t('chatInput.boostSkillsLoading')}</span>
                                   </div>
-                                ) : runtimeResolvedSkills.length === 0 ? (
-                                  <div className="bitfun-chat-input__boost-submenu-empty">{t('chatInput.boostSkillsEmpty')}</div>
+                                ) : userInvocableSkills.length === 0 ? (
+                                  <div className="bitfun-chat-input__boost-submenu-empty" data-bf-component="chat-input" data-bf-part="boostSubmenuState" data-bf-state="empty">{t('chatInput.boostSkillsEmpty')}</div>
                                 ) : (
                                   <div className="bitfun-chat-input__boost-submenu-list">
-                                    {runtimeResolvedSkills.map(skill => (
+                                    {userInvocableSkills.map(skill => (
                                       <div
                                         key={skill.key}
                                         role="button"
                                         tabIndex={0}
                                         className="bitfun-chat-input__boost-submenu-item"
+                                        data-bf-component="chat-input"
+                                        data-bf-part="boostSubmenuItem"
+                                        data-bf-boost-item-kind="skill"
                                         title={skill.description || skill.name}
                                         onClick={e => {
                                           e.stopPropagation();
@@ -4134,7 +5756,9 @@ export const ChatInput: React.FC<ChatInputProps> = ({
                                         onKeyDown={e => e.key === 'Enter' && insertSkillIntoInput(skill.name)}
                                       >
                                         <Sparkles size={12} className="bitfun-chat-input__boost-submenu-item-icon" aria-hidden />
-                                        <span className="bitfun-chat-input__boost-submenu-item-name">{skill.name}</span>
+                                        <span className="bitfun-chat-input__boost-submenu-item-name">
+                                          {[skill.name, skill.argumentHint?.trim()].filter(Boolean).join(' ')}
+                                        </span>
                                       </div>
                                     ))}
                                   </div>
@@ -4143,6 +5767,9 @@ export const ChatInput: React.FC<ChatInputProps> = ({
                                   role="button"
                                   tabIndex={0}
                                   className="bitfun-chat-input__boost-submenu-manage"
+                                  data-bf-component="chat-input"
+                                  data-bf-part="boostSubmenuManage"
+                                  data-bf-boost-item-kind="manage"
                                   onClick={handleOpenSkillsLibrary}
                                   onKeyDown={e => e.key === 'Enter' && handleOpenSkillsLibrary(e as any)}
                                 >
@@ -4155,11 +5782,14 @@ export const ChatInput: React.FC<ChatInputProps> = ({
 
                         {!!currentSessionId && !isBtwSession && (
                           <>
-                            <div className="bitfun-chat-input__boost-section-divider" aria-hidden />
+                            <div className="bitfun-chat-input__boost-section-divider" data-bf-component="chat-input" data-bf-part="boostDivider" aria-hidden />
                             <div
                               role="button"
                               tabIndex={0}
                               className="bitfun-chat-input__boost-context-row"
+                              data-bf-component="chat-input"
+                              data-bf-part="boostItem"
+                              data-bf-boost-item-kind="context"
                               data-testid="chat-input-boost-start-btw"
                               onClick={handleBoostStartBtw}
                               onKeyDown={e => e.key === 'Enter' && handleBoostStartBtw(e)}
@@ -4171,12 +5801,15 @@ export const ChatInput: React.FC<ChatInputProps> = ({
                         )}
 
                         {(!currentSessionId || isBtwSession) && (
-                          <div className="bitfun-chat-input__boost-section-divider" aria-hidden />
+                          <div className="bitfun-chat-input__boost-section-divider" data-bf-component="chat-input" data-bf-part="boostDivider" aria-hidden />
                         )}
                         <div
                           role="button"
                           tabIndex={0}
                           className="bitfun-chat-input__boost-context-row"
+                          data-bf-component="chat-input"
+                          data-bf-part="boostItem"
+                          data-bf-boost-item-kind="context"
                           data-testid="chat-input-boost-new-session"
                           onClick={handleBoostNewSession}
                           onKeyDown={e => e.key === 'Enter' && handleBoostNewSession(e)}
@@ -4189,49 +5822,75 @@ export const ChatInput: React.FC<ChatInputProps> = ({
                   )}
                 </div>
               </div>
-              <div className="bitfun-chat-input__actions-right">
-                <div className="bitfun-chat-input__model-usage-group">
+              <div className="bitfun-chat-input__actions-right" data-bf-component="chat-input" data-bf-part="actionsRight">
+                {voiceInput.phase === 'idle' ? (
+                  <div className="bitfun-chat-input__model-usage-group" data-bf-component="chat-input" data-bf-part="model">
                   <ModelSelector
                     currentMode={effectiveSendAgentType}
                     sessionId={effectiveTargetSessionId || undefined}
+                    isSubagentSession={isSubagentInputTarget}
                     currentTokens={tokenUsage.current}
                     maxTokens={tokenUsage.max}
                     contextUsageSource={tokenUsage.source}
                     onLoadingChange={handleModelLoadingChange}
+                    externalSelection={dispatchModelSelection}
                   />
-                </div>
+                  </div>
+                ) : null}
 
-                {renderActionButton()}
+                {!caps.transferInFlight ? (
+                  <ComposerVoiceInputButton controller={voiceInput} />
+                ) : null}
+                {voiceInput.phase === 'idle' ? renderActionButton() : null}
               </div>
             </div>
           </div>
         </div>
       </div>
-      {((chatStripRepositoryPath || chatStripWorkspaceLabel) ||
-        (effectiveTargetSessionId && effectiveTargetSession)) && (
-        <ChatInputWorkspaceStrip
-          repositoryPath={chatStripRepositoryPath}
-          workspaceLabel={chatStripWorkspaceLabel}
-          deferPassiveGitRefresh={deferChatStripPassiveGitRefresh}
-          usageReport={
-            effectiveTargetSessionId && effectiveTargetSession
-              ? { visible: true, onOpen: handleToolbarUsageReport }
-              : undefined
-          }
-          threadGoal={
-            effectiveTargetSessionId && effectiveTargetSession && !isBtwSession
-              ? {
-                  visible: true,
-                  goal: threadGoalController.goal,
-                  onOpen: () => {
-                    void threadGoalController.openGoalEntry();
-                  },
-                }
-              : undefined
-          }
-        />
-      )}
-      {effectiveTargetSession && !isBtwSession ? (
+      <ChatInputWorkspaceStrip
+        repositoryPath={chatStripRepositoryPath}
+        workspaceLabel={chatStripWorkspaceLabel}
+        executionTarget={effectiveTargetSession?.config.executionTarget}
+        dispatchControl={dispatchControl}
+        worktreeControl={worktreeControl}
+        deferPassiveGitRefresh={deferChatStripPassiveGitRefresh}
+        permissionControl={showPermissionModeControl
+          ? caps.sessionScopedApproval
+            ? {
+                mode: dispatchPermissionMode,
+                disabled: dispatchSubmissionOptionsLocked,
+                options: ['ask', 'auto', 'reject'],
+                scopeLabel: t('chatInput.dispatch.sessionScope'),
+                onChange: handleDispatchPermissionModeChange,
+                onHide: handleHidePermissionModeControl,
+              }
+            : {
+                mode: permissionMode,
+                saving: permissionModeSaving,
+                onChange: isAcpTargetSession ? undefined : handlePermissionModeChange,
+                onHide: isAcpTargetSession ? undefined : handleHidePermissionModeControl,
+              }
+          : undefined}
+        usageReport={
+          effectiveTargetSessionId && effectiveTargetSession && caps.usageReport
+            ? { visible: true, onOpen: handleToolbarUsageReport }
+            : undefined
+        }
+        threadGoal={
+          effectiveTargetSessionId &&
+          effectiveTargetSession &&
+          caps.threadGoal
+            ? {
+                visible: true,
+                goal: threadGoalController.goal,
+                onOpen: () => {
+                  void threadGoalController.openGoalEntry();
+                },
+              }
+            : undefined
+        }
+      />
+      {effectiveTargetSession && caps.threadGoal ? (
         <ThreadGoalDialogs
           controller={threadGoalController}
           disabled={!effectiveTargetSession.workspacePath}

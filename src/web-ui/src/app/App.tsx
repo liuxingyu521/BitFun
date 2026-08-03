@@ -6,7 +6,8 @@ import { ChatProvider } from '../infrastructure/contexts/ChatProvider';
 import { ViewModeProvider } from '../infrastructure/contexts/ViewModeProvider';
 import { SSHRemoteProvider } from '../features/ssh-remote';
 import { ContextMenuRenderer } from '../shared/context-menu-system/components/ContextMenuRenderer';
-import { NotificationContainer, NotificationCenter, notificationService } from '../shared/notification-system';
+import { NotificationContainer, notificationService } from '../shared/notification-system';
+import { NotificationCenter } from '../shared/notification-system/components/NotificationCenter';
 import { AnnouncementProvider } from '../shared/announcement-system';
 import { ConfirmDialogRenderer } from '../component-library';
 import { createLogger } from '@/shared/utils/logger';
@@ -25,6 +26,8 @@ import {
   isStartupOverlayPresent,
 } from './startup/startupOverlay';
 import { ToolbarModeProvider } from '../flow_chat/components/toolbar-mode/ToolbarModeProvider';
+import type { AgentCompanionPetCommand } from './services/agentCompanionPetCommands';
+import AskUserAnnouncer from './components/NavPanel/AskUserAnnouncer';
 
 const log = createLogger('App');
 
@@ -645,11 +648,13 @@ function App() {
   }, []);
 
   useEffect(() => {
+    let disposed = false;
     let unlisten: (() => void) | null = null;
     void import('@tauri-apps/api/event')
       .then(({ listen }) => listen<{ sessionId?: string }>(
         'agent-companion://open-session',
         async event => {
+          if (disposed) return;
           const sessionId = event.payload?.sessionId;
           if (!sessionId) return;
 
@@ -668,13 +673,58 @@ function App() {
         },
       ))
       .then(removeListener => {
+        if (disposed) {
+          removeListener();
+          return;
+        }
         unlisten = removeListener;
       })
       .catch(error => {
-        log.warn('Failed to listen for Agent companion session open events', error);
+        if (!disposed) {
+          log.warn('Failed to listen for Agent companion session open events', error);
+        }
       });
 
     return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | null = null;
+    void import('@tauri-apps/api/event')
+      .then(({ listen }) => listen<AgentCompanionPetCommand>(
+        'agent-companion://pet-command',
+        async event => {
+          if (disposed) return;
+          try {
+            const { handleAgentCompanionPetCommand } = await import('./services/agentCompanionPetCommands');
+            await handleAgentCompanionPetCommand(event.payload);
+          } catch (error) {
+            log.warn('Failed to handle Agent companion pet command', {
+              commandType: event.payload?.type,
+              error,
+            });
+          }
+        },
+      ))
+      .then(removeListener => {
+        if (disposed) {
+          removeListener();
+          return;
+        }
+        unlisten = removeListener;
+      })
+      .catch(error => {
+        if (!disposed) {
+          log.warn('Failed to listen for Agent companion pet commands', error);
+        }
+      });
+
+    return () => {
+      disposed = true;
       unlisten?.();
     };
   }, []);
@@ -802,6 +852,11 @@ function App() {
 
             {/* Announcement / feature-demo / tips system */}
             <AnnouncementProvider />
+
+            {/* AskUserQuestion waiting-state aria-live announcer.
+                Mounted here (inside ToolbarModeProvider, outside LazyAppLayout)
+                so it persists across both normal and Toolbar Mode. */}
+            <AskUserAnnouncer />
 
           </ToolbarModeProvider>
         </SSHRemoteProvider>

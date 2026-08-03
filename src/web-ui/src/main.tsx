@@ -4,7 +4,11 @@ import AgentCompanionDesktopPet from "./app/components/AgentCompanionDesktopPet/
 import AppErrorBoundary from "./app/components/AppErrorBoundary";
 import { STARTUP_OVERLAY_HIDDEN_EVENT } from "./app/startup/startupSignals";
 import { WorkspaceProvider } from "./infrastructure/contexts/WorkspaceProvider";
+import { PeerDeviceProvider } from "./infrastructure/peer-device/PeerDeviceContext";
+import { PeerHostInvokeBridge } from "./infrastructure/peer-device/PeerHostInvokeBridge";
+import { PeerDirectoryPickerHost } from "./infrastructure/peer-device/PeerDirectoryPickerHost";
 import { I18nProvider } from "./infrastructure/i18n/providers/I18nProvider";
+import { mouseGlowService } from "./infrastructure/mouse-glow/core/MouseGlowService";
 import "./app/styles/index.scss";
 
 // Font: Noto Sans SC is loaded via a <link> tag in index.html.
@@ -185,20 +189,27 @@ function registerGlobalErrorHandlers() {
 
 registerGlobalErrorHandlers();
 
-// Disable Tab-key focus traversal globally.
-// Tab still works inside Monaco Editor and xterm terminal where it has semantic meaning.
+// Disable Tab-key focus traversal globally (IDE-style chrome).
+// Allow Tab where it has semantic meaning: Monaco, xterm, and modal/dialog forms
+// (SSH connect, account login, settings dialogs, etc. — Modal focus trap keeps focus inside).
 document.addEventListener(
   'keydown',
   (e: KeyboardEvent) => {
     if (e.key !== 'Tab') return;
     const target = e.target as Element | null;
-    if (target?.closest('.monaco-editor, .xterm')) return;
+    if (
+      target?.closest(
+        '.monaco-editor, .xterm, [role="dialog"], [aria-modal="true"]'
+      )
+    ) {
+      return;
+    }
     e.preventDefault();
   },
   true
 );
 
-/** Logger, theme, and minimal deps — must finish before first React paint (F5 / webview reload does not re-run Tauri init script). */
+/** Logger, appearance, and minimal deps must finish before the first React paint. */
 async function initializeBeforeRender(): Promise<void> {
   const phaseStartedAt = nowMs();
   startupTrace.markPhase('before_render_start');
@@ -210,15 +221,16 @@ async function initializeBeforeRender(): Promise<void> {
 
   log.info('Initializing BitFun');
 
-  await traceStartupStep('before_render_step', 'theme_service_initialize', async () => {
+  await traceStartupStep('before_render_step', 'appearance_initialize', async () => {
     await measureAsyncAndLog(log, 'Startup step completed', async () => {
-      const { themeService } = await import('./infrastructure/theme');
-      await themeService.initialize();
+      const { appearanceService } = await import('./infrastructure/appearance');
+      await appearanceService.initialize();
     }, {
-      data: { step: 'themeService.initialize' },
+      data: { step: 'appearanceService.initialize' },
     });
   });
   log.info('Theme system initialized');
+  mouseGlowService.initialize();
   logElapsed(log, 'Startup phase completed', phaseStartedAt, {
     data: { phase: 'initializeBeforeRender' },
   });
@@ -257,8 +269,10 @@ async function initializeAfterRender(): Promise<void> {
       await installFrontendLogLevelConfigWatcher();
     })(),
     (async () => {
-      const { themeService } = await import('./infrastructure/theme');
-      await themeService.ensureUserThemesLoaded();
+      const { ensureSettingsAppliedListener } = await import(
+        './infrastructure/account/settingsAppliedListener'
+      );
+      ensureSettingsAppliedListener();
     })(),
     (async () => {
       const { registerDefaultContextTypes } = await import('./shared/context-system/core/registerDefaultTypes');
@@ -289,7 +303,7 @@ async function initializeAfterRender(): Promise<void> {
     const names = [
       'EditorConfigPreload',
       'LogLevelConfigWatcher',
-      'UserThemes',
+      'SettingsAppliedListener',
       'DefaultContextTypes',
       'RecommendationProviders',
       'Tools',
@@ -353,7 +367,11 @@ async function startApplication(): Promise<void> {
     <AppErrorBoundary>
       <I18nProvider>
         <WorkspaceProvider>
-          <App />
+          <PeerDeviceProvider>
+            <PeerHostInvokeBridge />
+            <PeerDirectoryPickerHost />
+            <App />
+          </PeerDeviceProvider>
         </WorkspaceProvider>
       </I18nProvider>
     </AppErrorBoundary>

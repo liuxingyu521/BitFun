@@ -22,6 +22,7 @@ pub mod pty;
 pub mod runtime_port;
 pub mod session;
 pub mod shell;
+mod transcript;
 
 // Re-export main types for convenience
 pub use api::{
@@ -29,7 +30,7 @@ pub use api::{
     ExecuteCommandResponse, GetHistoryRequest, GetHistoryResponse, ResizeRequest,
     SendCommandRequest, SessionResponse, ShellInfo, SignalRequest, TerminalApi, WriteRequest,
 };
-pub use config::{ShellConfig, TerminalConfig};
+pub use config::{ShellConfig, TerminalConfig, TerminalTranscriptConfig};
 pub use events::{TerminalEvent, TerminalEventEmitter};
 pub use exec::{
     get_global_exec_process_manager, ExecCommandRequest as LocalExecCommandRequest,
@@ -42,8 +43,8 @@ pub use exec::{
     SendStdinRequest as LocalSendStdinRequest, WriteStdinRequest as LocalWriteStdinRequest,
 };
 pub use exec_shell::{
-    parse_configured_shell_preference, resolve_local_exec_shell, ConfiguredShellPreference,
-    ResolvedLocalExecShell,
+    parse_configured_shell_preference, resolve_local_exec_shell,
+    resolve_local_exec_shell_without_probe, ConfiguredShellPreference, ResolvedLocalExecShell,
 };
 pub use pty::{
     // New component-based types

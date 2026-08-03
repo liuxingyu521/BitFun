@@ -9,7 +9,6 @@ use thiserror::Error;
 const REVIEW_PLATFORM_TIMEOUT_SECS: u64 = 25;
 const MAX_REVIEW_PLATFORM_REDIRECTS: usize = 5;
 const DEFAULT_JSON_RESPONSE_MAX_BYTES: usize = 16 * 1024 * 1024;
-const DEFAULT_TEXT_RESPONSE_MAX_BYTES: usize = 1024 * 1024;
 const HTTP_ERROR_BODY_MAX_BYTES: usize = 8 * 1024;
 
 #[derive(Debug, Error)]
@@ -34,7 +33,7 @@ pub(crate) struct ReviewHttpClient {
 impl ReviewHttpClient {
     pub(crate) fn new_review_platform() -> Result<Self, ReviewHttpError> {
         let inner = reqwest::Client::builder()
-            .use_native_tls()
+            .tls_backend_rustls()
             .redirect(review_redirect_policy())
             .timeout(Duration::from_secs(REVIEW_PLATFORM_TIMEOUT_SECS))
             .build()
@@ -225,12 +224,6 @@ fn append_bounded_chunk(
     }
     body.extend_from_slice(chunk);
     Ok(())
-}
-
-pub(crate) async fn send_text(
-    request: ReviewHttpRequest,
-) -> Result<ReviewTextResponse, ReviewHttpError> {
-    send_text_bounded(request, DEFAULT_TEXT_RESPONSE_MAX_BYTES).await
 }
 
 pub(crate) async fn send_text_bounded(

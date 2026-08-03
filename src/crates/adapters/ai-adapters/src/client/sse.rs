@@ -3,6 +3,7 @@ use crate::client::StreamResponse;
 use crate::stream::UnifiedResponse;
 use crate::trace::{ModelExchangeRequestAttempt, ModelExchangeTraceConfig};
 use anyhow::{anyhow, Result};
+use bitfun_core_types::errors::{AiProviderError, ErrorCategory};
 use chrono::{DateTime, Utc};
 use futures::Stream;
 use log::{debug, error, warn};
@@ -21,7 +22,18 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::sync::CancellationToken;
 
 const BASE_RETRY_DELAY_MS: u64 = 500;
-/// Maximum delay applied to a `Retry-After` header value.
+/// Base delay for HTTP 429 / rate-limit retries when `Retry-After` is absent.
+///
+/// Providers frequently omit `Retry-After` (or send a useless 1s value). The
+/// previous general backoff capped at 4s (`attempt.min(3)`), so 10 attempts
+/// finished in ~90s and never waited for TPM / RPM windows to recover —
+/// especially painful when multiple subagents retry in parallel.
+const RATE_LIMIT_BASE_RETRY_DELAY_MS: u64 = 2_000;
+/// Cap for the general (non-429) exponential backoff ladder.
+const MAX_EXPONENTIAL_DELAY_MS: u64 = 30_000;
+/// Maximum exponent shift applied to retry delays (`2^n` multiplier).
+const MAX_RETRY_EXPONENT_SHIFT: u32 = 6;
+/// Maximum delay applied to a `Retry-After` header value / rate-limit backoff.
 ///
 /// Some providers (especially TPM-based rate limits on aggregator platforms
 /// like NVIDIA's integrate API) return large `Retry-After` values of 30-60
@@ -93,8 +105,48 @@ fn is_retryable_http_status(status: StatusCode) -> bool {
     status.is_server_error() || matches!(status.as_u16(), 408 | 409 | 425 | 429)
 }
 
+fn provider_error_code(body: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let error = value.get("error").unwrap_or(&value);
+    ["code", "type", "status"].iter().find_map(|field| {
+        error.get(field).and_then(|value| match value {
+            serde_json::Value::String(value) => Some(value.clone()),
+            serde_json::Value::Number(value) => Some(value.to_string()),
+            _ => None,
+        })
+    })
+}
+
+fn http_provider_error(
+    label: &str,
+    status: StatusCode,
+    error_text: &str,
+    error_kind: &str,
+) -> AiProviderError {
+    AiProviderError::from_parts(
+        format!("{} {} {}: {}", label, error_kind, status, error_text),
+        Some(label.to_string()),
+        provider_error_code(error_text),
+        Some(status.as_u16()),
+    )
+}
+
 fn exponential_retry_delay_ms(attempt: usize) -> u64 {
-    BASE_RETRY_DELAY_MS * (1 << attempt.min(3))
+    let shift = u32::try_from(attempt)
+        .unwrap_or(u32::MAX)
+        .min(MAX_RETRY_EXPONENT_SHIFT);
+    BASE_RETRY_DELAY_MS
+        .saturating_mul(1u64 << shift)
+        .min(MAX_EXPONENTIAL_DELAY_MS)
+}
+
+fn rate_limit_retry_delay_ms(attempt: usize) -> u64 {
+    let shift = u32::try_from(attempt)
+        .unwrap_or(u32::MAX)
+        .min(MAX_RETRY_EXPONENT_SHIFT);
+    RATE_LIMIT_BASE_RETRY_DELAY_MS
+        .saturating_mul(1u64 << shift)
+        .min(MAX_RETRY_AFTER_DELAY_MS)
 }
 
 fn retry_after_delay_ms(headers: &HeaderMap) -> Option<u64> {
@@ -121,8 +173,22 @@ fn retry_after_delay_ms(headers: &HeaderMap) -> Option<u64> {
     .map(|delay| delay.min(MAX_RETRY_AFTER_DELAY_MS))
 }
 
-fn retry_delay_ms(attempt: usize, headers: &HeaderMap) -> u64 {
-    retry_after_delay_ms(headers).unwrap_or_else(|| exponential_retry_delay_ms(attempt))
+fn retry_delay_ms(attempt: usize, headers: &HeaderMap, status: StatusCode) -> u64 {
+    let fallback = if status == StatusCode::TOO_MANY_REQUESTS {
+        rate_limit_retry_delay_ms(attempt)
+    } else {
+        exponential_retry_delay_ms(attempt)
+    };
+
+    match retry_after_delay_ms(headers) {
+        // Honor Retry-After, but never let a tiny/zero value defeat the
+        // rate-limit ladder (common with aggregator "Retry-After: 1" responses).
+        Some(retry_after) if status == StatusCode::TOO_MANY_REQUESTS => {
+            retry_after.max(fallback).min(MAX_RETRY_AFTER_DELAY_MS)
+        }
+        Some(retry_after) if retry_after > 0 => retry_after,
+        Some(_) | None => fallback,
+    }
 }
 
 struct ManagedResponseStream {
@@ -189,6 +255,7 @@ where
                     request_url: url.to_string(),
                     request_body: trace.capture_request_body.then(|| request_body.clone()),
                     attempt_number: attempt + 1,
+                    round_attempt: trace.round_attempt().cloned(),
                 })
                 .await
         } else {
@@ -201,6 +268,7 @@ where
             StreamSendOutcome::Response(resp) => {
                 let connect_time = elapsed_ms_u64(request_start_time);
                 let status = resp.status();
+                let http_version = resp.version();
                 let headers = resp.headers().clone();
 
                 if status.is_client_error() && !is_retryable_http_status(status) {
@@ -208,25 +276,28 @@ where
                         .text()
                         .await
                         .unwrap_or_else(|e| format!("Failed to read error response: {}", e));
+                    let provider_error =
+                        http_provider_error(label, status, &error_text, "client error");
                     if let Some(trace) = trace.as_ref() {
                         trace
                             .sink
                             .request_attempt_failed(
                                 trace_handle.as_ref(),
-                                &format!("{} client error {}: {}", label, status, error_text),
+                                &provider_error.to_string(),
                             )
                             .await;
                     }
-                    error!("{} client error {}: {}", label, status, error_text);
-                    return Err(anyhow!("{} client error {}: {}", label, status, error_text));
+                    error!("{}", provider_error);
+                    return Err(anyhow!(provider_error));
                 }
 
                 if status.is_success() {
                     debug!(
-                        "{} request connected: {}ms, status: {}, attempt: {}/{}",
+                        "{} request connected: {}ms, status: {}, protocol: {:?}, transport_attempt: {}/{}",
                         label,
                         connect_time,
                         status,
+                        http_version,
                         attempt + 1,
                         max_tries
                     );
@@ -236,9 +307,23 @@ where
                         .text()
                         .await
                         .unwrap_or_else(|e| format!("Failed to read error response: {}", e));
-                    let error = anyhow!("{} error {}: {}", label, status, error_text);
+                    let provider_error = http_provider_error(label, status, &error_text, "error");
+                    if provider_error.category == ErrorCategory::ContextOverflow {
+                        if let Some(trace) = trace.as_ref() {
+                            trace
+                                .sink
+                                .request_attempt_failed(
+                                    trace_handle.as_ref(),
+                                    &provider_error.to_string(),
+                                )
+                                .await;
+                        }
+                        error!("{}", provider_error);
+                        return Err(anyhow!(provider_error));
+                    }
+                    let error = anyhow!(provider_error);
                     warn!(
-                        "{} request failed: {}ms, attempt {}/{}, error: {}",
+                        "{} request failed: {}ms, transport_attempt {}/{}, error: {}",
                         label,
                         connect_time,
                         attempt + 1,
@@ -260,9 +345,9 @@ where
                     }
 
                     if attempt < max_tries - 1 {
-                        let delay_ms = retry_delay_ms(attempt, &headers);
+                        let delay_ms = retry_delay_ms(attempt, &headers, status);
                         debug!(
-                            "Retrying {} after {}ms (attempt {}, status {})",
+                            "Retrying {} after {}ms (transport_attempt {}, status {})",
                             label,
                             delay_ms,
                             attempt + 2,
@@ -278,7 +363,7 @@ where
                 let error_msg = format_transport_error(label, &e);
                 let error = anyhow!("{}", error_msg);
                 warn!(
-                    "{} request failed: {}ms, attempt {}/{}, error: {}",
+                    "{} request failed: {}ms, transport_attempt {}/{}, error: {}",
                     label,
                     connect_time,
                     attempt + 1,
@@ -296,7 +381,7 @@ where
                 if attempt < max_tries - 1 {
                     let delay_ms = exponential_retry_delay_ms(attempt);
                     debug!(
-                        "Retrying {} after {}ms (attempt {})",
+                        "Retrying {} after {}ms (transport_attempt {})",
                         label,
                         delay_ms,
                         attempt + 2
@@ -310,7 +395,7 @@ where
                 let error_msg = format_ttft_timeout_error(label, ttft_timeout);
                 let error = anyhow!("{}", error_msg);
                 warn!(
-                    "{} request failed: {}ms, attempt {}/{}, error: {}",
+                    "{} request failed: {}ms, transport_attempt {}/{}, error: {}",
                     label,
                     connect_time,
                     attempt + 1,
@@ -328,7 +413,7 @@ where
                 if attempt < max_tries - 1 {
                     let delay_ms = exponential_retry_delay_ms(attempt);
                     debug!(
-                        "Retrying {} after {}ms (attempt {})",
+                        "Retrying {} after {}ms (transport_attempt {})",
                         label,
                         delay_ms,
                         attempt + 2
@@ -377,6 +462,35 @@ mod tests {
         atomic::{AtomicBool, Ordering},
         Arc,
     };
+
+    #[test]
+    fn http_error_uses_structured_code_before_generic_message() {
+        let error = http_provider_error(
+            "OpenAI Responses API",
+            StatusCode::BAD_REQUEST,
+            r#"{"error":{"code":"context_length_exceeded","message":"Request failed"}}"#,
+            "client error",
+        );
+
+        assert_eq!(error.category, ErrorCategory::ContextOverflow);
+        assert_eq!(
+            error.provider_code.as_deref(),
+            Some("context_length_exceeded")
+        );
+        assert_eq!(error.http_status, Some(400));
+    }
+
+    #[test]
+    fn no_body_bad_request_is_not_assumed_to_be_context_overflow() {
+        let error = http_provider_error(
+            "OpenAI Responses API",
+            StatusCode::BAD_REQUEST,
+            "400 status code (no body)",
+            "client error",
+        );
+
+        assert_eq!(error.category, ErrorCategory::InvalidRequest);
+    }
 
     #[test]
     fn format_ttft_timeout_error_includes_timeout_seconds() {
@@ -457,8 +571,59 @@ mod tests {
     fn retry_delay_falls_back_to_exponential_backoff() {
         let headers = HeaderMap::new();
 
-        assert_eq!(retry_delay_ms(0, &headers), 500);
-        assert_eq!(retry_delay_ms(1, &headers), 1000);
-        assert_eq!(retry_delay_ms(4, &headers), 4000);
+        assert_eq!(retry_delay_ms(0, &headers, StatusCode::BAD_GATEWAY), 500);
+        assert_eq!(retry_delay_ms(1, &headers, StatusCode::BAD_GATEWAY), 1000);
+        assert_eq!(retry_delay_ms(4, &headers, StatusCode::BAD_GATEWAY), 8_000);
+        assert_eq!(retry_delay_ms(6, &headers, StatusCode::BAD_GATEWAY), 30_000);
+        assert_eq!(retry_delay_ms(8, &headers, StatusCode::BAD_GATEWAY), 30_000);
+    }
+
+    #[test]
+    fn rate_limit_retry_uses_longer_exponential_backoff() {
+        let headers = HeaderMap::new();
+
+        assert_eq!(
+            retry_delay_ms(0, &headers, StatusCode::TOO_MANY_REQUESTS),
+            2_000
+        );
+        assert_eq!(
+            retry_delay_ms(1, &headers, StatusCode::TOO_MANY_REQUESTS),
+            4_000
+        );
+        assert_eq!(
+            retry_delay_ms(3, &headers, StatusCode::TOO_MANY_REQUESTS),
+            16_000
+        );
+        assert_eq!(
+            retry_delay_ms(5, &headers, StatusCode::TOO_MANY_REQUESTS),
+            60_000
+        );
+        assert_eq!(
+            retry_delay_ms(9, &headers, StatusCode::TOO_MANY_REQUESTS),
+            60_000
+        );
+    }
+
+    #[test]
+    fn rate_limit_retry_after_never_undercuts_exponential_floor() {
+        let mut headers = HeaderMap::new();
+        headers.insert(RETRY_AFTER, HeaderValue::from_static("1"));
+
+        // Retry-After: 1s must not collapse attempt 3 back to a 1s storm.
+        assert_eq!(
+            retry_delay_ms(3, &headers, StatusCode::TOO_MANY_REQUESTS),
+            16_000
+        );
+    }
+
+    #[test]
+    fn rate_limit_honors_longer_retry_after() {
+        let mut headers = HeaderMap::new();
+        headers.insert(RETRY_AFTER, HeaderValue::from_static("45"));
+
+        assert_eq!(
+            retry_delay_ms(0, &headers, StatusCode::TOO_MANY_REQUESTS),
+            45_000
+        );
     }
 }

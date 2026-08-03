@@ -49,6 +49,12 @@ pub struct GetRuntimeLoggingInfoRequest {}
 #[derive(Debug, Deserialize, Default)]
 pub struct ExportDiagnosticsBundleRequest {}
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppendFlowChatDiagnosticsRequest {
+    pub entries: Vec<Value>,
+}
+
 fn to_json_value<T: Serialize>(value: T, context: &str) -> Result<Value, String> {
     serde_json::to_value(value).map_err(|e| format!("Failed to serialize {}: {}", context, e))
 }
@@ -188,7 +194,7 @@ pub async fn set_config(
         Ok(_) => {
             if request.path.starts_with("ai.models")
                 || request.path.starts_with("ai.default_models")
-                || request.path.starts_with("ai.agent_models")
+                || request.path.starts_with("ai.agent_model_defaults")
                 || request.path.starts_with("ai.stream_idle_timeout_secs")
                 || request.path.starts_with("ai.stream_ttft_timeout_secs")
                 || request.path.starts_with("ai.proxy")
@@ -199,6 +205,9 @@ pub async fn set_config(
                     request.path
                 );
             }
+
+            // Notify auto-sync to upload the updated config to the relay
+            crate::api::remote_connect_api::notify_settings_changed();
 
             Ok("Configuration set successfully".to_string())
         }
@@ -242,6 +251,9 @@ pub async fn reset_config(
                 );
             }
 
+            // Notify auto-sync: config reset, upload to relay
+            crate::api::remote_connect_api::notify_settings_changed();
+
             Ok(message)
         }
         Err(e) => {
@@ -283,6 +295,8 @@ pub async fn import_config(
         Ok(result) => {
             state.ai_client_factory.invalidate_cache();
             info!("Config imported, AI client cache invalidated");
+            // Notify auto-sync: config changed, upload to relay
+            crate::api::remote_connect_api::notify_settings_changed();
             Ok(to_json_value(result, "import config result")?)
         }
         Err(e) => {
@@ -363,6 +377,18 @@ pub async fn export_diagnostics_bundle(
 ) -> Result<Value, String> {
     let bundle_info = crate::crash_diagnostics::export_diagnostics_bundle()?;
     to_json_value(bundle_info, "diagnostics bundle info")
+}
+
+#[tauri::command]
+pub async fn append_flow_chat_diagnostics(
+    _state: State<'_, AppState>,
+    request: AppendFlowChatDiagnosticsRequest,
+) -> Result<usize, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::logging::append_flow_chat_diagnostics(&request.entries)
+    })
+    .await
+    .map_err(|error| format!("Flow Chat diagnostics writer task failed: {}", error))?
 }
 
 #[tauri::command]

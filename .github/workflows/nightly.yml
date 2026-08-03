@@ -67,6 +67,9 @@ jobs:
     if: needs.check-changes.outputs.should_build == 'true'
     env:
       NODE_OPTIONS: --max-old-space-size=6144
+      # Nightly relay archives are signed too (linux-binaries.yml receives the
+      # key), so nightly Desktop needs the same trust root to verify them.
+      BITFUN_RELEASE_PUBKEY: ${{ secrets.TAURI_UPDATER_PUBKEY }}
 
     strategy:
       fail-fast: false
@@ -97,11 +100,6 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Setup OpenSSL (Windows, prebuilt)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: ./scripts/ci/setup-openssl-windows.ps1
-
       - name: Install Linux system dependencies (Tauri bundler)
         if: runner.os == 'Linux'
         shell: bash
@@ -120,11 +118,14 @@ jobs:
             APPINDICATOR_PKG=libayatana-appindicator3-dev
           fi
 
+          # Tauri pins AppImage GTK input methods to its bundled cache, so the
+          # fcitx5 GTK3 bridge must be present before linuxdeploy builds it.
           sudo apt-get install -y --no-install-recommends \
             pkg-config \
             xdg-utils \
             libglib2.0-dev \
             libgtk-3-dev \
+            fcitx5-frontend-gtk3 \
             libxdo-dev \
             "$WEBKIT_PKG" \
             "$APPINDICATOR_PKG" \
@@ -189,8 +190,49 @@ jobs:
           echo "package.json version: $(jq -r '.version' package.json)"
           echo "Cargo.toml version:   $(grep 'x-release-please-version' Cargo.toml)"
 
+      - name: Run Windows CLI terminal contracts
+        if: runner.os == 'Windows'
+        env:
+          CARGO_INCREMENTAL: "0"
+          CARGO_PROFILE_DEV_DEBUG: "0"
+          CARGO_PROFILE_TEST_DEBUG: "0"
+        run: |
+          cargo generate-lockfile
+          cargo test --locked -p bitfun-cli --test terminal_process_contracts
+
       - name: Build desktop app
         run: ${{ matrix.platform.build_command }}
+
+      - name: Package macOS CLI for SSH dispatch
+        if: runner.os == 'macOS'
+        id: macos-cli
+        shell: bash
+        env:
+          NIGHTLY_VERSION: ${{ needs.check-changes.outputs.nightly_version }}
+          TARGET: ${{ matrix.platform.target }}
+        run: |
+          set -euo pipefail
+          ASSET_VERSION="${NIGHTLY_VERSION%%+*}"
+          cargo build --release --target "$TARGET" -p bitfun-cli
+          bash scripts/cli/package-unix.sh "$ASSET_VERSION" "$TARGET"
+
+      - name: Sign macOS CLI archive and checksum
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          BITFUN_SIGNING_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          BITFUN_SIGNING_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          BITFUN_SIGNING_PUBKEY: ${{ secrets.TAURI_UPDATER_PUBKEY }}
+        run: |
+          set -euo pipefail
+          bash scripts/sign-release-assets.sh \
+            "${{ steps.macos-cli.outputs.archive }}" \
+            "${{ steps.macos-cli.outputs.checksum }}"
+
+      - name: Verify AppImage fcitx5 GTK module
+        if: runner.os == 'Linux'
+        shell: bash
+        run: bash scripts/ci/verify-appimage-fcitx.sh "${{ matrix.platform.target }}"
 
       - name: Upload bundles
         uses: actions/upload-artifact@v6
@@ -203,11 +245,29 @@ jobs:
             target/release/bundle
             src/apps/desktop/target/release/bundle
             BitFun-Installer/src-tauri/target/release/bitfun-installer.exe
+            bitfun-cli-*-apple-darwin.tar.gz
+            bitfun-cli-*-apple-darwin.tar.gz.sha256
+            bitfun-cli-*-apple-darwin.tar.gz.sig
+            bitfun-cli-*-apple-darwin.tar.gz.sha256.sig
+
+  linux-binaries:
+    name: Linux CLI and Relay Server
+    needs: check-changes
+    if: needs.check-changes.outputs.should_build == 'true'
+    uses: ./.github/workflows/linux-binaries.yml
+    secrets:
+      release_signing_key: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      release_signing_password: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      release_pubkey: ${{ secrets.TAURI_UPDATER_PUBKEY }}
+    with:
+      checkout_ref: ${{ github.sha }}
+      version: ${{ needs.check-changes.outputs.nightly_version }}
+      artifact_prefix: nightly
 
   # ── Publish nightly pre-release ────────────────────────────────────
   publish-nightly:
     name: Publish Nightly
-    needs: [check-changes, package]
+    needs: [check-changes, package, linux-binaries]
     if: needs.check-changes.outputs.should_build == 'true'
     runs-on: ubuntu-latest
 
@@ -221,16 +281,67 @@ jobs:
           path: release-assets
           merge-multiple: true
 
+      - name: Download Linux binary artifacts
+        uses: actions/download-artifact@v7
+        with:
+          pattern: bitfun-linux-nightly-*
+          path: linux-release-assets
+          merge-multiple: true
+
       - name: List release assets
         run: |
           echo "Nightly assets:"
           find release-assets -type f | sort
+          echo "Nightly Linux CLI and Relay Server assets:"
+          find linux-release-assets -type f | sort
 
       - name: Delete previous nightly release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release delete "${{ env.NIGHTLY_TAG }}" --yes --cleanup-tag 2>/dev/null || true
+
+      - name: Generate Linux binaries manifest
+        env:
+          NIGHTLY_VERSION: ${{ needs.check-changes.outputs.nightly_version }}
+        run: |
+          set -euo pipefail
+          # Asset names drop the `+<sha>` build metadata (see linux-binaries.yml).
+          node scripts/generate-linux-binaries-manifest.mjs \
+            --assets-dir linux-release-assets \
+            --version "${NIGHTLY_VERSION%%+*}" \
+            --tag "${{ env.NIGHTLY_TAG }}" \
+            --repo "GCWing/BitFun" \
+            --out linux-release-assets/linux-binaries.json
+
+      # The Tauri bundler signs the five updater artifacts during `tauri build`,
+      # but the installers people download by hand from the release page — dmg,
+      # deb, rpm, the Windows installer and the direct AppImages — shipped with
+      # no signature at all. Sign them with the same key so every published
+      # artifact is verifiable. (This is not OS-level code signing: Gatekeeper
+      # and SmartScreen still need Apple/Authenticode certificates.)
+      - name: Sign installer packages
+        shell: bash
+        env:
+          BITFUN_SIGNING_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          BITFUN_SIGNING_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          BITFUN_SIGNING_PUBKEY: ${{ secrets.TAURI_UPDATER_PUBKEY }}
+        run: |
+          set -euo pipefail
+          mapfile -t assets < <(
+            find release-assets -type f \
+              \( -name '*.AppImage' -o -name '*.deb' -o -name '*.rpm' \
+                 -o -name '*.dmg' -o -name '*bitfun-installer.exe' \) | sort
+          )
+          if [[ "${#assets[@]}" -eq 0 ]]; then
+            echo "No installer packages found to sign."
+            exit 0
+          fi
+          bash scripts/sign-release-assets.sh "${assets[@]}"
+
+          # Publish the public key alongside the signatures: a signature nobody
+          # can fetch a key for is not verifiable.
+          printf '%s' "${BITFUN_SIGNING_PUBKEY}" | base64 -d >release-assets/minisign.pub
 
       - name: Create nightly release
         uses: softprops/action-gh-release@v3
@@ -252,3 +363,39 @@ jobs:
             release-assets/**/*.dmg
             release-assets/**/*.rpm
             release-assets/**/*bitfun-installer.exe
+            release-assets/**/*.sig
+            release-assets/minisign.pub
+            release-assets/**/bitfun-cli-*-apple-darwin.tar.gz
+            release-assets/**/bitfun-cli-*-apple-darwin.tar.gz.sha256
+            linux-release-assets/bitfun-cli-*.tar.gz
+            linux-release-assets/bitfun-cli-*.tar.gz.sha256
+            linux-release-assets/bitfun-relay-server-*.tar.gz
+            linux-release-assets/bitfun-relay-server-*.tar.gz.sha256
+            linux-release-assets/*.tar.gz.sig
+            linux-release-assets/*.tar.gz.sha256.sig
+            linux-release-assets/linux-binaries.json
+
+      - name: Verify published Linux CLI signatures
+        shell: bash
+        run: |
+          set -euo pipefail
+          while IFS= read -r cli_url; do
+            curl -fsSL --retry 5 --retry-delay 3 "${cli_url}.sig" -o /dev/null
+            curl -fsSL --retry 5 --retry-delay 3 "${cli_url}.sha256.sig" -o /dev/null
+          done < <(jq -r '.platforms[].cli.url' linux-release-assets/linux-binaries.json)
+
+      - name: Verify published macOS CLI assets
+        shell: bash
+        env:
+          NIGHTLY_VERSION: ${{ needs.check-changes.outputs.nightly_version }}
+        run: |
+          set -euo pipefail
+          ASSET_VERSION="${NIGHTLY_VERSION%%+*}"
+          RELEASE_ROOT="https://github.com/GCWing/BitFun/releases/download/${{ env.NIGHTLY_TAG }}"
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            archive="${RELEASE_ROOT}/bitfun-cli-${ASSET_VERSION}-${target}.tar.gz"
+            curl -fsSL --retry 5 --retry-delay 3 "$archive" -o /dev/null
+            curl -fsSL --retry 5 --retry-delay 3 "${archive}.sha256" -o /dev/null
+            curl -fsSL --retry 5 --retry-delay 3 "${archive}.sig" -o /dev/null
+            curl -fsSL --retry 5 --retry-delay 3 "${archive}.sha256.sig" -o /dev/null
+          done

@@ -38,6 +38,8 @@ pub enum MessageContent {
     ToolResult {
         tool_id: String,
         tool_name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effective_tool_name: Option<String>,
         result: serde_json::Value,
         result_for_assistant: Option<String>,
         is_error: bool,
@@ -108,6 +110,13 @@ pub enum InternalReminderKind {
     InterruptedContinue,
     ThinkingOnlyRescue,
     FinalizeCacheAnchor,
+    /// Re-establishes execution after compaction; replaced by the next compaction.
+    CompressionContinuation,
+    /// A Stop hook blocked the end of a turn and asked the agent to continue.
+    StopHookBlock,
+    /// Model-visible context contributed by a SessionStart or
+    /// UserPromptSubmit hook.
+    HookContext,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -138,6 +147,12 @@ impl InternalReminderKind {
                 | Self::InterruptedContinue
                 | Self::ThinkingOnlyRescue
                 | Self::FinalizeCacheAnchor
+                | Self::CompressionContinuation
+                // Mid-turn scaffolding: the Stop hook's feedback matters only
+                // while the reopened turn is still running. HookContext is
+                // deliberately absent — it carries real context a hook asked
+                // the model to keep.
+                | Self::StopHookBlock
         )
     }
 
@@ -346,6 +361,7 @@ impl From<Message> for AIMessage {
             MessageContent::ToolResult {
                 tool_id,
                 tool_name,
+                effective_tool_name: _,
                 result,
                 result_for_assistant,
                 is_error,
@@ -484,6 +500,7 @@ impl Message {
             content: MessageContent::ToolResult {
                 tool_id: result.tool_id.clone(),
                 tool_name: result.tool_name.clone(),
+                effective_tool_name: result.effective_tool_name.clone(),
                 result: result.result.clone(),
                 result_for_assistant: result.result_for_assistant.clone(),
                 is_error: result.is_error,
@@ -667,6 +684,7 @@ impl Display for MessageContent {
             MessageContent::ToolResult {
                 tool_id,
                 tool_name,
+                effective_tool_name: _,
                 result,
                 result_for_assistant,
                 is_error,
@@ -705,8 +723,10 @@ impl Display for MessageContent {
 
 #[cfg(test)]
 mod tests {
-    use super::Message;
+    use super::{Message, ToolCall};
     use crate::util::types::Message as AIMessage;
+    use bitfun_agent_stream::ToolArgumentRepairKind;
+    use serde_json::json;
 
     #[test]
     fn preserves_empty_reasoning_content_for_provider_replay() {
@@ -717,6 +737,26 @@ mod tests {
 
         assert_eq!(ai_msg.reasoning_content.as_deref(), Some(""));
         assert_eq!(ai_msg.thinking_signature.as_deref(), Some("sig_1"));
+    }
+
+    #[test]
+    fn preserves_tool_argument_repair_provenance_from_stream_contract() {
+        let tool_call = ToolCall::from(bitfun_agent_stream::ToolCall {
+            tool_id: "call_1".to_string(),
+            tool_name: "Read".to_string(),
+            arguments: json!({ "path": "src/main.rs" }),
+            raw_arguments: Some(r#"{"path":"src/main.rs" "line_end":4}"#.to_string()),
+            is_error: false,
+            parse_error: None,
+            recovered_from_truncation: false,
+            repair_kind: ToolArgumentRepairKind::PermissiveNormalToolJsonRepair,
+        });
+
+        assert_eq!(
+            tool_call.repair_kind,
+            ToolArgumentRepairKind::PermissiveNormalToolJsonRepair
+        );
+        assert!(!tool_call.recovered_from_truncation);
     }
 }
 
@@ -733,11 +773,20 @@ pub struct ToolCall {
     /// Record whether tool parameters are valid
     #[serde(default)]
     pub is_error: bool,
+    /// Original JSON parser error when the provider emitted invalid arguments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parse_error: Option<String>,
     /// True when the raw JSON arguments were truncated mid-stream and we
     /// successfully repaired them. Downstream consumers can flag this to the
     /// model so it understands the content may be incomplete.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub recovered_from_truncation: bool,
+    /// Provenance for any argument repair accepted before tool validation.
+    #[serde(
+        default,
+        skip_serializing_if = "bitfun_agent_stream::ToolArgumentRepairKind::is_none"
+    )]
+    pub repair_kind: bitfun_agent_stream::ToolArgumentRepairKind,
 }
 
 impl ToolCall {
@@ -754,7 +803,9 @@ impl From<bitfun_agent_stream::ToolCall> for ToolCall {
             arguments: tool_call.arguments,
             raw_arguments: tool_call.raw_arguments,
             is_error: tool_call.is_error,
+            parse_error: tool_call.parse_error,
             recovered_from_truncation: tool_call.recovered_from_truncation,
+            repair_kind: tool_call.repair_kind,
         }
     }
 }
@@ -762,7 +813,11 @@ impl From<bitfun_agent_stream::ToolCall> for ToolCall {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolResult {
     pub tool_id: String,
+    /// Provider-facing tool name. Deferred calls retain the gateway name.
     pub tool_name: String,
+    /// Runtime target for internal persistence, classification, and UI projection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_tool_name: Option<String>,
     pub result: serde_json::Value,
     /// Result text specifically for passing to AI assistant (if None, then use result)
     pub result_for_assistant: Option<String>,

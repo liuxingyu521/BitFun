@@ -11,7 +11,36 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+pub use bitfun_core_types::{
+    SessionExecutionTarget, SessionExecutionTargetKind, SessionExecutionTargetRequest,
+    WorktreeError, WorktreeErrorCode, WorktreeLifecycle, WorktreeSettings, WorktreeSummary,
+};
+
+mod local_workspace_snapshot;
+#[cfg(feature = "permission")]
+mod permission;
 mod plugin;
+mod script_tool;
+#[cfg(feature = "permission")]
+pub use bitfun_product_domains::tool_permissions::{
+    resolve_child_permission_policy, resolve_permission_policy, wildcard_matches,
+    ChildPermissionPolicyLayers, PermissionAuditEvent, PermissionAuditRecord,
+    PermissionConstraintLayer, PermissionDelegationContext, PermissionEffect, PermissionEvaluator,
+    PermissionGrant, PermissionGrantKey, PermissionInteractionConfig, PermissionPolicyConfig,
+    PermissionPolicyLayers, PermissionPolicyPreset, PermissionReply, PermissionReplySource,
+    PermissionRequest, PermissionRequestEvent, PermissionRequestSource,
+    PermissionRequestSourceKind, PermissionResourceCaseSensitivity, PermissionRule,
+    PermissionRuleset, PermissionRuntimeCeiling, PermissionRuntimeCeilingValidationError,
+    ResolvedPermissionPolicy, ToolPermissionConfig,
+};
+pub use local_workspace_snapshot::{
+    LocalWorkspaceSnapshotPort, LocalWorkspaceSnapshotSessionRequest, LocalWorkspaceSnapshotStats,
+    LocalWorkspaceSnapshotTurnRequest,
+};
+#[cfg(feature = "permission")]
+pub use permission::{
+    PermissionAuditStorePort, PermissionGrantStorePort, PermissionReplyStorePort,
+};
 pub use plugin::{
     validate_plugin_dispatch_response, validate_plugin_runtime_read_response,
     DisabledPluginRuntimeClient, ExtensionCapabilityAvailability, PermissionPromptDenyState,
@@ -28,6 +57,11 @@ pub use plugin::{
     PluginRuntimeUnavailableReason, PluginSourceKind, PluginSourceRef, PluginStatusKind,
     PluginStatusSnapshot, PluginTargetRef, PluginTrustLevel, ProjectionOnlyPluginRuntimeClient,
 };
+pub use script_tool::{
+    ScriptToolDescriptor, ScriptToolExpectedExport, ScriptToolInvokeRequest,
+    ScriptToolInvokeResponse, ScriptToolLoadRequest, ScriptToolLoadResponse, ScriptToolRuntime,
+    ScriptToolRuntimeAvailability,
+};
 
 pub type PortResult<T> = Result<T, PortError>;
 
@@ -40,6 +74,9 @@ pub enum PortErrorKind {
     PermissionDenied,
     Cancelled,
     Timeout,
+    SessionInUse,
+    CleanupRequired,
+    OutcomeUnknown,
     Backend,
 }
 
@@ -191,6 +228,21 @@ pub struct SessionTurnLoadRequest {
     pub tail_turn_count: Option<usize>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionTurnWindowRequest {
+    pub workspace_path: PathBuf,
+    pub session_id: String,
+    pub include_internal: bool,
+    pub target_storage_turn_index: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_catalog_revision: Option<String>,
+    pub before: usize,
+    pub after: usize,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionTurnLoadTiming {
@@ -216,6 +268,8 @@ pub struct SessionViewRestoreTiming {
     pub visibility_metadata_duration_ms: u64,
     pub load_session_with_turns_duration_ms: u64,
     pub normalize_turn_ids_duration_ms: u64,
+    #[serde(default)]
+    pub turn_catalog_duration_ms: u64,
     pub total_duration_ms: u64,
     pub turn_load: SessionTurnLoadTiming,
 }
@@ -237,17 +291,56 @@ pub struct WorkspaceDirEntry {
     pub is_symlink: bool,
 }
 
+/// File type for one exact path without following its final symbolic link.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspacePathKind {
+    File,
+    Directory,
+    Symlink,
+    Other,
+}
+
 /// Unified file system operations that work for both local and remote workspaces.
 #[async_trait::async_trait]
 pub trait WorkspaceFileSystem: Send + Sync {
     async fn read_file(&self, path: &str) -> anyhow::Result<Vec<u8>>;
     async fn read_file_text(&self, path: &str) -> anyhow::Result<String>;
+    /// Read UTF-8 text up to `max_bytes`. Production filesystem providers
+    /// should enforce the bound before or while transferring the file.
+    async fn read_file_text_bounded(
+        &self,
+        path: &str,
+        max_bytes: usize,
+    ) -> anyhow::Result<Option<String>> {
+        let content = self.read_file_text(path).await?;
+        Ok((content.len() <= max_bytes).then_some(content))
+    }
     async fn write_file(&self, path: &str, contents: &[u8]) -> anyhow::Result<()>;
     async fn exists(&self, path: &str) -> anyhow::Result<bool>;
     async fn is_file(&self, path: &str) -> anyhow::Result<bool>;
     async fn is_dir(&self, path: &str) -> anyhow::Result<bool>;
+    /// Inspect one exact path without following its final symbolic link.
+    /// Providers that cannot guarantee no-follow semantics must return an
+    /// error instead of falling back to link-following metadata.
+    async fn path_kind_no_follow(&self, _path: &str) -> anyhow::Result<Option<WorkspacePathKind>> {
+        Err(anyhow::anyhow!(
+            "exact no-follow path metadata is not supported by this workspace filesystem"
+        ))
+    }
     /// List immediate children (non-recursive). Symlinks may be included; callers often skip them.
     async fn read_dir(&self, path: &str) -> anyhow::Result<Vec<WorkspaceDirEntry>>;
+    /// List at most `max_entries` immediate children. Production providers
+    /// should stop local iteration or remote directory-batch requests once the
+    /// bound is met.
+    async fn read_dir_bounded(
+        &self,
+        path: &str,
+        max_entries: usize,
+    ) -> anyhow::Result<Vec<WorkspaceDirEntry>> {
+        let mut entries = self.read_dir(path).await?;
+        entries.truncate(max_entries);
+        Ok(entries)
+    }
 }
 
 /// Unified shell execution options for local and remote workspaces.
@@ -660,30 +753,6 @@ impl std::fmt::Debug for ToolRuntimeHandles {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PermissionRequest {
-    pub scope: String,
-    pub action: String,
-    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
-    pub metadata: serde_json::Map<String, serde_json::Value>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PermissionDecision {
-    Allow,
-    Deny { reason: String },
-}
-
-#[async_trait::async_trait]
-pub trait PermissionPort: RuntimeServicePort {
-    async fn request_permission(
-        &self,
-        request: PermissionRequest,
-    ) -> PortResult<PermissionDecision>;
-}
-
 pub trait ClockPort: RuntimeServicePort {
     fn now_unix_millis(&self) -> i64;
 }
@@ -759,7 +828,55 @@ pub trait RemoteExecPort: RuntimeServicePort + std::fmt::Debug {
 
 pub trait NetworkPort: RuntimeServicePort {}
 
-pub trait GitPort: RuntimeServicePort {}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceDiffFileStatus {
+    Added,
+    Modified,
+    Deleted,
+    Renamed,
+    Conflicted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WorkspaceDiffContent {
+    Text { patch: String },
+    Binary,
+    TooLarge,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceDiffFile {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_path: Option<String>,
+    pub status: WorkspaceDiffFileStatus,
+    pub staged: bool,
+    pub unstaged: bool,
+    pub untracked: bool,
+    pub additions: usize,
+    pub deletions: usize,
+    pub content: WorkspaceDiffContent,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceDiffSnapshot {
+    pub files: Vec<WorkspaceDiffFile>,
+    pub truncated: bool,
+}
+
+#[async_trait::async_trait]
+pub trait GitPort: RuntimeServicePort {
+    async fn workspace_diff(&self) -> PortResult<WorkspaceDiffSnapshot> {
+        Err(PortError::new(
+            PortErrorKind::NotAvailable,
+            "workspace diff is not supported by this provider",
+        ))
+    }
+}
 
 pub trait McpCatalogPort: RuntimeServicePort {}
 
@@ -836,6 +953,10 @@ pub struct RemoteRecentWorkspaceFacts {
     pub name: String,
     pub last_opened: String,
     pub kind: RemoteWorkspaceKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_connection_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_ssh_host: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -852,6 +973,10 @@ pub struct RemoteAssistantWorkspaceFacts {
 pub struct RemoteWorkspaceUpdate {
     pub path: String,
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_connection_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_ssh_host: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -902,7 +1027,12 @@ pub struct RemoteFileChunkRange {
 pub trait RemoteWorkspaceRuntimeHost: Send + Sync {
     async fn current_workspace(&self) -> Option<RemoteWorkspaceFacts>;
     async fn recent_workspaces(&self) -> Vec<RemoteRecentWorkspaceFacts>;
-    async fn open_workspace(&self, path: &str) -> Result<RemoteWorkspaceUpdate, String>;
+    async fn open_workspace(
+        &self,
+        path: &str,
+        remote_connection_id: Option<&str>,
+        remote_ssh_host: Option<&str>,
+    ) -> Result<RemoteWorkspaceUpdate, String>;
     async fn assistant_workspaces(&self) -> Vec<RemoteAssistantWorkspaceFacts>;
     async fn open_assistant_workspace(&self, path: &str) -> Result<RemoteWorkspaceUpdate, String>;
 }
@@ -949,9 +1079,17 @@ pub struct AgentSessionCreateRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_workspace_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_target: Option<SessionExecutionTarget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_connection_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_ssh_host: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
     #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
     pub metadata: serde_json::Map<String, serde_json::Value>,
 }
@@ -963,6 +1101,32 @@ pub struct AgentSessionCreateResult {
     #[serde(default)]
     pub session_name: String,
     pub agent_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_workspace_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_target: Option<SessionExecutionTarget>,
+}
+
+impl AgentSessionCreateResult {
+    pub fn new(
+        session_id: impl Into<String>,
+        session_name: impl Into<String>,
+        agent_type: impl Into<String>,
+    ) -> Self {
+        Self {
+            session_id: session_id.into(),
+            session_name: session_name.into(),
+            agent_type: agent_type.into(),
+            workspace_path: None,
+            workspace_id: None,
+            project_workspace_path: None,
+            execution_target: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -981,6 +1145,14 @@ pub struct AgentSessionSummary {
     pub session_id: String,
     pub session_name: String,
     pub agent_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_user_dialog_agent_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_submitted_agent_type: Option<String>,
+    #[serde(default)]
+    pub turn_count: usize,
     pub created_at_ms: u64,
     pub last_active_at_ms: u64,
 }
@@ -998,6 +1170,214 @@ pub struct AgentSessionDeleteRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct AgentSessionRenameRequest {
+    pub workspace_path: String,
+    pub session_id: String,
+    pub session_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_connection_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_ssh_host: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSessionArchiveRequest {
+    pub workspace_path: String,
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_connection_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_ssh_host: Option<String>,
+}
+
+/// Sets the persisted archive state without exposing product-specific archive UI.
+///
+/// This is separate from [`AgentSessionArchiveRequest`] so existing archive-only
+/// consumers keep their current request shape and behavior.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSessionArchiveStateRequest {
+    pub workspace_path: String,
+    pub session_id: String,
+    pub archived: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_connection_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_ssh_host: Option<String>,
+}
+
+/// Records one completed local command result in user-visible session history.
+///
+/// This request intentionally cannot select another turn kind or opt the turn
+/// into model context. It is not a generic transcript-writing contract.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentLocalCommandTurnRecordRequest {
+    pub session_id: String,
+    pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub metadata: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Starts one user-authored shell command as a normal, model-visible tool turn.
+///
+/// The caller provides the exact turn identity so interactive adapters can
+/// register cancellation before the side effect is admitted. Implementations
+/// must route execution through the normal tool, permission, and audit owners;
+/// this is not a generic process-spawn or arbitrary-tool contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgentUserShellCommandRequest {
+    pub session_id: String,
+    pub turn_id: String,
+    pub command: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgentUserShellCommandResult {
+    pub session_id: String,
+    pub turn_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSessionModelUpdateRequest {
+    pub session_id: String,
+    pub model_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSessionModeUpdateRequest {
+    pub session_id: String,
+    pub mode_id: String,
+}
+
+/// Starts one audited manual context-compaction maintenance turn.
+///
+/// The caller supplies the exact turn identity so process adapters can register
+/// cancellation ownership before the side effect is admitted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgentSessionCompactionRequest {
+    pub session_id: String,
+    pub turn_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgentSessionCompactionResult {
+    pub session_id: String,
+    pub turn_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentContextReloadTarget {
+    All,
+    Skills,
+    Instructions,
+}
+
+impl AgentContextReloadTarget {
+    pub const fn includes_skills(self) -> bool {
+        matches!(self, Self::All | Self::Skills)
+    }
+
+    pub const fn includes_instructions(self) -> bool {
+        matches!(self, Self::All | Self::Instructions)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgentContextReloadRequest {
+    pub session_id: String,
+    pub target: AgentContextReloadTarget,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSessionForkRequest {
+    pub workspace_path: String,
+    pub source_session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_connection_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_ssh_host: Option<String>,
+}
+
+/// Forks a session at an explicitly selected persisted turn.
+///
+/// This is additive to [`AgentSessionForkRequest`] so existing Rust SDK
+/// consumers keep the source-compatible latest-turn request shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSessionForkAtTurnRequest {
+    pub workspace_path: String,
+    pub source_session_id: String,
+    pub source_turn_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_connection_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_ssh_host: Option<String>,
+}
+
+/// Forks a session immediately before an explicitly selected persisted turn.
+///
+/// The selected turn is the replayable prompt boundary and is not copied into
+/// the fork. This stays separate from [`AgentSessionForkAtTurnRequest`] so its
+/// inclusive behavior remains source- and behavior-compatible.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSessionForkBeforeTurnRequest {
+    pub workspace_path: String,
+    pub source_session_id: String,
+    pub source_turn_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_connection_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_ssh_host: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSessionForkResult {
+    pub session_id: String,
+    pub session_name: String,
+    pub agent_type: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSessionUsageRequest {
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_connection_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_ssh_host: Option<String>,
+    #[serde(default)]
+    pub include_hidden_subagents: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentTurnSettlementRequest {
+    pub session_id: String,
+    pub turn_id: String,
+    pub wait_timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AgentSessionWorkspaceRequest {
     pub session_id: String,
 }
@@ -1009,9 +1389,132 @@ pub struct AgentSessionWorkspaceBinding {
     pub workspace_id: Option<String>,
     pub workspace_path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_workspace_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_target: Option<SessionExecutionTarget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_connection_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_ssh_host: Option<String>,
+}
+
+pub const AGENT_WORKSPACE_REFERENCES_METADATA_KEY: &str = "workspace_references";
+pub const MAX_AGENT_WORKSPACE_REFERENCES_PER_TURN: usize = 20;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentWorkspaceReferenceKind {
+    File,
+    Directory,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentWorkspaceReferenceSourceRange {
+    /// Zero-based character offset in the original user input.
+    pub start: usize,
+    /// Exclusive zero-based character offset in the original user input.
+    pub end: usize,
+    pub value: String,
+}
+
+/// A user-selected workspace path carried as structured turn metadata.
+///
+/// The path is workspace-relative and slash-normalized. It is not an
+/// authorization token: the runtime owner validates the current Session
+/// binding and path again before accepting the turn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentWorkspaceReference {
+    pub path: String,
+    pub kind: AgentWorkspaceReferenceKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_line: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_line: Option<u32>,
+    pub source: AgentWorkspaceReferenceSourceRange,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentWorkspaceReferenceSearchRequest {
+    pub session_id: String,
+    #[serde(default)]
+    pub query: String,
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentWorkspaceReferenceSearchEntry {
+    pub path: String,
+    pub kind: AgentWorkspaceReferenceKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentWorkspaceReferenceSearchResult {
+    #[serde(default)]
+    pub entries: Vec<AgentWorkspaceReferenceSearchEntry>,
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentMessageWorkspaceReferencesRequest {
+    pub session_id: String,
+    pub message_id: String,
+}
+
+pub fn put_agent_workspace_references(
+    metadata: &mut serde_json::Map<String, serde_json::Value>,
+    references: &[AgentWorkspaceReference],
+) -> PortResult<()> {
+    if references.is_empty() {
+        metadata.remove(AGENT_WORKSPACE_REFERENCES_METADATA_KEY);
+        return Ok(());
+    }
+    if references.len() > MAX_AGENT_WORKSPACE_REFERENCES_PER_TURN {
+        return Err(PortError::new(
+            PortErrorKind::InvalidRequest,
+            format!(
+                "a message can reference at most {MAX_AGENT_WORKSPACE_REFERENCES_PER_TURN} workspace paths"
+            ),
+        ));
+    }
+    let value = serde_json::to_value(references).map_err(|error| {
+        PortError::new(
+            PortErrorKind::InvalidRequest,
+            format!("failed to serialize workspace references: {error}"),
+        )
+    })?;
+    metadata.insert(AGENT_WORKSPACE_REFERENCES_METADATA_KEY.to_string(), value);
+    Ok(())
+}
+
+pub fn agent_workspace_references_from_metadata(
+    metadata: &serde_json::Map<String, serde_json::Value>,
+) -> PortResult<Vec<AgentWorkspaceReference>> {
+    let Some(value) = metadata.get(AGENT_WORKSPACE_REFERENCES_METADATA_KEY) else {
+        return Ok(Vec::new());
+    };
+    let references: Vec<AgentWorkspaceReference> =
+        serde_json::from_value(value.clone()).map_err(|error| {
+            PortError::new(
+                PortErrorKind::InvalidRequest,
+                format!("invalid workspace reference metadata: {error}"),
+            )
+        })?;
+    if references.len() > MAX_AGENT_WORKSPACE_REFERENCES_PER_TURN {
+        return Err(PortError::new(
+            PortErrorKind::InvalidRequest,
+            format!(
+                "a message can reference at most {MAX_AGENT_WORKSPACE_REFERENCES_PER_TURN} workspace paths"
+            ),
+        ));
+    }
+    Ok(references)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1030,6 +1533,27 @@ pub struct AgentSubmissionRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum AgentDialogTurnExecution {
+    Standard,
+    FreshExternalSubagent {
+        ecosystem_id: String,
+        logical_id: String,
+    },
+}
+
+impl Default for AgentDialogTurnExecution {
+    fn default() -> Self {
+        Self::Standard
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentDialogTurnRequest {
     pub session_id: String,
@@ -1038,6 +1562,8 @@ pub struct AgentDialogTurnRequest {
     pub original_message: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "AgentDialogTurnExecution::is_standard")]
+    pub execution: AgentDialogTurnExecution,
     pub agent_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace_path: Option<String>,
@@ -1054,6 +1580,23 @@ pub struct AgentDialogTurnRequest {
     pub attachments: Vec<AgentInputAttachment>,
     #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
     pub metadata: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Text-only steering request for one exact running dialog turn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgentDialogSteerRequest {
+    pub session_id: String,
+    pub turn_id: String,
+    pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_content: Option<String>,
+}
+
+impl AgentDialogTurnExecution {
+    pub fn is_standard(&self) -> bool {
+        matches!(self, Self::Standard)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1113,6 +1656,7 @@ pub enum AgentSubmissionSource {
     RemoteRelay,
     Bot,
     Cli,
+    SdkHost,
 }
 
 pub type DialogTriggerSource = AgentSubmissionSource;
@@ -1130,43 +1674,36 @@ pub enum DialogQueuePriority {
 pub struct DialogSubmissionPolicy {
     pub trigger_source: DialogTriggerSource,
     pub queue_priority: DialogQueuePriority,
-    pub skip_tool_confirmation: bool,
 }
 
 impl DialogSubmissionPolicy {
     pub const fn new(
         trigger_source: DialogTriggerSource,
         queue_priority: DialogQueuePriority,
-        skip_tool_confirmation: bool,
     ) -> Self {
         Self {
             trigger_source,
             queue_priority,
-            skip_tool_confirmation,
         }
     }
 
     pub const fn for_source(trigger_source: DialogTriggerSource) -> Self {
-        let (queue_priority, skip_tool_confirmation) = match trigger_source {
-            DialogTriggerSource::AgentSession => (DialogQueuePriority::Low, true),
-            DialogTriggerSource::ScheduledJob => (DialogQueuePriority::Low, true),
+        let queue_priority = match trigger_source {
+            DialogTriggerSource::AgentSession => DialogQueuePriority::Low,
+            DialogTriggerSource::ScheduledJob => DialogQueuePriority::Low,
             DialogTriggerSource::DesktopUi
             | DialogTriggerSource::DesktopApi
-            | DialogTriggerSource::Cli => (DialogQueuePriority::Normal, false),
+            | DialogTriggerSource::Cli
+            | DialogTriggerSource::SdkHost => DialogQueuePriority::Normal,
             DialogTriggerSource::RemoteRelay | DialogTriggerSource::Bot => {
-                (DialogQueuePriority::Normal, true)
+                DialogQueuePriority::Normal
             }
         };
-        Self::new(trigger_source, queue_priority, skip_tool_confirmation)
+        Self::new(trigger_source, queue_priority)
     }
 
     pub const fn with_queue_priority(mut self, queue_priority: DialogQueuePriority) -> Self {
         self.queue_priority = queue_priority;
-        self
-    }
-
-    pub const fn with_skip_tool_confirmation(mut self, skip_tool_confirmation: bool) -> Self {
-        self.skip_tool_confirmation = skip_tool_confirmation;
         self
     }
 }
@@ -1255,7 +1792,13 @@ pub struct AgentSessionReplyRoute {
 }
 
 /// Outcome for steering a message into an already-running dialog turn.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
 pub enum DialogSteerOutcome {
     /// Steering was buffered for the running turn and will be consumed at the
     /// next model-round boundary.
@@ -1354,6 +1897,15 @@ pub trait DialogRoundInjectionSource: Send + Sync {
         turn_id: &str,
     ) -> RoundInjectionToolPreemption;
     fn take_pending(&self, session_id: &str, turn_id: &str) -> Vec<RoundInjection>;
+
+    fn acknowledge_consumed(
+        &self,
+        _session_id: &str,
+        _turn_id: &str,
+        _injection_id: &str,
+        _kind: RoundInjectionKind,
+    ) {
+    }
 }
 
 /// Legacy session metadata key for the pre-Codex goal mode experiment.
@@ -1471,6 +2023,10 @@ pub struct ThreadGoalToolResponse {
 pub struct AgentThreadGoalGetRequest {
     pub session_id: String,
     pub workspace_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_connection_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_ssh_host: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1616,6 +2172,41 @@ pub trait AgentSubmissionPort: Send + Sync {
         request: AgentSessionCreateRequest,
     ) -> PortResult<AgentSessionCreateResult>;
 
+    /// Creates a session with an exact caller-provided identity.
+    ///
+    /// Providers that do not support exact identity creation keep the default
+    /// typed unsupported response. A successful response must preserve
+    /// `session_id` exactly.
+    async fn create_session_with_id(
+        &self,
+        session_id: String,
+        request: AgentSessionCreateRequest,
+    ) -> PortResult<AgentSessionCreateResult> {
+        let _ = (session_id, request);
+        Err(PortError::new(
+            PortErrorKind::NotAvailable,
+            "exact session identity creation is not supported by this provider",
+        ))
+    }
+
+    /// Creates one caller-identified connection-scoped Session.
+    ///
+    /// The Session uses the normal Runtime owners but must not become durable
+    /// product state. This narrow operation lets process adapters provide
+    /// bounded cleanup without pretending that crash-safe durable creation has
+    /// already been specified.
+    async fn create_transient_session_with_id(
+        &self,
+        session_id: String,
+        request: AgentSessionCreateRequest,
+    ) -> PortResult<AgentSessionCreateResult> {
+        let _ = (session_id, request);
+        Err(PortError::new(
+            PortErrorKind::NotAvailable,
+            "transient exact session creation is not supported by this provider",
+        ))
+    }
+
     async fn submit_message(
         &self,
         request: AgentSubmissionRequest,
@@ -1633,10 +2224,222 @@ pub trait AgentSessionManagementPort: Send + Sync {
 
     async fn delete_session(&self, request: AgentSessionDeleteRequest) -> PortResult<()>;
 
+    async fn rename_session(&self, request: AgentSessionRenameRequest) -> PortResult<()> {
+        let _ = request;
+        Err(PortError::new(
+            PortErrorKind::NotAvailable,
+            "session rename is not supported by this provider",
+        ))
+    }
+
+    async fn archive_session(&self, request: AgentSessionArchiveRequest) -> PortResult<()> {
+        let _ = request;
+        Err(PortError::new(
+            PortErrorKind::NotAvailable,
+            "session archive is not supported by this provider",
+        ))
+    }
+
+    async fn set_session_archived(
+        &self,
+        request: AgentSessionArchiveStateRequest,
+    ) -> PortResult<()> {
+        if request.archived {
+            return self
+                .archive_session(AgentSessionArchiveRequest {
+                    workspace_path: request.workspace_path,
+                    session_id: request.session_id,
+                    remote_connection_id: request.remote_connection_id,
+                    remote_ssh_host: request.remote_ssh_host,
+                })
+                .await;
+        }
+        Err(PortError::new(
+            PortErrorKind::NotAvailable,
+            "session unarchive is not supported by this provider",
+        ))
+    }
+
     async fn resolve_session_workspace_binding(
         &self,
         request: AgentSessionWorkspaceRequest,
     ) -> PortResult<Option<AgentSessionWorkspaceBinding>>;
+}
+
+/// Narrow workspace-reference use cases shared by first-party interactive
+/// adapters. Implementations keep filesystem search and persisted message
+/// lookup behind the authoritative Session owner.
+#[async_trait::async_trait]
+pub trait AgentWorkspaceReferencePort: Send + Sync {
+    async fn search_workspace_references(
+        &self,
+        request: AgentWorkspaceReferenceSearchRequest,
+    ) -> PortResult<AgentWorkspaceReferenceSearchResult>;
+
+    async fn workspace_references_for_message(
+        &self,
+        request: AgentMessageWorkspaceReferencesRequest,
+    ) -> PortResult<Vec<AgentWorkspaceReference>>;
+}
+
+/// Deadline-bearing request for discarding a connection-scoped transient
+/// Session. This is separate from [`AgentSessionDeleteRequest`] so adding Host
+/// cleanup policy cannot break the established Rust Session-management API.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentTransientSessionDiscardRequest {
+    pub workspace_path: String,
+    pub session_id: String,
+    pub remote_connection_id: Option<String>,
+    pub remote_ssh_host: Option<String>,
+    pub wait_timeout_ms: u64,
+}
+
+/// Runtime lifecycle owner for connection-scoped Session cleanup.
+#[async_trait::async_trait]
+pub trait AgentSessionClosePort: Send + Sync {
+    /// Quiesces and discards only a loaded transient Session owned by the
+    /// caller. Implementations must reject durable Sessions and must never
+    /// remove persisted Session storage through this operation.
+    async fn discard_transient_session(
+        &self,
+        request: AgentTransientSessionDiscardRequest,
+    ) -> PortResult<bool> {
+        let _ = request;
+        Err(PortError::new(
+            PortErrorKind::NotAvailable,
+            "transient session discard is not supported by this provider",
+        ))
+    }
+}
+
+#[async_trait::async_trait]
+pub trait AgentLocalCommandTurnPort: Send + Sync {
+    async fn record_completed_local_command_turn(
+        &self,
+        request: AgentLocalCommandTurnRecordRequest,
+    ) -> PortResult<()>;
+}
+
+#[async_trait::async_trait]
+pub trait AgentUserShellCommandPort: Send + Sync {
+    async fn run_user_shell_command(
+        &self,
+        request: AgentUserShellCommandRequest,
+    ) -> PortResult<AgentUserShellCommandResult>;
+}
+
+#[async_trait::async_trait]
+pub trait AgentSessionModelPort: Send + Sync {
+    async fn update_session_model(&self, request: AgentSessionModelUpdateRequest)
+        -> PortResult<()>;
+}
+
+#[async_trait::async_trait]
+pub trait AgentSessionModePort: Send + Sync {
+    async fn update_session_mode(&self, request: AgentSessionModeUpdateRequest) -> PortResult<()>;
+}
+
+#[async_trait::async_trait]
+pub trait AgentSessionCompactionPort: Send + Sync {
+    async fn start_session_compaction(
+        &self,
+        request: AgentSessionCompactionRequest,
+    ) -> PortResult<AgentSessionCompactionResult>;
+}
+
+/// Local Session history mutation requested by an interactive product surface.
+///
+/// This is deliberately narrower than a generic checkpoint or workspace rewind
+/// API: one Core-owned operation keeps the persisted transcript, model context,
+/// and tracked workspace files on the same staged boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSessionRevertRequest {
+    pub workspace_path: String,
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_connection_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_ssh_host: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AgentSessionComposerUpdate {
+    Preserve,
+    Replace { text: String },
+    Clear,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSessionRevertResult {
+    pub session_id: String,
+    pub transcript: SessionTranscript,
+    pub composer: AgentSessionComposerUpdate,
+    /// Active and queued Turns retired by the maintenance boundary. Consumers
+    /// use this as an event-stream fence after replacing their local projection.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retired_turn_ids: Vec<String>,
+    pub changed: bool,
+    pub hidden_turn_count: usize,
+}
+
+#[async_trait::async_trait]
+pub trait AgentSessionRevertPort: Send + Sync {
+    async fn undo_session(
+        &self,
+        request: AgentSessionRevertRequest,
+    ) -> PortResult<AgentSessionRevertResult>;
+
+    async fn redo_session(
+        &self,
+        request: AgentSessionRevertRequest,
+    ) -> PortResult<AgentSessionRevertResult>;
+}
+
+#[async_trait::async_trait]
+pub trait AgentSessionForkPort: Send + Sync {
+    async fn fork_session(
+        &self,
+        request: AgentSessionForkRequest,
+    ) -> PortResult<AgentSessionForkResult>;
+
+    async fn fork_session_at_turn(
+        &self,
+        request: AgentSessionForkAtTurnRequest,
+    ) -> PortResult<AgentSessionForkResult> {
+        let _ = request;
+        Err(PortError::new(
+            PortErrorKind::NotAvailable,
+            "exact-turn session fork is not supported by this provider",
+        ))
+    }
+
+    async fn fork_session_before_turn(
+        &self,
+        request: AgentSessionForkBeforeTurnRequest,
+    ) -> PortResult<AgentSessionForkResult> {
+        let _ = request;
+        Err(PortError::new(
+            PortErrorKind::NotAvailable,
+            "before-turn session fork is not supported by this provider",
+        ))
+    }
+}
+
+#[async_trait::async_trait]
+pub trait AgentSessionUsagePort: Send + Sync {
+    async fn generate_session_usage(
+        &self,
+        request: AgentSessionUsageRequest,
+    ) -> PortResult<bitfun_core_types::SessionUsageReport>;
+}
+
+#[async_trait::async_trait]
+pub trait AgentTurnSettlementPort: Send + Sync {
+    async fn wait_for_turn_settlement(&self, request: AgentTurnSettlementRequest)
+        -> PortResult<()>;
 }
 
 #[async_trait::async_trait]
@@ -1645,6 +2448,16 @@ pub trait AgentDialogTurnPort: Send + Sync {
         &self,
         request: AgentDialogTurnRequest,
     ) -> PortResult<DialogSubmitOutcome>;
+
+    async fn steer_dialog_turn(
+        &self,
+        _request: AgentDialogSteerRequest,
+    ) -> PortResult<DialogSteerOutcome> {
+        Err(PortError::new(
+            PortErrorKind::NotAvailable,
+            "dialog turn steering is not supported by this provider",
+        ))
+    }
 }
 
 #[async_trait::async_trait]
@@ -1813,14 +2626,54 @@ pub struct SessionTranscript {
     pub messages: Vec<TranscriptMessage>,
 }
 
+/// Read-only transcript content shared by runtime consumers.
+///
+/// This projection preserves portable history facts without exposing the Core persistence
+/// message type. Multimodal entries report attachment counts rather than transporting image
+/// payloads; callers that need attachment content require a separate, authorized capability.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum TranscriptContent {
+    Text(String),
+    Multimodal {
+        text: String,
+        image_count: usize,
+    },
+    ToolResult {
+        tool_id: String,
+        tool_name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effective_tool_name: Option<String>,
+        result: serde_json::Value,
+        is_error: bool,
+    },
+    Mixed {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_content: Option<String>,
+        text: String,
+        #[serde(default)]
+        tool_calls: Vec<TranscriptToolCall>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TranscriptToolCall {
+    pub tool_id: String,
+    pub tool_name: String,
+    #[serde(default)]
+    pub arguments: serde_json::Value,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TranscriptMessage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     pub role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<String>,
-    #[serde(default)]
-    pub content: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp_ms: Option<u64>,
+    pub content: TranscriptContent,
 }
 
 #[async_trait::async_trait]
@@ -1880,6 +2733,371 @@ impl SubagentContextMode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    #[test]
+    fn session_revert_contract_preserves_authoritative_transcript_and_composer_intent() {
+        let result = AgentSessionRevertResult {
+            session_id: "session-1".to_string(),
+            transcript: SessionTranscript {
+                session_id: "session-1".to_string(),
+                messages: Vec::new(),
+            },
+            composer: AgentSessionComposerUpdate::Replace {
+                text: "restore this prompt".to_string(),
+            },
+            retired_turn_ids: vec!["turn-2".to_string(), "turn-queued".to_string()],
+            changed: true,
+            hidden_turn_count: 2,
+        };
+
+        let value = serde_json::to_value(&result).expect("session revert result should serialize");
+        assert_eq!(value["sessionId"], "session-1");
+        assert_eq!(value["composer"]["kind"], "replace");
+        assert_eq!(value["composer"]["text"], "restore this prompt");
+        assert_eq!(value["hiddenTurnCount"], 2);
+        assert_eq!(value["retiredTurnIds"][1], "turn-queued");
+        assert_eq!(
+            serde_json::from_value::<AgentSessionRevertResult>(value)
+                .expect("session revert result should deserialize"),
+            result
+        );
+    }
+
+    #[test]
+    fn workspace_reference_metadata_round_trips_without_expanding_dialog_turn_dto() {
+        let references = vec![AgentWorkspaceReference {
+            path: "src/lib.rs".to_string(),
+            kind: AgentWorkspaceReferenceKind::File,
+            start_line: Some(12),
+            end_line: Some(24),
+            source: AgentWorkspaceReferenceSourceRange {
+                start: 7,
+                end: 28,
+                value: "@src/lib.rs#12-24".to_string(),
+            },
+        }];
+        let mut metadata = serde_json::Map::new();
+
+        put_agent_workspace_references(&mut metadata, &references)
+            .expect("workspace reference metadata should serialize");
+
+        assert_eq!(
+            agent_workspace_references_from_metadata(&metadata)
+                .expect("workspace reference metadata should deserialize"),
+            references
+        );
+        assert_eq!(
+            metadata[AGENT_WORKSPACE_REFERENCES_METADATA_KEY][0]["startLine"],
+            12
+        );
+    }
+
+    #[test]
+    fn workspace_reference_metadata_rejects_invalid_shapes() {
+        let metadata = serde_json::Map::from_iter([(
+            AGENT_WORKSPACE_REFERENCES_METADATA_KEY.to_string(),
+            serde_json::json!([{"path": 7}]),
+        )]);
+
+        let error = agent_workspace_references_from_metadata(&metadata)
+            .expect_err("invalid workspace reference metadata must fail closed");
+
+        assert_eq!(error.kind, PortErrorKind::InvalidRequest);
+
+        let too_many = vec![
+            serde_json::json!({
+                "path": "src/lib.rs",
+                "kind": "file",
+                "source": {"start": 0, "end": 11, "value": "@src/lib.rs"}
+            });
+            MAX_AGENT_WORKSPACE_REFERENCES_PER_TURN + 1
+        ];
+        let metadata = serde_json::Map::from_iter([(
+            AGENT_WORKSPACE_REFERENCES_METADATA_KEY.to_string(),
+            serde_json::Value::Array(too_many),
+        )]);
+        assert!(agent_workspace_references_from_metadata(&metadata).is_err());
+
+        let references = vec![
+            AgentWorkspaceReference {
+                path: "src/lib.rs".to_string(),
+                kind: AgentWorkspaceReferenceKind::File,
+                start_line: None,
+                end_line: None,
+                source: AgentWorkspaceReferenceSourceRange {
+                    start: 0,
+                    end: 11,
+                    value: "@src/lib.rs".to_string(),
+                },
+            };
+            MAX_AGENT_WORKSPACE_REFERENCES_PER_TURN + 1
+        ];
+        assert!(put_agent_workspace_references(&mut serde_json::Map::new(), &references).is_err());
+    }
+
+    #[test]
+    fn context_reload_contract_is_closed_and_target_specific() {
+        let cases = [
+            (AgentContextReloadTarget::All, "all", true, true),
+            (AgentContextReloadTarget::Skills, "skills", true, false),
+            (
+                AgentContextReloadTarget::Instructions,
+                "instructions",
+                false,
+                true,
+            ),
+        ];
+
+        for (target, serialized_target, skills, instructions) in cases {
+            assert_eq!(target.includes_skills(), skills);
+            assert_eq!(target.includes_instructions(), instructions);
+            let request = AgentContextReloadRequest {
+                session_id: "session-1".to_string(),
+                target,
+            };
+            assert_eq!(
+                serde_json::to_value(&request).expect("serialize request"),
+                serde_json::json!({
+                    "sessionId": "session-1",
+                    "target": serialized_target,
+                })
+            );
+            assert_eq!(
+                serde_json::from_value::<AgentContextReloadRequest>(serde_json::json!({
+                    "sessionId": "session-1",
+                    "target": serialized_target,
+                }))
+                .expect("deserialize request"),
+                request
+            );
+        }
+
+        assert!(
+            serde_json::from_value::<AgentContextReloadRequest>(serde_json::json!({
+                "sessionId": "session-1",
+                "target": "all",
+                "unexpected": true,
+            }))
+            .is_err()
+        );
+    }
+
+    #[derive(Default)]
+    struct ArchiveOnlySessionProvider {
+        archived_requests: Mutex<Vec<AgentSessionArchiveRequest>>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentSessionManagementPort for ArchiveOnlySessionProvider {
+        async fn list_sessions(
+            &self,
+            _request: AgentSessionListRequest,
+        ) -> PortResult<Vec<AgentSessionSummary>> {
+            Ok(Vec::new())
+        }
+
+        async fn delete_session(&self, _request: AgentSessionDeleteRequest) -> PortResult<()> {
+            Ok(())
+        }
+
+        async fn archive_session(&self, request: AgentSessionArchiveRequest) -> PortResult<()> {
+            self.archived_requests.lock().unwrap().push(request);
+            Ok(())
+        }
+
+        async fn resolve_session_workspace_binding(
+            &self,
+            _request: AgentSessionWorkspaceRequest,
+        ) -> PortResult<Option<AgentSessionWorkspaceBinding>> {
+            Ok(None)
+        }
+    }
+
+    struct LatestTurnForkOnlyProvider;
+
+    #[async_trait::async_trait]
+    impl AgentSessionForkPort for LatestTurnForkOnlyProvider {
+        async fn fork_session(
+            &self,
+            request: AgentSessionForkRequest,
+        ) -> PortResult<AgentSessionForkResult> {
+            Ok(AgentSessionForkResult {
+                session_id: format!("{}-fork", request.source_session_id),
+                session_name: "Fork".to_string(),
+                agent_type: "agentic".to_string(),
+            })
+        }
+    }
+
+    fn archive_state_request(archived: bool) -> AgentSessionArchiveStateRequest {
+        AgentSessionArchiveStateRequest {
+            workspace_path: "/workspace/project".to_string(),
+            session_id: "session_1".to_string(),
+            archived,
+            remote_connection_id: Some("conn-1".to_string()),
+            remote_ssh_host: Some("host-1".to_string()),
+        }
+    }
+
+    #[tokio::test]
+    async fn archive_state_default_preserves_archive_only_provider_compatibility() {
+        let provider = ArchiveOnlySessionProvider::default();
+
+        AgentSessionManagementPort::set_session_archived(&provider, archive_state_request(true))
+            .await
+            .expect("archive=true should delegate to the legacy provider");
+        // Scoped so the guard is provably released before the await below.
+        {
+            let requests = provider.archived_requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].workspace_path, "/workspace/project");
+            assert_eq!(requests[0].session_id, "session_1");
+            assert_eq!(requests[0].remote_connection_id.as_deref(), Some("conn-1"));
+            assert_eq!(requests[0].remote_ssh_host.as_deref(), Some("host-1"));
+        }
+
+        let error = AgentSessionManagementPort::set_session_archived(
+            &provider,
+            archive_state_request(false),
+        )
+        .await
+        .expect_err("legacy providers must reject unarchive by default");
+        assert_eq!(error.kind, PortErrorKind::NotAvailable);
+        assert_eq!(provider.archived_requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn exact_turn_fork_default_preserves_latest_turn_only_provider_compatibility() {
+        let provider = LatestTurnForkOnlyProvider;
+        let error = AgentSessionForkPort::fork_session_at_turn(
+            &provider,
+            AgentSessionForkAtTurnRequest {
+                workspace_path: "/workspace/project".to_string(),
+                source_session_id: "session_1".to_string(),
+                source_turn_id: "turn_1".to_string(),
+                remote_connection_id: None,
+                remote_ssh_host: None,
+            },
+        )
+        .await
+        .expect_err("legacy providers must reject exact-turn fork by default");
+
+        assert_eq!(error.kind, PortErrorKind::NotAvailable);
+    }
+
+    #[tokio::test]
+    async fn before_turn_fork_default_preserves_existing_provider_compatibility() {
+        let provider = LatestTurnForkOnlyProvider;
+        let error = AgentSessionForkPort::fork_session_before_turn(
+            &provider,
+            AgentSessionForkBeforeTurnRequest {
+                workspace_path: "/workspace/project".to_string(),
+                source_session_id: "session_1".to_string(),
+                source_turn_id: "turn_1".to_string(),
+                remote_connection_id: None,
+                remote_ssh_host: None,
+            },
+        )
+        .await
+        .expect_err("existing providers must reject before-turn fork by default");
+
+        assert_eq!(error.kind, PortErrorKind::NotAvailable);
+    }
+
+    #[test]
+    fn agent_session_create_request_keeps_rust_literal_compatible() {
+        let request = AgentSessionCreateRequest {
+            session_name: "Generated session".to_string(),
+            agent_type: "agentic".to_string(),
+            workspace_path: Some("/workspace/project".to_string()),
+            project_workspace_path: None,
+            execution_target: None,
+            workspace_id: Some("workspace-1".to_string()),
+            remote_connection_id: None,
+            remote_ssh_host: None,
+            model_id: Some("provider/model".to_string()),
+            metadata: serde_json::Map::new(),
+        };
+
+        let json = serde_json::to_value(request).expect("serialize create request");
+
+        assert!(json.get("sessionId").is_none());
+        assert_eq!(json["workspaceId"], "workspace-1");
+        assert_eq!(json["modelId"], "provider/model");
+    }
+
+    #[test]
+    fn agent_session_create_request_keeps_legacy_payload_compatible() {
+        let request: AgentSessionCreateRequest = serde_json::from_value(serde_json::json!({
+            "sessionName": "Generated session",
+            "agentType": "agentic",
+            "workspacePath": "/workspace/project"
+        }))
+        .expect("deserialize legacy create request");
+
+        let json = serde_json::to_value(request).expect("serialize create request");
+        assert!(json.get("sessionId").is_none());
+        assert!(json.get("workspaceId").is_none());
+        assert!(json.get("modelId").is_none());
+    }
+
+    #[test]
+    fn agent_session_create_result_keeps_legacy_payload_shape() {
+        let legacy = serde_json::json!({
+            "sessionId": "session_1",
+            "sessionName": "Main",
+            "agentType": "agentic"
+        });
+
+        let result: AgentSessionCreateResult =
+            serde_json::from_value(legacy.clone()).expect("deserialize legacy create result");
+
+        assert_eq!(result.workspace_path, None);
+        assert_eq!(result.workspace_id, None);
+        assert_eq!(result.project_workspace_path, None);
+        assert_eq!(result.execution_target, None);
+        assert_eq!(
+            serde_json::to_value(result).expect("serialize legacy create result"),
+            legacy
+        );
+    }
+
+    #[test]
+    fn agent_session_create_result_carries_normalized_workspace_facts() {
+        let result: AgentSessionCreateResult = serde_json::from_value(serde_json::json!({
+            "sessionId": "session_1",
+            "sessionName": "Main",
+            "agentType": "agentic",
+            "workspacePath": "/worktrees/session_1",
+            "workspaceId": "workspace_1",
+            "projectWorkspacePath": "/workspace/project",
+            "executionTarget": {
+                "kind": "managedWorktree",
+                "worktreeId": "worktree_1",
+                "rootPath": "/worktrees/session_1",
+                "baseRef": "main",
+                "baseCommit": "0123456789abcdef",
+                "branch": "bitfun/session_1",
+                "lifecycle": "managed"
+            }
+        }))
+        .expect("deserialize complete create result");
+
+        assert_eq!(
+            result.workspace_path.as_deref(),
+            Some("/worktrees/session_1")
+        );
+        assert_eq!(result.workspace_id.as_deref(), Some("workspace_1"));
+        assert_eq!(
+            result.project_workspace_path.as_deref(),
+            Some("/workspace/project")
+        );
+        let target = result.execution_target.expect("resolved execution target");
+        assert_eq!(target.kind, SessionExecutionTargetKind::ManagedWorktree);
+        assert_eq!(target.worktree_id.as_deref(), Some("worktree_1"));
+        assert_eq!(target.root_path, "/worktrees/session_1");
+    }
 
     #[test]
     fn port_error_display_keeps_kind_and_message() {
@@ -1933,25 +3151,58 @@ mod tests {
             .expect("serialize dialog trigger source");
 
         assert_eq!(json, serde_json::json!("cli"));
+
+        let sdk_host = serde_json::to_value(DialogTriggerSource::SdkHost)
+            .expect("serialize SDK Host trigger source");
+        assert_eq!(sdk_host, serde_json::json!("sdk_host"));
+    }
+
+    #[test]
+    fn delegated_dialog_turn_target_is_typed_and_provider_neutral() {
+        let target = AgentDialogTurnExecution::FreshExternalSubagent {
+            ecosystem_id: "opencode".to_string(),
+            logical_id: "reviewer".to_string(),
+        };
+
+        assert_eq!(
+            serde_json::to_value(target).expect("serialize delegated execution"),
+            serde_json::json!({
+                "kind": "fresh_external_subagent",
+                "ecosystemId": "opencode",
+                "logicalId": "reviewer",
+            })
+        );
+        assert_eq!(
+            AgentDialogTurnExecution::default(),
+            AgentDialogTurnExecution::Standard
+        );
+        assert!(
+            serde_json::from_value::<AgentDialogTurnExecution>(serde_json::json!({
+                "kind": "fresh_external_subagent",
+                "ecosystemId": "opencode",
+                "logicalId": "reviewer",
+                "model": "provider/model"
+            }))
+            .is_err()
+        );
     }
 
     #[test]
     fn dialog_submission_policy_preserves_current_surface_queue_defaults() {
         let remote = DialogSubmissionPolicy::for_source(DialogTriggerSource::RemoteRelay);
         assert_eq!(remote.queue_priority, DialogQueuePriority::Normal);
-        assert!(remote.skip_tool_confirmation);
 
         let bot = DialogSubmissionPolicy::for_source(DialogTriggerSource::Bot);
         assert_eq!(bot.queue_priority, DialogQueuePriority::Normal);
-        assert!(bot.skip_tool_confirmation);
 
         let agent_session = DialogSubmissionPolicy::for_source(DialogTriggerSource::AgentSession);
         assert_eq!(agent_session.queue_priority, DialogQueuePriority::Low);
-        assert!(agent_session.skip_tool_confirmation);
 
         let cli = DialogSubmissionPolicy::for_source(DialogTriggerSource::Cli);
         assert_eq!(cli.queue_priority, DialogQueuePriority::Normal);
-        assert!(!cli.skip_tool_confirmation);
+
+        let sdk_host = DialogSubmissionPolicy::for_source(DialogTriggerSource::SdkHost);
+        assert_eq!(sdk_host.queue_priority, DialogQueuePriority::Normal);
     }
 
     #[test]
@@ -2364,6 +3615,7 @@ mod tests {
             message: "hello".to_string(),
             original_message: Some("raw hello".to_string()),
             turn_id: Some("turn_1".to_string()),
+            execution: Default::default(),
             agent_type: "agentic".to_string(),
             workspace_path: Some("/workspace/project".to_string()),
             remote_connection_id: Some("conn-1".to_string()),
@@ -2371,7 +3623,6 @@ mod tests {
             policy: DialogSubmissionPolicy::new(
                 AgentSubmissionSource::RemoteRelay,
                 DialogQueuePriority::High,
-                true,
             ),
             reply_route: Some(AgentSessionReplyRoute {
                 source_session_id: "source_session".to_string(),
@@ -2403,7 +3654,7 @@ mod tests {
         assert_eq!(json["remoteSshHost"], "host-1");
         assert_eq!(json["policy"]["triggerSource"], "remote_relay");
         assert_eq!(json["policy"]["queuePriority"], "high");
-        assert_eq!(json["policy"]["skipToolConfirmation"], true);
+        assert!(json["policy"].get("skipToolConfirmation").is_none());
         assert_eq!(json["replyRoute"]["sourceSessionId"], "source_session");
         assert_eq!(json["replyRoute"]["sourceRemoteConnectionId"], "conn-1");
         assert_eq!(json["replyRoute"]["sourceRemoteSshHost"], "host-1");
@@ -2412,6 +3663,44 @@ mod tests {
             "session_message_request"
         );
         assert_eq!(json["attachments"][0]["kind"], "remote_image");
+    }
+
+    #[test]
+    fn agent_dialog_steer_contract_round_trips_exact_turn_identity() {
+        let request = AgentDialogSteerRequest {
+            session_id: "session_1".to_string(),
+            turn_id: "turn_1".to_string(),
+            content: "Please also check the tests".to_string(),
+            display_content: Some("Also check tests".to_string()),
+        };
+        let outcome = DialogSteerOutcome::Buffered {
+            session_id: "session_1".to_string(),
+            turn_id: "turn_1".to_string(),
+            steering_id: "steer_1".to_string(),
+        };
+
+        let request_json = serde_json::to_value(&request).expect("serialize steer request");
+        let outcome_json = serde_json::to_value(&outcome).expect("serialize steer outcome");
+
+        assert_eq!(request_json["sessionId"], "session_1");
+        assert_eq!(request_json["turnId"], "turn_1");
+        assert_eq!(request_json["content"], "Please also check the tests");
+        assert_eq!(request_json["displayContent"], "Also check tests");
+        assert_eq!(outcome_json["kind"], "buffered");
+        assert_eq!(outcome_json["sessionId"], "session_1");
+        assert_eq!(outcome_json["turnId"], "turn_1");
+        assert_eq!(outcome_json["steeringId"], "steer_1");
+
+        assert_eq!(
+            serde_json::from_value::<AgentDialogSteerRequest>(request_json)
+                .expect("deserialize steer request"),
+            request
+        );
+        assert_eq!(
+            serde_json::from_value::<DialogSteerOutcome>(outcome_json)
+                .expect("deserialize steer outcome"),
+            outcome
+        );
     }
 
     #[test]
@@ -2483,6 +3772,8 @@ mod tests {
         let get_request = AgentThreadGoalGetRequest {
             session_id: "session_1".to_string(),
             workspace_path: "/workspace/project".to_string(),
+            remote_connection_id: Some("conn-1".to_string()),
+            remote_ssh_host: Some("host-1".to_string()),
         };
         let create_request = AgentThreadGoalCreateRequest {
             session_id: "session_1".to_string(),
@@ -2503,6 +3794,8 @@ mod tests {
 
         assert_eq!(get_json["sessionId"], "session_1");
         assert_eq!(get_json["workspacePath"], "/workspace/project");
+        assert_eq!(get_json["remoteConnectionId"], "conn-1");
+        assert_eq!(get_json["remoteSshHost"], "host-1");
         assert_eq!(create_json["objective"], "Ship the refactor");
         assert_eq!(create_json["tokenBudget"], 1000);
         assert_eq!(update_json["status"], "complete");
@@ -2541,6 +3834,10 @@ mod tests {
             session_id: "session_1".to_string(),
             session_name: "Main".to_string(),
             agent_type: "agentic".to_string(),
+            model_id: Some("provider/model".to_string()),
+            last_user_dialog_agent_type: Some("plan".to_string()),
+            last_submitted_agent_type: Some("agentic".to_string()),
+            turn_count: 3,
             created_at_ms: 1000,
             last_active_at_ms: 2000,
         };
@@ -2550,12 +3847,62 @@ mod tests {
             remote_connection_id: Some("conn-1".to_string()),
             remote_ssh_host: Some("host-1".to_string()),
         };
+        let rename_request = AgentSessionRenameRequest {
+            workspace_path: "/workspace/project".to_string(),
+            session_id: "session_1".to_string(),
+            session_name: "Renamed".to_string(),
+            remote_connection_id: Some("conn-1".to_string()),
+            remote_ssh_host: Some("host-1".to_string()),
+        };
+        let archive_request = AgentSessionArchiveRequest {
+            workspace_path: "/workspace/project".to_string(),
+            session_id: "session_1".to_string(),
+            remote_connection_id: Some("conn-1".to_string()),
+            remote_ssh_host: Some("host-1".to_string()),
+        };
+        let archive_state_request = AgentSessionArchiveStateRequest {
+            workspace_path: "/workspace/project".to_string(),
+            session_id: "session_1".to_string(),
+            archived: false,
+            remote_connection_id: Some("conn-1".to_string()),
+            remote_ssh_host: Some("host-1".to_string()),
+        };
+        let fork_request = AgentSessionForkRequest {
+            workspace_path: "/workspace/project".to_string(),
+            source_session_id: "session_1".to_string(),
+            remote_connection_id: None,
+            remote_ssh_host: None,
+        };
+        let fork_at_turn_request = AgentSessionForkAtTurnRequest {
+            workspace_path: "/workspace/project".to_string(),
+            source_session_id: "session_1".to_string(),
+            source_turn_id: "turn_2".to_string(),
+            remote_connection_id: Some("conn-1".to_string()),
+            remote_ssh_host: Some("host-1".to_string()),
+        };
+        let fork_before_turn_request = AgentSessionForkBeforeTurnRequest {
+            workspace_path: "/workspace/project".to_string(),
+            source_session_id: "session_1".to_string(),
+            source_turn_id: "turn_2".to_string(),
+            remote_connection_id: None,
+            remote_ssh_host: None,
+        };
+        let model_request = AgentSessionModelUpdateRequest {
+            session_id: "session_1".to_string(),
+            model_id: "provider/model".to_string(),
+        };
+        let mode_request = AgentSessionModeUpdateRequest {
+            session_id: "session_1".to_string(),
+            mode_id: "agentic".to_string(),
+        };
         let workspace_request = AgentSessionWorkspaceRequest {
             session_id: "session_1".to_string(),
         };
         let workspace_binding = AgentSessionWorkspaceBinding {
             workspace_id: Some("workspace_1".to_string()),
             workspace_path: "/workspace/project".to_string(),
+            project_workspace_path: None,
+            execution_target: None,
             remote_connection_id: Some("conn-1".to_string()),
             remote_ssh_host: Some("host-1".to_string()),
         };
@@ -2563,6 +3910,18 @@ mod tests {
         let list_json = serde_json::to_value(list_request).expect("serialize list request");
         let summary_json = serde_json::to_value(summary).expect("serialize summary");
         let delete_json = serde_json::to_value(delete_request).expect("serialize delete request");
+        let rename_json = serde_json::to_value(rename_request).expect("serialize rename request");
+        let archive_json =
+            serde_json::to_value(archive_request).expect("serialize archive request");
+        let archive_state_json =
+            serde_json::to_value(archive_state_request).expect("serialize archive-state request");
+        let fork_json = serde_json::to_value(fork_request).expect("serialize fork request");
+        let fork_at_turn_json =
+            serde_json::to_value(fork_at_turn_request).expect("serialize exact-turn fork request");
+        let fork_before_turn_json = serde_json::to_value(fork_before_turn_request)
+            .expect("serialize before-turn fork request");
+        let model_json = serde_json::to_value(model_request).expect("serialize model request");
+        let mode_json = serde_json::to_value(mode_request).expect("serialize mode request");
         let workspace_json =
             serde_json::to_value(workspace_request).expect("serialize workspace request");
         let binding_json =
@@ -2570,18 +3929,58 @@ mod tests {
 
         assert_eq!(list_json["workspacePath"], "/workspace/project");
         assert_eq!(list_json["remoteConnectionId"], "conn-1");
+        assert_eq!(summary_json["modelId"], "provider/model");
+        assert_eq!(summary_json["lastUserDialogAgentType"], "plan");
+        assert_eq!(summary_json["lastSubmittedAgentType"], "agentic");
         assert_eq!(list_json["remoteSshHost"], "host-1");
         assert_eq!(summary_json["sessionId"], "session_1");
+        assert_eq!(summary_json["turnCount"], 3);
         assert_eq!(summary_json["createdAtMs"], 1000);
         assert_eq!(summary_json["lastActiveAtMs"], 2000);
         assert_eq!(delete_json["sessionId"], "session_1");
         assert_eq!(delete_json["remoteConnectionId"], "conn-1");
         assert_eq!(delete_json["remoteSshHost"], "host-1");
+        assert_eq!(rename_json["sessionName"], "Renamed");
+        assert_eq!(rename_json["remoteConnectionId"], "conn-1");
+        assert_eq!(archive_json["sessionId"], "session_1");
+        assert_eq!(archive_json["remoteSshHost"], "host-1");
+        assert_eq!(archive_state_json["archived"], false);
+        assert!(fork_json.get("sourceTurnId").is_none());
+        assert_eq!(fork_at_turn_json["sourceTurnId"], "turn_2");
+        assert_eq!(fork_before_turn_json["sourceTurnId"], "turn_2");
+        assert_eq!(fork_before_turn_json["sourceSessionId"], "session_1");
+        assert_eq!(model_json["sessionId"], "session_1");
+        assert_eq!(model_json["modelId"], "provider/model");
+        assert_eq!(mode_json["sessionId"], "session_1");
+        assert_eq!(mode_json["modeId"], "agentic");
         assert_eq!(workspace_json["sessionId"], "session_1");
         assert_eq!(binding_json["workspaceId"], "workspace_1");
         assert_eq!(binding_json["workspacePath"], "/workspace/project");
         assert_eq!(binding_json["remoteConnectionId"], "conn-1");
         assert_eq!(binding_json["remoteSshHost"], "host-1");
+    }
+
+    #[test]
+    fn local_command_turn_contract_has_fixed_narrow_shape() {
+        let mut metadata = serde_json::Map::new();
+        metadata.insert("kind".to_string(), serde_json::json!("usage_report"));
+        let request = AgentLocalCommandTurnRecordRequest {
+            session_id: "session_1".to_string(),
+            content: "Usage report".to_string(),
+            turn_id: Some("turn_1".to_string()),
+            timestamp_ms: Some(1000),
+            metadata,
+        };
+
+        let json = serde_json::to_value(request).expect("serialize local command turn");
+
+        assert_eq!(json["sessionId"], "session_1");
+        assert_eq!(json["content"], "Usage report");
+        assert_eq!(json["turnId"], "turn_1");
+        assert_eq!(json["timestampMs"], 1000);
+        assert_eq!(json["metadata"]["kind"], "usage_report");
+        assert!(json.get("turnKind").is_none());
+        assert!(json.get("modelVisible").is_none());
     }
 
     #[test]
@@ -2633,6 +4032,23 @@ mod tests {
         assert_eq!(json["sessionId"], "session_1");
         assert_eq!(json["turnId"], "turn_1");
         assert!(json.get("fromTurnId").is_none());
+    }
+
+    #[test]
+    fn transcript_contract_keeps_portable_message_identity_and_content() {
+        let message = TranscriptMessage {
+            id: Some("message_1".to_string()),
+            role: "assistant".to_string(),
+            turn_id: Some("turn_1".to_string()),
+            timestamp_ms: Some(3000),
+            content: TranscriptContent::Text("done".to_string()),
+        };
+
+        let message_json = serde_json::to_value(message).expect("serialize transcript message");
+
+        assert_eq!(message_json["id"], "message_1");
+        assert_eq!(message_json["timestampMs"], 3000);
+        assert_eq!(message_json["content"]["Text"], "done");
     }
 
     #[test]

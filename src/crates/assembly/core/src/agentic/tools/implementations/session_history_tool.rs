@@ -1,15 +1,12 @@
-use crate::agentic::persistence::PersistenceManager;
 use crate::agentic::tools::framework::{
     Tool, ToolExposure, ToolRenderOptions, ToolResult, ToolUseContext, ValidationResult,
 };
-use crate::infrastructure::PathManager;
 use crate::service::session::SessionTranscriptExportOptions;
 use crate::service_agent_runtime::CoreServiceAgentRuntime;
 use crate::util::errors::{BitFunError, BitFunResult};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::sync::Arc;
 
 /// SessionHistory tool - export a grep-friendly transcript file for a session.
 pub struct SessionHistoryTool;
@@ -26,24 +23,7 @@ impl SessionHistoryTool {
     }
 
     fn validate_session_id(session_id: &str) -> Result<(), String> {
-        if session_id.is_empty() {
-            return Err("session_id cannot be empty".to_string());
-        }
-        if session_id == "." || session_id == ".." {
-            return Err("session_id cannot be '.' or '..'".to_string());
-        }
-        if session_id.contains('/') || session_id.contains('\\') {
-            return Err("session_id cannot contain path separators".to_string());
-        }
-        if !session_id
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
-        {
-            return Err(
-                "session_id can only contain ASCII letters, numbers, '-' and '_'".to_string(),
-            );
-        }
-        Ok(())
+        bitfun_core_types::validate_session_id(session_id)
     }
 
     fn resolve_session_id(&self, session_id: &str) -> BitFunResult<String> {
@@ -123,7 +103,7 @@ Examples:
     }
 
     fn default_exposure(&self) -> ToolExposure {
-        ToolExposure::Collapsed
+        ToolExposure::Deferred
     }
 
     fn input_schema(&self) -> Value {
@@ -161,10 +141,6 @@ Examples:
 
     fn is_readonly(&self) -> bool {
         true
-    }
-
-    fn needs_permissions(&self, _input: Option<&Value>) -> bool {
-        false
     }
 
     async fn validate_input(
@@ -258,9 +234,12 @@ Examples:
                     ))
                 })?;
         let display_workspace = display_workspace.to_string_lossy().into_owned();
-        let manager = PersistenceManager::new(Arc::new(PathManager::new()?))?;
-        let transcript = manager
-            .export_session_transcript(
+        let coordinator =
+            crate::agentic::coordination::get_global_coordinator().ok_or_else(|| {
+                BitFunError::service("Core coordinator is unavailable for SessionHistory export")
+            })?;
+        let transcript = coordinator
+            .export_visible_persisted_session_transcript(
                 &session_storage_dir,
                 &session_id,
                 &SessionTranscriptExportOptions {

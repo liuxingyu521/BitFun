@@ -83,15 +83,24 @@ describe('SessionsSection layout styles', () => {
     expect(labelBlock).toContain('text-overflow: ellipsis;');
     expect(btwBadgeBlock).toContain('white-space: nowrap;');
     expect(btwBadgeBlock).toContain('overflow: visible;');
-    expect(btwBadgeBlock).toContain('color: color-mix(in srgb, var(--color-accent-400) 62%, var(--color-text-primary));');
+    expect(btwBadgeBlock).toContain('color: color-mix(in srgb, var(--bf-appearance-token-color-accent-400) 62%, var(--bf-appearance-token-color-text-primary));');
     expect(btwBadgeBlock).toContain('font-weight: 600;');
     expect(btwBadgeBlock).toContain('opacity: 0.96;');
     expect(reviewBadgeBlock).toContain('white-space: nowrap;');
-    expect(reviewBadgeBlock).toContain('color: color-mix(in srgb, var(--color-accent-400) 82%, var(--color-text-primary));');
+    expect(reviewBadgeBlock).toContain('color: color-mix(in srgb, var(--bf-appearance-token-color-accent-400) 82%, var(--bf-appearance-token-color-text-primary));');
     expect(reviewBadgeBlock).toContain('font-weight: 600;');
     expect(backgroundSubagentBadgeBlock).toContain('flex: 0 0 auto;');
     expect(backgroundSubagentBadgeBlock).toContain('display: inline-grid;');
+    expect(backgroundSubagentBadgeBlock).toContain('place-items: center;');
+    expect(backgroundSubagentBadgeBlock).toContain('line-height: 0;');
     expect(backgroundSubagentBadgeBlock).toContain('width: 16px;');
     expect(backgroundSubagentBadgeBlock).toContain('height: 16px;');
+
+    const backgroundSubagentIconBlock = extractInlineItemBlock(stylesheet, 'background-subagent-icon');
+    expect(backgroundSubagentIconBlock).toContain('place-self: center;');
+    expect(backgroundSubagentIconBlock).toContain('display: block;');
+    expect(backgroundSubagentIconBlock).toContain('transform-origin: center center;');
+    expect(stylesheet).not.toContain('--bitfun-subagent-bot-optical-y');
+    expect(stylesheet).not.toContain('translateY(var(--bitfun-subagent-bot-optical-y))');
   });
 });

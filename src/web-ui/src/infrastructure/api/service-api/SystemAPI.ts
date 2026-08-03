@@ -219,6 +219,28 @@ export class SystemAPI {
     }
   }
 
+  /** Desktop only: whether BitFun should keep the local computer awake. */
+  async getPreventSleepEnabled(): Promise<boolean> {
+    try {
+      return await api.invoke('get_prevent_sleep_enabled', {
+        request: {}
+      });
+    } catch (error) {
+      throw createTauriCommandError('get_prevent_sleep_enabled', error);
+    }
+  }
+
+  /** Desktop only: apply and persist the app-wide sleep-prevention preference. */
+  async setPreventSleepEnabled(enabled: boolean): Promise<void> {
+    try {
+      await api.invoke('set_prevent_sleep_enabled', {
+        request: { enabled }
+      });
+    } catch (error) {
+      throw createTauriCommandError('set_prevent_sleep_enabled', error, { enabled });
+    }
+  }
+
   // ─── Window / Tray behavior ────────────────────────────────────────────────
 
   /** Desktop only: immediately quit the application. */
@@ -245,6 +267,20 @@ export class SystemAPI {
       await api.invoke('initialize_tray_after_startup', { request: {} });
     } catch (error) {
       throw createTauriCommandError('initialize_tray_after_startup', error);
+    }
+  }
+
+  /**
+   * Desktop only: protect normal main-window geometry while toolbar mode
+   * temporarily resizes the shared native window.
+   */
+  async setMainWindowTransientGeometry(transient: boolean): Promise<void> {
+    try {
+      await api.invoke('set_main_window_transient_geometry', {
+        request: { transient }
+      });
+    } catch (error) {
+      throw createTauriCommandError('set_main_window_transient_geometry', error, { transient });
     }
   }
 

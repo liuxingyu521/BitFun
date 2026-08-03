@@ -3,11 +3,12 @@
  */
 import { create } from 'zustand';
 import type { SubagentInfo } from '@/infrastructure/api/service-api/SubagentAPI';
+import type { SubagentModelSelection } from '@/infrastructure/config/types';
 import {
   CAPABILITY_ACCENT,
   CAPABILITY_CATEGORIES,
   type CapabilityCategory,
-} from './agentTheme';
+} from './agentAppearance';
 
 export { CAPABILITY_CATEGORIES };
 export type { CapabilityCategory };
@@ -26,13 +27,17 @@ export interface AgentWithCapabilities extends SubagentInfo {
   /** Distinguishes primary agent mode from sub-agent */
   agentKind?: AgentKind;
   visibleSubagentCount?: number;
+  /** Explicit model selection for this Subagent, if it overrides the shared default. */
+  subagentModelOverride?: SubagentModelSelection;
+  /** Display name for an explicitly configured Subagent model override. */
+  subagentModelDisplayName?: string;
 }
 
 export const CAPABILITY_COLORS: Record<CapabilityCategory, string> = CAPABILITY_ACCENT;
 
 export type AgentsScenePage = 'home' | 'createAgent';
 export type AgentEditorMode = 'create' | 'edit';
-export type AgentFilterLevel = 'all' | 'builtin' | 'user' | 'project';
+export type AgentFilterLevel = 'all' | 'builtin' | 'user' | 'project' | 'external';
 export type AgentFilterType = 'all' | 'mode' | 'subagent';
 
 interface AgentsStoreState {

@@ -1,5 +1,8 @@
 use crate::session_state::SessionState;
 pub use bitfun_core_types::SessionKind;
+pub use bitfun_core_types::{
+    SessionContinuationPolicy, SessionExecutionTarget, SessionModelBindingPolicy,
+};
 use serde::{Deserialize, Serialize};
 use std::time::SystemTime;
 use uuid::Uuid;
@@ -132,6 +135,17 @@ impl Session {
     }
 }
 
+impl From<Session> for bitfun_runtime_ports::AgentSessionCreateResult {
+    fn from(session: Session) -> Self {
+        let mut result = Self::new(session.session_id, session.session_name, session.agent_type);
+        result.workspace_path = session.config.workspace_path;
+        result.workspace_id = session.config.workspace_id;
+        result.project_workspace_path = session.config.project_workspace_path;
+        result.execution_target = session.config.execution_target;
+        result
+    }
+}
+
 /// Session configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionConfig {
@@ -145,6 +159,15 @@ pub struct SessionConfig {
     /// without changing the desktop's foreground workspace.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace_path: Option<String>,
+    /// Main project root used for session persistence and project-scoped
+    /// orchestration. For legacy and local sessions this is the same as
+    /// `workspace_path`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_workspace_path: Option<String>,
+    /// Resolved execution target. Legacy sessions omit this and are treated as
+    /// local sessions rooted at `workspace_path`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_target: Option<SessionExecutionTarget>,
     /// Stable workspace id for resolving workspace-scoped metadata such as related directories.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<String>,
@@ -160,6 +183,24 @@ pub struct SessionConfig {
     /// Model config ID used by this session (for token usage tracking)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_id: Option<String>,
+    /// Whether this child session accepts another delegated turn.
+    #[serde(default, skip_serializing_if = "is_reusable_continuation_policy")]
+    pub continuation_policy: SessionContinuationPolicy,
+    /// Whether config reconciliation may replace this session's model.
+    #[serde(default, skip_serializing_if = "is_mutable_model_binding_policy")]
+    pub model_binding_policy: SessionModelBindingPolicy,
+    /// Runtime identity approved for an immutable concrete model binding.
+    /// Mutable sessions leave this unset and continue to resolve selectors.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_binding_fingerprint: Option<String>,
+}
+
+fn is_reusable_continuation_policy(policy: &SessionContinuationPolicy) -> bool {
+    *policy == SessionContinuationPolicy::Reusable
+}
+
+fn is_mutable_model_binding_policy(policy: &SessionModelBindingPolicy) -> bool {
+    *policy == SessionModelBindingPolicy::Mutable
 }
 
 impl Default for SessionConfig {
@@ -172,10 +213,15 @@ impl Default for SessionConfig {
             max_turns: 200,
             enable_context_compression: true,
             workspace_path: None,
+            project_workspace_path: None,
+            execution_target: None,
             workspace_id: None,
             remote_connection_id: None,
             remote_ssh_host: None,
             model_id: None,
+            continuation_policy: SessionContinuationPolicy::default(),
+            model_binding_policy: SessionModelBindingPolicy::default(),
+            model_binding_fingerprint: None,
         }
     }
 }
@@ -187,6 +233,9 @@ pub struct SessionSummary {
     pub session_name: String,
     /// Current/default mode selection for the session.
     pub agent_type: String,
+    /// Runtime-owned model selector currently bound to the session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
     /// Mode of the last surviving user dialog turn in the session history.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_user_dialog_agent_type: Option<String>,
@@ -241,9 +290,13 @@ pub fn sanitize_persisted_session_state(state: &SessionState) -> SessionState {
 mod tests {
     use super::{
         sanitize_persisted_session_state, CompressionState, PersistedSessionStateFile, Session,
-        SessionConfig,
+        SessionConfig, SessionContinuationPolicy, SessionModelBindingPolicy,
     };
     use crate::session_state::{ProcessingPhase, SessionState};
+    use bitfun_core_types::{
+        SessionExecutionTarget, SessionExecutionTargetKind, WorktreeLifecycle,
+    };
+    use bitfun_runtime_ports::AgentSessionCreateResult;
     use serde_json::json;
 
     #[test]
@@ -261,6 +314,46 @@ mod tests {
         assert!(config.remote_connection_id.is_none());
         assert!(config.remote_ssh_host.is_none());
         assert!(config.model_id.is_none());
+        assert_eq!(
+            config.continuation_policy,
+            SessionContinuationPolicy::Reusable
+        );
+        assert_eq!(
+            config.model_binding_policy,
+            SessionModelBindingPolicy::Mutable
+        );
+    }
+
+    #[test]
+    fn non_default_subagent_session_policies_are_persisted_and_legacy_defaults_remain_compatible() {
+        let config = SessionConfig {
+            continuation_policy: SessionContinuationPolicy::FreshOnly,
+            model_binding_policy: SessionModelBindingPolicy::ApprovedImmutable,
+            ..SessionConfig::default()
+        };
+        let serialized = serde_json::to_value(&config).expect("session config should serialize");
+        assert_eq!(serialized["continuation_policy"], "fresh_only");
+        assert_eq!(serialized["model_binding_policy"], "approved_immutable");
+
+        let mut legacy = serialized;
+        legacy
+            .as_object_mut()
+            .expect("session config should be an object")
+            .remove("continuation_policy");
+        legacy
+            .as_object_mut()
+            .expect("session config should be an object")
+            .remove("model_binding_policy");
+        let restored: SessionConfig =
+            serde_json::from_value(legacy).expect("legacy session config should deserialize");
+        assert_eq!(
+            restored.continuation_policy,
+            SessionContinuationPolicy::Reusable
+        );
+        assert_eq!(
+            restored.model_binding_policy,
+            SessionModelBindingPolicy::Mutable
+        );
     }
 
     #[test]
@@ -280,6 +373,47 @@ mod tests {
         assert!(session.last_submitted_agent_type.is_none());
         assert!(session.created_by.is_none());
         assert!(session.snapshot_session_id.is_none());
+    }
+
+    #[test]
+    fn session_create_result_preserves_normalized_workspace_facts() {
+        let execution_target = SessionExecutionTarget {
+            kind: SessionExecutionTargetKind::ManagedWorktree,
+            worktree_id: Some("worktree_1".to_string()),
+            root_path: "/worktrees/session_1".to_string(),
+            base_ref: Some("main".to_string()),
+            base_commit: Some("0123456789abcdef".to_string()),
+            branch: Some("bitfun/session_1".to_string()),
+            lifecycle: Some(WorktreeLifecycle::Managed),
+        };
+        let session = Session::new_with_id(
+            "session_1".to_string(),
+            "Main".to_string(),
+            "agentic".to_string(),
+            SessionConfig {
+                workspace_path: Some("/worktrees/session_1".to_string()),
+                workspace_id: Some("workspace_1".to_string()),
+                project_workspace_path: Some("/workspace/project".to_string()),
+                execution_target: Some(execution_target.clone()),
+                ..SessionConfig::default()
+            },
+        );
+
+        let result = AgentSessionCreateResult::from(session);
+
+        assert_eq!(result.session_id, "session_1");
+        assert_eq!(result.session_name, "Main");
+        assert_eq!(result.agent_type, "agentic");
+        assert_eq!(
+            result.workspace_path.as_deref(),
+            Some("/worktrees/session_1")
+        );
+        assert_eq!(result.workspace_id.as_deref(), Some("workspace_1"));
+        assert_eq!(
+            result.project_workspace_path.as_deref(),
+            Some("/workspace/project")
+        );
+        assert_eq!(result.execution_target, Some(execution_target));
     }
 
     #[test]

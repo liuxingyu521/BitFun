@@ -27,17 +27,31 @@ pub mod function_agents;
 #[cfg(feature = "git")]
 pub mod git;
 
+#[cfg(feature = "hook-import")]
+pub mod hook_import;
+
 #[cfg(feature = "mcp")]
 pub mod mcp;
 
 #[cfg(feature = "miniapp-runtime")]
 pub mod miniapp;
 
+#[cfg(feature = "miniapp-market")]
+pub mod miniapp_market;
+
 #[cfg(feature = "plugin-source")]
 pub mod plugin_source;
 
 #[cfg(feature = "remote-connect")]
 pub mod remote_connect;
+
+#[cfg(all(test, feature = "remote-connect"))]
+mod feature_contract_tests {
+    #[test]
+    fn remote_connect_feature_exposes_its_public_module() {
+        let _ = super::remote_connect::RemoteConnectSubmissionSource::Relay;
+    }
+}
 
 #[cfg(feature = "remote-ssh")]
 pub mod remote_ssh;
@@ -47,6 +61,11 @@ pub mod review_platform;
 
 #[cfg(feature = "review-platform")]
 pub(crate) mod review_platform_http;
+
+#[cfg(feature = "script-tool-runtime")]
+pub mod script_tool;
+#[cfg(feature = "speech")]
+pub mod speech;
 
 #[cfg(feature = "workspace-search")]
 pub mod workspace_search;

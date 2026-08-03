@@ -1,5 +1,4 @@
 pub mod agentic;
-pub mod agentic_projection_manifest;
 /// Events Layer
 ///
 /// Independent event definition layer, providing:
@@ -9,23 +8,20 @@ pub mod agentic_projection_manifest;
 pub mod backend;
 pub mod emitter;
 pub mod frontend_projection;
+pub mod speech;
 pub mod types;
 
 pub use agentic::{
     AgenticEvent, AgenticEventEnvelope, AgenticEventPriority, DeepReviewQueueReason,
-    DeepReviewQueueState, DeepReviewQueueStatus, SubagentParentInfo, ToolEventData,
-};
-pub use agentic_projection_manifest::{
-    agentic_event_projection_manifest_entry, is_legacy_websocket_agentic_event_type,
-    public_agentic_event_projection_manifest, AgenticEventProjectionAggregate,
-    AgenticEventProjectionManifestEntry, AgenticEventProjectionReplayPolicy,
-    AgenticEventProjectionRetentionPolicy, AgenticEventProjectionUiShape,
-    AGENTIC_EVENT_PROJECTION_MANIFEST,
+    DeepReviewQueueState, DeepReviewQueueStatus, ModelRoundAttemptDiagnostic,
+    ModelRoundAttemptToolDiagnostic, SubagentParentInfo, ToolEventData, ToolEventIdentity,
 };
 pub use backend::{
     BackgroundCommandLifecycleInfo, ToolExecutionCompletedInfo, ToolExecutionErrorInfo,
     ToolExecutionProgressInfo, ToolExecutionStartedInfo, ToolTerminalReadyInfo,
 };
+pub use bitfun_core_types::ToolImageAttachment;
 pub use emitter::EventEmitter;
 pub use frontend_projection::{project_agentic_frontend_event, AgenticFrontendEvent};
+pub use speech::{SPEECH_MODEL_PROGRESS_EVENT, SPEECH_MODEL_STATUS_CHANGED_EVENT};
 pub use types::*;

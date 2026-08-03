@@ -41,8 +41,26 @@ export const SETTINGS_TAB_SEARCH_CONTENT: Record<ConfigTab, readonly SettingsTab
     { ns: 'settings/default-model', key: 'subtitle' },
     { ns: 'settings/default-model', key: 'tabs.models' },
     { ns: 'settings/ai-model', key: 'subtitle' },
+    { ns: 'settings/ai-model', key: 'subagentModels.title' },
+    { ns: 'settings/ai-model', key: 'subagentModels.default.description' },
+    { ns: 'settings/ai-model', key: 'sessionTitle.title' },
+    { ns: 'settings/ai-model', key: 'sessionTitle.subtitle' },
     { ns: 'settings/default-model', key: 'tabs.proxy' },
     { ns: 'settings/ai-model', key: 'proxy.enableHint' },
+  ],
+
+  worktrees: [
+    { ns: 'worktrees', key: 'settings.title' },
+    { ns: 'worktrees', key: 'settings.description' },
+    { ns: 'worktrees', key: 'settings.isolation.title' },
+    { ns: 'worktrees', key: 'settings.isolation.description' },
+    { ns: 'worktrees', key: 'settings.rootPath.label' },
+    { ns: 'worktrees', key: 'settings.branchPrefix.label' },
+    { ns: 'worktrees', key: 'settings.copyChanges.label' },
+    { ns: 'worktrees', key: 'settings.autoDelete.label' },
+    { ns: 'worktrees', key: 'settings.autoDeleteLimit.label' },
+    { ns: 'worktrees', key: 'management.title' },
+    { ns: 'worktrees', key: 'management.description' },
   ],
 
   'archived-sessions': [
@@ -56,11 +74,8 @@ export const SETTINGS_TAB_SEARCH_CONTENT: Record<ConfigTab, readonly SettingsTab
   'session-personalization': [
     { ns: 'settings/session-config', key: 'personalizationPage.title' },
     { ns: 'settings/session-config', key: 'personalizationPage.subtitle' },
-    { ns: 'settings/session-config', key: 'features.sessionTitle.title' },
-    { ns: 'settings/session-config', key: 'features.sessionTitle.subtitle' },
     { ns: 'settings/session-config', key: 'features.agentCompanion.title' },
     { ns: 'settings/session-config', key: 'features.agentCompanion.subtitle' },
-    { ns: 'settings/session-config', key: 'models.empty' },
   ],
 
   'session-permissions': [
@@ -71,6 +86,9 @@ export const SETTINGS_TAB_SEARCH_CONTENT: Record<ConfigTab, readonly SettingsTab
     { ns: 'settings/session-config', key: 'features.workspaceSearch.enable' },
     { ns: 'settings/session-config', key: 'toolExecution.sectionTitle' },
     { ns: 'settings/session-config', key: 'toolExecution.sectionDescription' },
+    { ns: 'settings/session-config', key: 'deferredToolLoading.sectionTitle' },
+    { ns: 'settings/session-config', key: 'deferredToolLoading.sectionDescription' },
+    { ns: 'settings/session-config', key: 'deferredToolLoading.warning' },
     { ns: 'settings/session-config', key: 'computerUse.sectionTitle' },
     { ns: 'settings/session-config', key: 'computerUse.sectionDescription' },
     { ns: 'settings/session-config', key: 'computerUse.enable' },
@@ -124,6 +142,26 @@ export const SETTINGS_TAB_SEARCH_CONTENT: Record<ConfigTab, readonly SettingsTab
     { ns: 'settings/mcp', key: 'section.serverList.description' },
   ],
 
+  'external-sources': [
+    { ns: 'settings/external-sources', key: 'title' },
+    { ns: 'settings/external-sources', key: 'subtitle' },
+    { ns: 'settings/external-sources', key: 'sources.title' },
+    { ns: 'settings/external-sources', key: 'sources.description' },
+    { ns: 'settings/external-sources', key: 'conflicts.title' },
+    { ns: 'settings/external-sources', key: 'conflicts.description' },
+  ],
+
+  hooks: [
+    { ns: 'settings/hooks', key: 'title' },
+    { ns: 'settings/hooks', key: 'subtitle' },
+    { ns: 'settings/hooks', key: 'activation.title' },
+    { ns: 'settings/hooks', key: 'activation.description' },
+    { ns: 'settings/hooks', key: 'locations.title' },
+    { ns: 'settings/hooks', key: 'locations.description' },
+    { ns: 'settings/hooks', key: 'compatibility.title' },
+    { ns: 'settings/hooks', key: 'compatibility.description' },
+  ],
+
   'acp-agents': [
     { ns: 'settings/acp-agents', key: 'title' },
     { ns: 'settings/acp-agents', key: 'subtitle' },
@@ -167,6 +205,16 @@ export const SETTINGS_TAB_SEARCH_CONTENT: Record<ConfigTab, readonly SettingsTab
     { ns: 'settings/quick-actions', key: 'page.subtitle' },
     { ns: 'settings/quick-actions', key: 'sections.builtin.title' },
     { ns: 'settings/quick-actions', key: 'sections.custom.title' },
+  ],
+
+  'voice-input': [
+    { ns: 'settings/voice-input', key: 'title' },
+    { ns: 'settings/voice-input', key: 'subtitle' },
+    { ns: 'settings/voice-input', key: 'sections.composer' },
+    { ns: 'settings/voice-input', key: 'sections.model' },
+    { ns: 'settings/voice-input', key: 'composer.enabled.label' },
+    { ns: 'settings/voice-input', key: 'composer.language.label' },
+    { ns: 'settings/voice-input', key: 'model.download' },
   ],
 
   // lsp: [ ... ], // nav entry temporarily hidden; omit from search index

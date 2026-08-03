@@ -3,15 +3,16 @@
  * Initializes event listeners and handles various Agentic events
  */
 
-import { FlowChatStore } from '../../store/FlowChatStore';
+import { FlowChatStore, mergeModelRoundAttemptDiagnostics } from '../../store/FlowChatStore';
 import { stateMachineManager } from '../../state-machine';
 import { SessionExecutionEvent, SessionExecutionState } from '../../state-machine/types';
 import { agenticEventListener, type AgenticEventCallbacks } from '../AgenticEventListener';
 import { 
-  generateTextChunkKey, 
+  generateTextChunkKey,
   generateToolEventKey,
   normalizeParamsPartialFragment,
   parseEventKey,
+  TEXT_CHUNK_MAX_LATENCY_MS,
   type FlowToolEvent,
   type SubagentParentInfo,
   type TextChunkEventData,
@@ -19,30 +20,29 @@ import {
   type ParamsPartialToolEvent
 } from '../EventBatcher';
 import { notificationService } from '../../../shared/notification-system/services/NotificationService';
-import type { NotificationAction } from '../../../shared/notification-system/types';
 import { createLogger } from '@/shared/utils/logger';
 import { handleThreadGoalUpdated } from '../threadGoalEventService';
 import { resolveThreadGoalUserMessageDisplay } from '../../utils/threadGoalDisplay';
+import { cleanRemoteUserInput } from '../../utils/userInputText';
+import { effectiveToolInvocation, getEffectiveToolName } from '../../utils/toolInvocationIdentity';
+import { absoluteSessionTurnIndexForId } from '../../utils/flowChatTurnOrdinal';
 import type {
   DeepReviewQueueStateChangedEvent,
   ImageAnalysisEvent,
+  ModelRoundStartedEvent,
   ModelRoundCompletedEvent,
+  ModelRoundAttemptSupersededEvent,
   OpenBuiltInBrowserEvent,
   AcpContextUsageUpdatedEvent,
   SessionModelAutoMigratedEvent,
   SubagentSessionLinkedEvent,
 } from '@/infrastructure/api/service-api/AgentAPI';
-import { configManager } from '@/infrastructure/config/services/ConfigManager';
-import type { AIModelConfig, DefaultModelsConfig } from '@/infrastructure/config/types';
-import { i18nService } from '@/infrastructure/i18n/core/I18nService';
 import { MCPAPI } from '@/infrastructure/api/service-api/MCPAPI';
 import { ACPClientAPI, type AcpPermissionRequestEvent } from '@/infrastructure/api/service-api/ACPClientAPI';
 import { globalEventBus } from '@/infrastructure/event-bus';
 import type { FlowChatContext, DialogTurn, ModelRound, FlowToolItem } from './types';
 import {
-  getAiErrorPresentation,
   normalizeAiErrorDetail,
-  type AiErrorPresentation,
   type AiErrorDetail,
 } from '@/shared/ai-errors/aiErrorPresenter';
 import { useReviewActionBarStore } from '../../store/deepReviewActionBarStore';
@@ -58,7 +58,6 @@ import {
   immediateSaveDialogTurn, 
   saveDialogTurnToDisk,
   cleanupSaveState,
-  updateSessionMetadata,
 } from './PersistenceModule';
 import { 
   processNormalTextChunkInternal, 
@@ -66,7 +65,6 @@ import {
   completeActiveTextItems,
   cleanupSessionBuffers
 } from './TextChunkModule';
-import { pendingQueueManager } from './PendingQueueModule';
 import { 
   processToolEvent,
   processToolParamsPartialInternal,
@@ -79,6 +77,13 @@ import {
   clearRuntimeStatus,
   scheduleModelResponseStatus,
 } from './RuntimeStatusModule';
+import { requestPeerSessionRefresh } from './PeerSessionRefreshModule';
+import { isPeerDeviceModeActive } from '@/infrastructure/peer-device/peerModeFlag';
+import {
+  optimisticTurnAdoptionKey,
+  sessionPendingTurnAdoptionKey,
+  stripOptimisticTurnAdoption,
+} from '../../utils/optimisticTurnAdoption';
 
 const log = createLogger('EventHandlerModule');
 const TURN_COMPLETION_QUIET_WINDOW_MS = 500;
@@ -153,7 +158,10 @@ export const __test_only__ = {
   resolveDialogTurnDisplayContent,
   mergeParamsPartialEventData,
   findSubagentParentInfoByRound,
-  resolveModelDisplayNameFromConfig,
+  handleDialogTurnStarted,
+  handleDialogTurnFailed,
+  handleSubagentSessionLinked,
+  handleModelRoundStart,
 };
 
 function shouldMarkUnreadCompletion(sessionId: string): boolean {
@@ -167,6 +175,7 @@ function logDroppedDataEvent(
   turnId: string | null,
   details: Record<string, unknown>
 ): void {
+  requestPeerSessionRefresh(sessionId);
   log.debug('Dropped agentic data event', {
     eventName,
     sessionId,
@@ -396,6 +405,7 @@ function ensureSubagentSession(
   subagentSessionId: string,
   event?: Record<string, unknown>,
   explicitSubagentType?: string,
+  focusedReviewDisplayLabel?: SubagentSessionLinkedEvent['focusedReviewDisplayLabel'],
 ): void {
   const store = FlowChatStore.getInstance();
   const existing = store.getState().sessions.get(subagentSessionId);
@@ -414,13 +424,14 @@ function ensureSubagentSession(
         subagentType: subagentType || undefined,
       });
     }
+    store.updateSessionFocusedReviewDisplayLabel(subagentSessionId, focusedReviewDisplayLabel);
     return;
   }
 
   const parentSession = store.getState().sessions.get(parentInfo.sessionId);
   const parentTurnIndex = parentSession
-    ?.dialogTurns
-    .findIndex(turn => turn.id === parentInfo.dialogTurnId);
+    ? absoluteSessionTurnIndexForId(parentSession, parentInfo.dialogTurnId)
+    : undefined;
   store.addExternalSession(
     subagentSessionId,
     buildSubagentSessionTitleWithType(parentInfo, explicitSubagentType),
@@ -434,10 +445,15 @@ function ensureSubagentSession(
       btwOrigin: {
         parentSessionId: parentInfo.sessionId,
         parentDialogTurnId: parentInfo.dialogTurnId,
-        parentTurnIndex: typeof parentTurnIndex === 'number' && parentTurnIndex >= 0
-          ? parentTurnIndex + 1
-          : undefined,
+        parentTurnIndex,
       },
+      focusedReviewDisplayLabel,
+      projectWorkspacePath:
+        parentSession?.projectWorkspacePath
+        || parentSession?.config.projectWorkspacePath
+        || parentSession?.workspacePath,
+      executionTarget: parentSession?.config.executionTarget,
+      workspaceId: parentSession?.workspaceId,
     },
     parentSession?.remoteConnectionId || extractEventRemoteConnectionId(event),
     parentSession?.remoteSshHost || extractEventRemoteSshHost(event),
@@ -486,6 +502,12 @@ function handleSubagentSessionLinked(
   const subagentDialogTurnId =
     event?.subagentDialogTurnId ?? (event as any)?.subagent_dialog_turn_id;
   const agentType = event?.agentType ?? (event as any)?.agent_type;
+  const modelId = event?.modelId ?? (event as any)?.model_id;
+  const rawFocusedReviewDisplayLabel = event?.focusedReviewDisplayLabel
+    ?? (event as any)?.focused_review_display_label;
+  const focusedReviewDisplayLabel = typeof rawFocusedReviewDisplayLabel === 'string'
+    ? rawFocusedReviewDisplayLabel
+    : undefined;
 
   if (!childSessionId || !parentSessionId || !parentDialogTurnId || !parentToolCallId) {
     log.warn('SubagentSessionLinked missing required fields', { event });
@@ -499,7 +521,17 @@ function handleSubagentSessionLinked(
   };
 
   attachSubagentSessionToParentTool(parentInfo, childSessionId, subagentDialogTurnId);
-  ensureSubagentSession(context, parentInfo, childSessionId, event as Record<string, unknown>, agentType);
+  ensureSubagentSession(
+    context,
+    parentInfo,
+    childSessionId,
+    event as Record<string, unknown>,
+    agentType,
+    focusedReviewDisplayLabel,
+  );
+  if (typeof modelId === 'string' && modelId.trim()) {
+    FlowChatStore.getInstance().updateSessionModelName(childSessionId, modelId.trim());
+  }
   reconcileBackgroundSubagentSession(childSessionId);
 }
 
@@ -542,7 +574,7 @@ function findSubagentParentInfoByRound(
 
           const toolItem = item as FlowToolItem;
           if (
-            toolItem.toolName?.toLowerCase() === 'task' &&
+            getEffectiveToolName(toolItem).toLowerCase() === 'task' &&
             toolItem.subagentSessionId === subagentSessionId &&
             toolItem.subagentDialogTurnId === subagentDialogTurnId
           ) {
@@ -560,106 +592,23 @@ function findSubagentParentInfoByRound(
   return undefined;
 }
 
-function readConfigString(value: unknown): string {
-  return typeof value === 'string' ? value.trim() : '';
-}
-
-function findConfiguredModel(
-  models: AIModelConfig[],
-  modelRef: string | null | undefined,
-): AIModelConfig | null {
-  const value = modelRef?.trim();
-  if (!value) {
-    return null;
-  }
-
-  return models.find(model =>
-    model.id === value ||
-    model.name === value ||
-    model.model_name === value
-  ) ?? null;
-}
-
-function resolveModelDisplayNameFromConfig(
-  modelId: string,
-  models: AIModelConfig[],
-  defaultModels: DefaultModelsConfig,
-): string {
-  const fallback = modelId.trim();
-  if (!fallback) {
-    return '';
-  }
-
-  let modelRef = fallback;
-  if (fallback === 'primary') {
-    modelRef = readConfigString(defaultModels.primary) || fallback;
-  } else if (fallback === 'fast') {
-    modelRef =
-      readConfigString(defaultModels.fast) ||
-      readConfigString(defaultModels.primary) ||
-      fallback;
-  }
-
-  const model = findConfiguredModel(models, modelRef);
-  return readConfigString(model?.model_name) || fallback;
-}
-
-async function resolveSubagentModelDisplayName(modelId: string): Promise<string> {
-  try {
-    const configData = await configManager.getConfigs([
-      'ai.models',
-      'ai.default_models',
-    ]);
-    const models = (configData['ai.models'] as AIModelConfig[] | undefined) || [];
-    const defaultModels =
-      (configData['ai.default_models'] as DefaultModelsConfig | undefined) || {};
-
-    return resolveModelDisplayNameFromConfig(modelId, models, defaultModels);
-  } catch (error) {
-    log.warn('Failed to resolve subagent model display name', { modelId, error });
-    return modelId;
-  }
-}
-
 function updateSubagentParentTaskModel(
   context: FlowChatContext,
   parentInfo: SubagentParentInfo,
-  modelId: string,
-  modelDisplayName: string,
+  modelConfigId: string | undefined,
+  effectiveModelName: string,
 ): void {
   const store = FlowChatStore.getInstance();
   store.updateModelRoundItem(
     parentInfo.sessionId,
     parentInfo.dialogTurnId,
     parentInfo.toolCallId,
-    { subagentModelId: modelId, subagentModelDisplayName: modelDisplayName } as Partial<FlowToolItem>,
+    {
+      subagentModelId: modelConfigId,
+      subagentModelDisplayName: effectiveModelName,
+    } as Partial<FlowToolItem>,
   );
   debouncedSaveDialogTurn(context, parentInfo.sessionId, parentInfo.dialogTurnId, 800);
-}
-
-function patchSubagentParentTaskModelDisplayName(
-  context: FlowChatContext,
-  parentInfo: SubagentParentInfo,
-  modelId: string,
-  displayName: string,
-): void {
-  const store = FlowChatStore.getInstance();
-  const currentItem = store.findToolItem(
-    parentInfo.sessionId,
-    parentInfo.dialogTurnId,
-    parentInfo.toolCallId,
-  );
-
-  if (currentItem?.type !== 'tool') {
-    return;
-  }
-
-  const currentTool = currentItem as FlowToolItem;
-  if (currentTool.subagentModelId !== modelId) {
-    return;
-  }
-
-  updateSubagentParentTaskModel(context, parentInfo, modelId, displayName);
 }
 
 /**
@@ -774,23 +723,23 @@ export async function initializeEventListeners(
   context: FlowChatContext,
   onTodoWriteResult: (sessionId: string, turnId: string, result: any) => void
 ): Promise<() => void> {
-  const { listen } = await import('@tauri-apps/api/event');
-  const unlistenProgress = await listen('backend-event-toolexecutionprogress', (event: any) => {
-    handleToolExecutionProgress(event.payload);
+  const { api } = await import('@/infrastructure/api/service-api/ApiClient');
+  const unlistenProgress = api.listen('backend-event-toolexecutionprogress', (payload: any) => {
+    handleToolExecutionProgress(payload);
   });
-  const unlistenTerminalReady = await listen('backend-event-toolterminalready', (event: any) => {
-    const eventData = (event.payload as any)?.value || event.payload;
+  const unlistenTerminalReady = api.listen('backend-event-toolterminalready', (payload: any) => {
+    const eventData = (payload as any)?.value || payload;
     handleToolTerminalReady(eventData);
   });
-  const unlistenBackgroundCommandLifecycle = await listen('backend-event-backgroundcommandlifecycle', (event: any) => {
-    const eventData = (event.payload as any)?.value || event.payload;
+  const unlistenBackgroundCommandLifecycle = api.listen('backend-event-backgroundcommandlifecycle', (payload: any) => {
+    const eventData = (payload as any)?.value || payload;
     useBackgroundCommandActivityStore.getState().applyLifecycleEvent(eventData);
   });
-  const unlistenMcpInteractionRequest = await listen('backend-event-mcpinteractionrequest', (event: any) => {
-    void handleMcpInteractionRequest((event.payload as any)?.value || event.payload);
+  const unlistenMcpInteractionRequest = api.listen('backend-event-mcpinteractionrequest', (payload: any) => {
+    void handleMcpInteractionRequest((payload as any)?.value || payload);
   });
-  const unlistenAcpPermissionRequest = await listen('backend-event-acppermissionrequest', (event: any) => {
-    void handleAcpPermissionRequest((event.payload as any)?.value || event.payload);
+  const unlistenAcpPermissionRequest = api.listen('backend-event-acppermissionrequest', (payload: any) => {
+    void handleAcpPermissionRequest((payload as any)?.value || payload);
   });
 
   const callbacks: AgenticEventCallbacks = {
@@ -829,6 +778,9 @@ export async function initializeEventListeners(
     },
     onModelRoundCompleted: (event) => {
       handleModelRoundComplete(context, event);
+    },
+    onModelRoundAttemptSuperseded: (event) => {
+      handleModelRoundAttemptSuperseded(context, event);
     },
     onDialogTurnCompleted: (event) => {
       handleDialogTurnComplete(context, event, onTodoWriteResult);
@@ -949,6 +901,20 @@ function handleSessionCreated(context: FlowChatContext, event: any): void {
   const store = FlowChatStore.getInstance();
   const existing = store.getState().sessions.get(sessionId);
   const workspacePath = resolveExternalSessionWorkspacePath(context, event);
+  const projectWorkspacePath =
+    (typeof event.projectWorkspacePath === 'string' && event.projectWorkspacePath)
+    || (typeof event.project_workspace_path === 'string' && event.project_workspace_path)
+    || workspacePath;
+  const executionTarget =
+    event.executionTarget && typeof event.executionTarget === 'object'
+      ? event.executionTarget
+      : event.execution_target && typeof event.execution_target === 'object'
+        ? event.execution_target
+        : undefined;
+  const workspaceId =
+    (typeof event.workspaceId === 'string' && event.workspaceId)
+    || (typeof event.workspace_id === 'string' && event.workspace_id)
+    || undefined;
   const remoteConnectionId = extractEventRemoteConnectionId(event);
   const remoteSshHost = extractEventRemoteSshHost(event);
 
@@ -959,7 +925,11 @@ function handleSessionCreated(context: FlowChatContext, event: any): void {
     sessionName || 'Remote Session',
     agentType || 'agentic',
     workspacePath,
-    undefined,
+    {
+      projectWorkspacePath,
+      executionTarget,
+      workspaceId,
+    },
     remoteConnectionId,
     remoteSshHost
   );
@@ -1093,6 +1063,7 @@ function finalizeTurnCompletionState(
   context.flowChatStore.markSessionFinished(sessionId);
 
   context.flowChatStore.updateDialogTurn(sessionId, turnId, turn => {
+    const completedAt = Date.now();
     const updatedModelRounds = turn.modelRounds.map((round) => {
       if (round.isStreaming) {
         return {
@@ -1100,7 +1071,7 @@ function finalizeTurnCompletionState(
           isStreaming: false,
           isComplete: true,
           status: 'completed' as const,
-          endTime: Date.now()
+          endTime: round.endTime ?? completedAt
         };
       }
       return round;
@@ -1110,7 +1081,7 @@ function finalizeTurnCompletionState(
       ...turn,
       modelRounds: updatedModelRounds,
       status: 'completed' as const,
-      endTime: Date.now()
+      endTime: turn.endTime ?? completedAt
     };
   });
   reconcileBackgroundSubagentSession(sessionId);
@@ -1209,11 +1180,24 @@ function handleSessionTitleGenerated(event: any): void {
 }
 
 function handleSessionModelAutoMigrated(event: SessionModelAutoMigratedEvent): void {
-  const { sessionId, newModelId } = event;
+  const { sessionId, previousModelId, newModelId, reason } = event;
   if (!sessionId || !newModelId) return;
 
   const store = FlowChatStore.getInstance();
-  store.updateSessionModelName(sessionId, newModelId);
+  const applied = store.applySessionModelAutoMigration(
+    sessionId,
+    previousModelId ?? '',
+    newModelId,
+  );
+  if (!applied) {
+    log.debug('Ignoring stale session model migration', {
+      sessionId,
+      previousModelId,
+      newModelId,
+      reason,
+      currentModelId: store.getState().sessions.get(sessionId)?.config.modelName,
+    });
+  }
 }
 
 /**
@@ -1522,22 +1506,6 @@ function handleImageAnalysisCompleted(_context: FlowChatContext, event: ImageAna
   log.info('Image analysis completed', { sessionId, success, durationMs });
 }
 
-/**
- * Strip agent-internal XML wrapper tags from user input before displaying.
- * Handles both normal and forwarded-agent envelopes.
- */
-function cleanRemoteUserInput(raw: string): string {
-  const s = raw.trim();
-  const userQueryMatch = s.match(/<user_query>\s*([\s\S]*?)\s*<\/user_query>/);
-  if (userQueryMatch) {
-    return userQueryMatch[1].trim();
-  }
-
-  return s
-    .replace(/<system(?:_|-)reminder>[\s\S]*?<\/system(?:_|-)reminder>/g, '')
-    .trim();
-}
-
 function handleDialogTurnStarted(context: FlowChatContext, event: any): void {
   const { sessionId, turnId, turnIndex, userInput, originalUserInput, userMessageMetadata } = event;
 
@@ -1614,7 +1582,51 @@ function handleDialogTurnStarted(context: FlowChatContext, event: any): void {
     userMessageMetadata?.kind === 'manual_compaction' ? 'manual_compaction' : 'user_dialog';
 
   const freshSession = store.getState().sessions.get(sessionId);
-  const dialogTurn = freshSession?.dialogTurns.find((turn: DialogTurn) => turn.id === turnId);
+  let dialogTurn = freshSession?.dialogTurns.find((turn: DialogTurn) => turn.id === turnId);
+  let projectedNewTurn = false;
+
+  if (!dialogTurn && freshSession) {
+    // Adoption is keyed purely by turn metadata: a driver that projected an
+    // optimistic turn marked it with the session's pending adoption key, and
+    // the executor's own DialogTurnStarted adopts it in place. No transport
+    // check — a session whose turns carry no key never matches.
+    const pendingAdoptionKey = sessionPendingTurnAdoptionKey(freshSession);
+    const optimisticTurn = pendingAdoptionKey
+      ? freshSession.dialogTurns.find(
+          turn => optimisticTurnAdoptionKey(turn) === pendingAdoptionKey,
+        )
+      : undefined;
+    if (optimisticTurn) {
+      store.updateDialogTurn(sessionId, optimisticTurn.id, turn => {
+        const optimisticMetadata = stripOptimisticTurnAdoption(
+          turn.userMessage.metadata,
+        );
+        const mergedMetadata =
+          optimisticMetadata || userMessageMetadata
+            ? { ...optimisticMetadata, ...userMessageMetadata }
+            : undefined;
+        return {
+          ...turn,
+          id: turnId,
+          kind: turn.kind || turnKind,
+          userMessage: {
+            ...turn.userMessage,
+            content: turn.userMessage.content || displayContent,
+            hasImages,
+            metadata: mergedMetadata,
+            images,
+          },
+          status: 'pending',
+          backendTurnIndex: typeof turnIndex === 'number' ? turnIndex : undefined,
+        };
+      });
+      dialogTurn = store.getState().sessions
+        .get(sessionId)
+        ?.dialogTurns.find((turn: DialogTurn) => turn.id === turnId);
+      projectedNewTurn = !!dialogTurn;
+    }
+  }
+
   if (!dialogTurn) {
     const newTurn: DialogTurn = {
       id: turnId,
@@ -1634,6 +1646,10 @@ function handleDialogTurnStarted(context: FlowChatContext, event: any): void {
       backendTurnIndex: typeof turnIndex === 'number' ? turnIndex : undefined,
     };
     store.addDialogTurn(sessionId, newTurn);
+    projectedNewTurn = true;
+  }
+
+  if (projectedNewTurn) {
     reconcileBackgroundSubagentSession(sessionId);
 
     context.contentBuffers.set(sessionId, new Map());
@@ -1647,6 +1663,10 @@ function handleDialogTurnStarted(context: FlowChatContext, event: any): void {
         log.error('State machine transition failed on dialog turn start', { sessionId, error });
       });
     }
+    return;
+  }
+
+  if (!dialogTurn) {
     return;
   }
 
@@ -1702,6 +1722,7 @@ function handleTextChunk(context: FlowChatContext, event: any): void {
 
   const dialogTurn = session.dialogTurns.find((turn: DialogTurn) => turn.id === turnId);
   if (!dialogTurn) {
+    requestPeerSessionRefresh(sessionId);
     log.debug('Dialog turn not found', { turnId });
     return;
   }
@@ -1738,7 +1759,8 @@ function handleTextChunk(context: FlowChatContext, event: any): void {
       ...existing,
       text: existing.text + incoming.text,
       isThinkingEnd: existing.isThinkingEnd || incoming.isThinkingEnd
-    })
+    }),
+    { maxLatencyMs: TEXT_CHUNK_MAX_LATENCY_MS }
   );
 }
 
@@ -1769,7 +1791,12 @@ export function processBatchedEvents(
           processNormalTextChunkInternal(context, sessionId, turnId, roundId, text, attemptId, attemptIndex);
         }
         
-        debouncedSaveDialogTurn(context, sessionId, turnId, 2000);
+        // The executing host owns turn persistence. A Peer controller receives
+        // the same chunks for rendering and must not echo a save RPC for every
+        // checkpoint, especially on a weak link.
+        if (!isPeerDeviceModeActive()) {
+          debouncedSaveDialogTurn(context, sessionId, turnId, 2000);
+        }
       } else if (eventType === 'tool:params') {
         const { sessionId, turnId, toolEvent } = payload;
         processToolParamsPartialInternal(sessionId, turnId, toolEvent);
@@ -1819,7 +1846,7 @@ function handleToolEvent(
     return;
   }
 
-  clearRuntimeStatus(context, sessionId, turnId);
+  clearRuntimeStatus(context, sessionId, turnId, { roundId });
   touchPendingTurnCompletion(context, sessionId, turnId);
   
   const eventData: ToolEventData = {
@@ -1856,7 +1883,7 @@ function handleToolEvent(
 /**
  * Handle model round started event
  */
-function handleModelRoundStart(context: FlowChatContext, event: any): void {
+function handleModelRoundStart(context: FlowChatContext, event: ModelRoundStartedEvent): void {
   const { sessionId, turnId, roundId, roundIndex, roundGroupId } = event;
   
   if (!shouldProcessEvent(sessionId, turnId, 'data', 'ModelRoundStarted')) {
@@ -1873,6 +1900,7 @@ function handleModelRoundStart(context: FlowChatContext, event: any): void {
 
   const dialogTurn = session.dialogTurns.find((turn: DialogTurn) => turn.id === turnId);
   if (!dialogTurn) {
+    requestPeerSessionRefresh(sessionId);
     log.debug('Dialog turn not found (model round start)', { turnId });
     return;
   }
@@ -1894,7 +1922,6 @@ function handleModelRoundStart(context: FlowChatContext, event: any): void {
     event.renderHints?.disableExploreGrouping === true ||
     event.metadata?.disableExploreGrouping === true ||
     event.disableExploreGrouping === true;
-
   const modelRound: ModelRound = {
     id: roundId,
     index: roundIndex || 0,
@@ -1904,6 +1931,9 @@ function handleModelRoundStart(context: FlowChatContext, event: any): void {
     isComplete: false,
     status: 'streaming',
     startTime: Date.now(),
+    // Model identity is optional: external ACP agents carry none.
+    ...(event.modelConfigId ? { modelConfigId: event.modelConfigId.trim() } : {}),
+    ...(event.effectiveModelName ? { effectiveModelName: event.effectiveModelName.trim() } : {}),
     ...(disableExploreGrouping
       ? { renderHints: { disableExploreGrouping: true } }
       : {}),
@@ -1912,22 +1942,16 @@ function handleModelRoundStart(context: FlowChatContext, event: any): void {
   context.flowChatStore.addModelRound(sessionId, turnId, modelRound);
   scheduleModelResponseStatus(context, sessionId, turnId, roundId);
 
-  const modelIdRaw = event.modelId ?? (event as any).model_id;
-  const modelId = typeof modelIdRaw === 'string' ? modelIdRaw.trim() : '';
   const linkedParentInfo =
     findSubagentParentInfoByRound(sessionId, turnId) ||
     getLinkedSubagentParentInfo(sessionId);
-  if (linkedParentInfo && modelId) {
-    updateSubagentParentTaskModel(context, linkedParentInfo, modelId, modelId);
-    void resolveSubagentModelDisplayName(modelId)
-      .then(displayName => {
-        if (displayName && displayName !== modelId) {
-          patchSubagentParentTaskModelDisplayName(context, linkedParentInfo, modelId, displayName);
-        }
-      })
-      .catch(error => {
-        log.warn('Failed to patch subagent model display name', { modelId, error });
-      });
+  if (linkedParentInfo && modelRound.effectiveModelName) {
+    updateSubagentParentTaskModel(
+      context,
+      linkedParentInfo,
+      modelRound.modelConfigId,
+      modelRound.effectiveModelName,
+    );
   }
   
   immediateSaveDialogTurn(context, sessionId, turnId);
@@ -1935,6 +1959,52 @@ function handleModelRoundStart(context: FlowChatContext, event: any): void {
 
 function optionalNumber(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+function handleModelRoundAttemptSuperseded(
+  context: FlowChatContext,
+  event: ModelRoundAttemptSupersededEvent,
+): void {
+  const sessionId = event?.sessionId ?? (event as any)?.session_id;
+  const turnId = event?.turnId ?? (event as any)?.turn_id;
+  const roundId = event?.roundId ?? (event as any)?.round_id;
+  const diagnostic = event?.diagnostic;
+
+  if (!sessionId || !turnId || !roundId) {
+    log.warn('ModelRoundAttemptSuperseded missing identity fields', { event });
+    return;
+  }
+
+  if (
+    !diagnostic ||
+    typeof diagnostic.attemptId !== 'string' ||
+    typeof diagnostic.attemptIndex !== 'number' ||
+    typeof diagnostic.category !== 'string'
+  ) {
+    log.warn('ModelRoundAttemptSuperseded has an invalid diagnostic', { sessionId, turnId, roundId });
+    return;
+  }
+
+  if (!shouldProcessEvent(sessionId, turnId, 'data', 'ModelRoundAttemptSuperseded')) {
+    return;
+  }
+
+  const round = context.flowChatStore.getState().sessions.get(sessionId)
+    ?.dialogTurns.find(dialogTurn => dialogTurn.id === turnId)
+    ?.modelRounds.find(modelRound => modelRound.id === roundId);
+  if (!round) {
+    log.debug('Model round not found (attempt superseded)', { sessionId, turnId, roundId });
+    return;
+  }
+
+  context.flowChatStore.updateModelRound(
+    sessionId,
+    turnId,
+    roundId,
+    current => mergeModelRoundAttemptDiagnostics(current, [diagnostic], {
+      supersedeMatchingAttempts: true,
+    }),
+  );
 }
 
 /**
@@ -1977,8 +2047,8 @@ function handleModelRoundComplete(context: FlowChatContext, event: ModelRoundCom
     endTime,
     durationMs,
     providerId: event.providerId ?? (event as any).provider_id,
-    modelId: event.modelId ?? (event as any).model_id,
-    modelAlias: event.modelAlias ?? (event as any).model_alias,
+    modelConfigId: event.modelConfigId,
+    effectiveModelName: event.effectiveModelName,
     firstChunkMs: optionalNumber(event.firstChunkMs ?? (event as any).first_chunk_ms),
     firstVisibleOutputMs: optionalNumber(event.firstVisibleOutputMs ?? (event as any).first_visible_output_ms),
     streamDurationMs: optionalNumber(event.streamDurationMs ?? (event as any).stream_duration_ms),
@@ -2247,6 +2317,7 @@ export function handleDialogTurnComplete(
   const success = event?.success;
   const finishReason = event?.finishReason ?? event?.finish_reason;
   const hasFinalResponse = event?.hasFinalResponse ?? event?.has_final_response;
+  const durationMs = optionalNumber(event?.durationMs ?? event?.duration_ms);
 
   if (!sessionId || !turnId) {
     log.warn('DialogTurnCompleted missing sessionId or turnId', { event });
@@ -2293,6 +2364,9 @@ export function handleDialogTurnComplete(
     return {
       ...turn,
       status: 'finishing' as const,
+      endTime: durationMs === undefined
+        ? turn.endTime
+        : turn.startTime + Math.max(0, durationMs),
       success: success ?? undefined,
       finishReason: finishReason ?? undefined,
       hasFinalResponse: typeof hasFinalResponse === 'boolean' ? hasFinalResponse : undefined,
@@ -2314,13 +2388,6 @@ export function handleDialogTurnComplete(
   beginTurnCompletion(context, sessionId, turnId, partialRecoveryReason);
 }
 
-/**
- * Handle dialog turn failed event
- */
-/**
- * Format a raw dialog error string into a user-friendly notification.
- * Returns a title, a short message with actionable advice, and the original error for diagnostics.
- */
 function normalizeDialogErrorDetail(event: any): AiErrorDetail {
   const rawCategory = typeof event.errorCategory === 'string' ? event.errorCategory : undefined;
   const detail = event.errorDetail && typeof event.errorDetail === 'object'
@@ -2328,87 +2395,6 @@ function normalizeDialogErrorDetail(event: any): AiErrorDetail {
     : { category: rawCategory, rawMessage: event.error };
 
   return normalizeAiErrorDetail(detail, event.error);
-}
-
-export interface DialogErrorNotification {
-  type: 'error' | 'warning';
-  title: string;
-  message: string;
-  detail: string;
-  rawError: string;
-  diagnostics: string;
-  actions?: NotificationAction[];
-  metadata?: Record<string, any>;
-}
-
-export function formatDialogErrorForNotification(
-  rawError: string,
-  errorDetail?: AiErrorDetail
-): DialogErrorNotification {
-  const raw = rawError || '';
-  const normalizedDetail = normalizeAiErrorDetail(errorDetail ?? { rawMessage: raw }, raw);
-  const presentation = getAiErrorPresentation(normalizedDetail);
-  const title = i18nService.t(presentation.titleKey);
-  const message = i18nService.t(presentation.messageKey);
-  const diagnostics = buildDialogErrorDiagnostics(presentation, raw, normalizedDetail);
-
-  return {
-    type: presentation.severity,
-    title,
-    message,
-    detail: diagnostics || raw,
-    rawError: raw,
-    diagnostics,
-    actions: buildDialogErrorActions(diagnostics),
-    metadata: {
-      aiError: {
-        category: presentation.category,
-        retryable: presentation.retryable,
-        diagnostics,
-        rawError: raw,
-        detail: normalizedDetail,
-      },
-    },
-  };
-}
-
-function buildDialogErrorDiagnostics(
-  presentation: AiErrorPresentation,
-  rawError: string,
-  detail: AiErrorDetail
-): string {
-  const lines = [
-    presentation.diagnostics,
-    detail.providerMessage ? `provider_message=${detail.providerMessage}` : null,
-    rawError ? `raw_error=${rawError}` : null,
-  ].filter(Boolean);
-
-  return lines.join('\n');
-}
-
-function buildDialogErrorActions(diagnostics: string): NotificationAction[] | undefined {
-  if (!diagnostics) {
-    return undefined;
-  }
-
-  return [
-    {
-      label: i18nService.t('errors:ai.actions.copyDiagnostics'),
-      variant: 'secondary',
-      onClick: () => {
-        const clipboard = typeof navigator !== 'undefined' ? navigator.clipboard : undefined;
-        if (!clipboard?.writeText) {
-          return;
-        }
-
-        void clipboard.writeText(diagnostics).then(() => {
-          notificationService.success(i18nService.t('flow-chat:deepReviewActionBar.diagnosticsCopied'), {
-            duration: 2500,
-          });
-        });
-      },
-    },
-  ];
 }
 
 function handleDialogTurnFailed(context: FlowChatContext, event: any): void {
@@ -2450,9 +2436,10 @@ function handleDialogTurnFailed(context: FlowChatContext, event: any): void {
   context.flowChatStore.markSessionFinished(sessionId);
   
   const dialogTurn = session.dialogTurns.find(turn => turn.id === turnId);
-  const hasSuccessfulModelRounds = dialogTurn && dialogTurn.modelRounds.length > 0;
-  
-  if (hasSuccessfulModelRounds) {
+  if (dialogTurn) {
+    const terminalError = typeof error === 'string' && error.trim()
+      ? error
+      : errorDetail.rawMessage || errorDetail.providerMessage || 'Execution failed';
     context.flowChatStore.updateDialogTurn(sessionId, turnId, turn => {
       const updatedModelRounds = turn.modelRounds.map((round) => {
         if (round.isStreaming) {
@@ -2471,42 +2458,14 @@ function handleDialogTurnFailed(context: FlowChatContext, event: any): void {
         ...turn,
         modelRounds: updatedModelRounds,
         status: 'error' as const,
-        error: error || 'Execution failed',
+        error: terminalError,
+        errorDetail,
         endTime: Date.now()
       };
     });
     
     saveDialogTurnToDisk(context, sessionId, turnId).catch(err => {
       log.warn('Failed to save failed dialog turn', { sessionId, turnId, error: err });
-    });
-  } else {
-    if (dialogTurn?.userMessage?.content) {
-      try {
-        // B-policy: restore the failed turn's user content into the pending
-        // queue exactly once, marked `failed` and `retryCount=1`. The auto-drain
-        // listener skips items with `retryCount > 0`, so the user must
-        // explicitly edit / send-now / delete to clear the entry. This prevents
-        // the previous behaviour where a hard error (auth, rate-limit, bad
-        // tool args) would auto-resend in a tight loop.
-        pendingQueueManager.enqueue({
-          sessionId,
-          content: dialogTurn.userMessage.content,
-          displayMessage: dialogTurn.userMessage.content,
-          retryCount: 1,
-          initialStatus: 'failed',
-        });
-      } catch (err) {
-        log.warn('Failed to restore failed turn into pending queue', {
-          sessionId,
-          turnId,
-          err,
-        });
-      }
-    }
-
-    context.flowChatStore.deleteDialogTurn(sessionId, turnId);
-    updateSessionMetadata(context, sessionId).catch(err => {
-      log.warn('Failed to update failed session metadata', { sessionId, error: err });
     });
   }
   reconcileBackgroundSubagentSession(sessionId);
@@ -2523,20 +2482,6 @@ function handleDialogTurnFailed(context: FlowChatContext, event: any): void {
     });
   }
   
-  const formatted = formatDialogErrorForNotification(error, errorDetail);
-  const options = {
-    title: formatted.title,
-    duration: 8000,
-    actions: formatted.actions,
-    metadata: formatted.metadata,
-  };
-
-  if (formatted.type === 'warning') {
-    notificationService.warning(formatted.message, options);
-  } else {
-    notificationService.error(formatted.message, options);
-  }
-
   if (shouldMarkUnreadCompletion(sessionId)) {
     context.flowChatStore.markSessionUnreadCompletion(sessionId, 'error');
   }
@@ -2652,14 +2597,15 @@ function detectModifiedPlanFiles(dialogTurn: DialogTurn): string[] {
     for (const item of round.items) {
       if (item.type !== 'tool') continue;
       const toolItem = item as FlowToolItem;
+      const effective = effectiveToolInvocation(toolItem.toolName, toolItem.toolCall?.input);
       
-      if (toolItem.toolName === 'CreatePlan' && toolItem.toolResult?.success) {
+      if (effective.toolName === 'CreatePlan' && toolItem.toolResult?.success) {
         const planPath = toolItem.toolResult.result?.plan_file_path;
         if (planPath) createPlanFiles.add(planPath);
       }
       
-      if (['Edit', 'Write'].includes(toolItem.toolName) && toolItem.toolResult?.success) {
-        const input = toolItem.toolCall?.input;
+      if (['Edit', 'Write'].includes(effective.toolName) && toolItem.toolResult?.success) {
+        const input = effective.input as any;
         const filePath = splitFilePathAndContent(input?.payload)?.filePath
           || input?.file_path
           || input?.target_file

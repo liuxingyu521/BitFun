@@ -2,6 +2,13 @@ import { escapeHtml, extractHtmlSlideBackground, getActiveIndex, getActiveSlide,
 import { translate as t, getLocale } from './i18n.js';
 import { refreshFlatSelect } from './flat-select.js';
 import { DEFAULT_STYLE_PRESET } from './style-presets.js';
+import {
+  elementModelElementHtml,
+  resolveElementColor,
+} from './element-model-html.js';
+import { sanitizeSlideMarkup } from './sanitize-slide-markup.js';
+
+export { resolveElementColor as resolveColor };
 
 export function applyI18n() {
   document.documentElement.lang = getLocale();
@@ -174,21 +181,24 @@ const HTML_SLIDE_PREVIEW_HOST_CLASS = 'html-slide-preview-host';
 const HTML_SLIDE_PREVIEW_SCALER_CLASS = 'html-slide-preview-scaler';
 const DEFAULT_SLIDE_DESIGN = { width: 1280, height: 720 };
 
-function writeSandboxIframeDocument(frame, html) {
+function writeSandboxIframeDocument(frame, sanitizedHtml) {
   const doc = frame.contentDocument;
   if (!doc) return false;
   doc.open();
-  doc.write(normalizeSlideDocument(html));
+  doc.write(sanitizedHtml);
   doc.close();
   return true;
 }
 
 function mountSandboxIframeHtml(frame, html, onMounted) {
+  const sanitizedHtml = sanitizeSlideMarkup(normalizeSlideDocument(html));
   frame.setAttribute('sandbox', 'allow-same-origin');
+  // Never use srcdoc here: sandboxed srcdoc iframes render blank in Tauri
+  // WebKit, and the srcdoc navigation would replace the written document.
   frame.src = 'about:blank';
 
   const mount = () => {
-    if (!writeSandboxIframeDocument(frame, html)) return false;
+    if (!writeSandboxIframeDocument(frame, sanitizedHtml)) return false;
     onMounted?.();
     return true;
   };
@@ -368,22 +378,6 @@ export function fitHtmlSlidePreviewSurface(host) {
 const SLIDE_SHADOW_ROOT_CLASS = 'ppt-slide-shadow-root';
 const SLIDE_SHADOW_BODY_CLASS = 'ppt-slide-shadow-body';
 
-/** Strip active content (scripts, inline handlers, javascript: URLs) from a parsed slide document. */
-function sanitizeParsedSlideDocument(parsed) {
-  parsed.querySelectorAll('script, iframe, object, embed, meta[http-equiv="refresh" i]').forEach((node) => node.remove());
-  parsed.querySelectorAll('*').forEach((node) => {
-    for (const attr of [...node.attributes]) {
-      const name = attr.name.toLowerCase();
-      if (name.startsWith('on')) {
-        node.removeAttribute(attr.name);
-      } else if ((name === 'href' || name === 'src' || name === 'xlink:href') && /^\s*javascript:/i.test(attr.value)) {
-        node.removeAttribute(attr.name);
-      }
-    }
-  });
-  return parsed;
-}
-
 /**
  * Build the in-document editable slide stage. The PPT Live app document
  * itself lives in a sandboxed host iframe without `allow-same-origin`
@@ -401,9 +395,8 @@ function createEditableSlideStage(html, frameClass) {
   const designW = Number(stage.dataset.designW);
   const designH = Number(stage.dataset.designH);
 
-  const parsed = sanitizeParsedSlideDocument(
-    new DOMParser().parseFromString(normalizeSlideDocument(html), 'text/html'),
-  );
+  const sanitizedMarkup = sanitizeSlideMarkup(normalizeSlideDocument(html));
+  const parsed = new DOMParser().parseFromString(sanitizedMarkup, 'text/html');
 
   const shadow = stage.attachShadow({ mode: 'open' });
   const rootEl = document.createElement('div');
@@ -459,7 +452,7 @@ function createEditableSlideStage(html, frameClass) {
 
   rootEl.appendChild(bodyEl);
   shadow.appendChild(rootEl);
-  stage._pptLiveSourceHtml = String(html || '');
+  stage._pptLiveSourceHtml = sanitizedMarkup;
   return stage;
 }
 
@@ -577,6 +570,8 @@ export function renderGeneration(state) {
   document.querySelector('.ppt-live')?.classList.toggle('is-generating', isActive);
   document.querySelector('.ppt-live')?.classList.toggle('has-generation-error', hasError);
 
+  renderGenerationProgress(state, { isActive, hasError });
+
   if (!list) return;
 
   // Merge high-level phase events and granular agent-stream entries into a
@@ -611,6 +606,44 @@ export function renderGeneration(state) {
     }
   }
   scrollGenerationListToLatest(list);
+}
+
+function renderGenerationProgress(state, { isActive, hasError }) {
+  const panel = byId('generationProgress');
+  const labelEl = byId('generationProgressLabel');
+  const countEl = byId('generationProgressCount');
+  const fillEl = byId('generationProgressFill');
+  const phaseList = byId('generationPhaseList');
+  if (!panel || !labelEl || !countEl || !fillEl || !phaseList) return;
+
+  const steps = state.generation?.steps || [];
+  const show = Boolean(isActive || hasError || steps.some((step) => step.status === 'done'));
+  panel.hidden = !show;
+  if (!show) return;
+
+  const drafted = Number(state.generation?.draftedCount) || 0;
+  const target = Number(state.generation?.slideTarget) || 0;
+  const running = steps.find((step) => step.status === 'running');
+  const ratio = target > 0
+    ? Math.max(0, Math.min(1, drafted / target))
+    : (running ? Math.max(0.08, steps.filter((step) => step.status === 'done').length / Math.max(steps.length, 1)) : (isActive ? 0.08 : 1));
+
+  labelEl.textContent = running?.label
+    || (hasError ? t('eventTurnFailed') : t('processEventDone'));
+  countEl.textContent = target > 0
+    ? `${Math.min(drafted, target)} / ${target}`
+    : (drafted > 0 ? String(drafted) : '');
+  fillEl.style.width = `${Math.round(ratio * 100)}%`;
+  panel.classList.toggle('is-error', hasError);
+  panel.classList.toggle('is-active', isActive && !hasError);
+
+  phaseList.innerHTML = '';
+  for (const step of steps) {
+    const li = document.createElement('li');
+    li.className = `generation-phase is-${step.status || 'pending'}`;
+    li.textContent = step.label || step.id;
+    phaseList.append(li);
+  }
 }
 
 function mergeTimeline(events, stream) {
@@ -712,22 +745,35 @@ function renderLiveIndicator(state, merged) {
 }
 
 function currentActivityLabel(state, merged) {
+  const drafted = Number(state.generation?.draftedCount) || 0;
+  const target = Number(state.generation?.slideTarget) || 0;
+  const currentStep = (state.generation?.steps || []).find((s) => s.status === 'running');
+  if (currentStep?.id === 'slides' && (drafted > 0 || target > 0)) {
+    return t('generationWritingSlideProgress', {
+      done: drafted,
+      total: target || Math.max(drafted, 1),
+    });
+  }
   // Derive the most specific "what is happening right now" label.
   for (let i = merged.length - 1; i >= 0; i--) {
     const item = merged[i];
     if (item.source === 'stream') {
       if (item.kind === 'tool-start') {
+        const tool = String(item.toolName || '').toLowerCase();
+        const detail = truncateText(String(item.text || ''), 80);
+        if ((tool === 'write' || tool === 'edit') && detail) {
+          return `${friendlyStreamToolName(item.toolName)} ${detail}…`;
+        }
         return `${friendlyStreamToolName(item.toolName)}…`;
       }
       if (item.kind === 'text') {
         return t('processEventText');
       }
     }
-    if (item.source === 'event' && item.title) {
+    if (item.source === 'event' && item.title && item.kind !== 'pulse') {
       return item.title;
     }
   }
-  const currentStep = (state.generation?.steps || []).find((s) => s.status === 'running');
   if (currentStep?.label) return `${currentStep.label}…`;
   return t('generationProgressPulse');
 }
@@ -801,9 +847,8 @@ export function syncDensitySlider(density = 'standard') {
 }
 
 export function syncInputs(state) {
-  const promptDraft = typeof state.promptDraft === 'string' ? state.promptDraft : '';
-  const hasDeck = Array.isArray(state.slides) && state.slides.length > 0;
-  value('topicInput', hasDeck ? promptDraft : (promptDraft || state.brief.topic));
+  // No prompt field to mirror: input lives in the host's floating session
+  // bubble, which owns its own draft.
   text('deckTitle', state.title || t('defaultDeckTitle'));
   text('deckMeta', t('slidesMeta', { count: state.slides.length }));
   text('currentSlideIndex', String(getActiveIndex(state) + 1));
@@ -843,8 +888,10 @@ export function syncStylePanelFromState(state) {
 export function readInputs(state, options = {}) {
   const includeTopic = options.includeTopic !== false;
   if (includeTopic) {
-    state.brief.topic = val('topicInput');
-    state.promptDraft = state.brief.topic;
+    // PPT Live has no topic input of its own: the instruction arrives from the
+    // floating session bubble and is stored on `state.promptDraft` before this
+    // runs (see submitInstruction in ui.js).
+    state.brief.topic = String(state.promptDraft || '').trim();
     inferBriefFromPrompt(state);
   }
 }
@@ -882,6 +929,9 @@ export function renderOutline(state, handlers) {
 export function renderThumbs(state, handlers) {
   const holder = byId('slideThumbs');
   if (!holder) return;
+  // Full rebuild resets scrollTop; keep the filmstrip viewport stable when
+  // the user clicks a non-visible thumb or when selection only changes.
+  const previousScrollTop = holder.scrollTop;
   holder.innerHTML = '';
   if (!state.slides.length) {
     const empty = document.createElement('div');
@@ -930,7 +980,9 @@ export function renderThumbs(state, handlers) {
     button.addEventListener('click', () => handlers.selectSlide(slide.id));
     holder.append(button);
   });
+  holder.scrollTop = previousScrollTop;
   requestAnimationFrame(() => {
+    holder.scrollTop = previousScrollTop;
     fitThumbPreviews();
     observeThumbPreviews();
   });
@@ -1075,7 +1127,7 @@ export function renderSlideCanvas(state, handlers) {
     canvas.innerHTML = isGenerating
       ? `<div class="slide-empty-state"><span aria-hidden="true">PL</span><strong>${escapeHtml(t('generationAgentWorking'))}</strong><p>${escapeHtml(t('agentWorkingDetail'))}</p></div>`
       : `<div class="welcome-hero"><span class="welcome-hero__icon" aria-hidden="true">PL</span><h2>${escapeHtml(t('welcomeTitle'))}</h2><p>${escapeHtml(t('welcomeSubcopy'))}</p><div class="welcome-hero__tips"><button type="button" class="welcome-tip" data-welcome-prompt="${escapeHtml(t('welcomeTip1'))}">${escapeHtml(t('welcomeTip1'))}</button><button type="button" class="welcome-tip" data-welcome-prompt="${escapeHtml(t('welcomeTip2'))}">${escapeHtml(t('welcomeTip2'))}</button><button type="button" class="welcome-tip" data-welcome-prompt="${escapeHtml(t('welcomeTip3'))}">${escapeHtml(t('welcomeTip3'))}</button></div></div>`;
-    bindWelcomeTips(canvas);
+    bindWelcomeTips(canvas, handlers);
     applySlideCanvasBackground(canvas, null);
     fitSlideCanvas();
     return;
@@ -1095,7 +1147,7 @@ export function renderSlideCanvas(state, handlers) {
         </div>
       </div>
     `;
-    bindWelcomeTips(canvas);
+    bindWelcomeTips(canvas, handlers);
     applySlideCanvasBackground(canvas, null);
     fitSlideCanvas();
     return;
@@ -1271,7 +1323,7 @@ export function hydrateHtmlSlideIframes(root = document) {
 export function slideHtml(slide, options = {}) {
   if (slide?.html) {
     const mountId = `slide-${++pendingSlideHtmlMountSeq}`;
-    pendingSlideHtmlMounts.set(mountId, normalizeSlideDocument(slide.html));
+    pendingSlideHtmlMounts.set(mountId, sanitizeSlideMarkup(normalizeSlideDocument(slide.html)));
     return `<iframe class="html-slide-frame" sandbox="allow-same-origin" src="about:blank" data-ppt-live-mount="${mountId}"></iframe>`;
   }
   const editable = Boolean(options.editable);
@@ -1288,7 +1340,12 @@ export function slideHtml(slide, options = {}) {
     ${slide.kicker ? `<div class="slide-kicker"><span></span><b>${escapeHtml(slide.kicker)}</b></div>` : ''}
     ${slide.proofObject ? `<div class="slide-proof-tag">${escapeHtml(slide.proofObject)}</div>` : ''}
     ${slideQualityBadge(slide)}
-    ${(slide.elements || []).map((element) => elementHtml(element, slide.theme, editable, selectedId)).join('')}
+    ${(slide.elements || []).map((element) => elementModelElementHtml(element, slide.theme, {
+      mode: 'editor',
+      editable,
+      selectedId,
+      mediaPlaceholder: t('mediaPlaceholder'),
+    })).join('')}
     ${slide.sourceNote ? `<div class="slide-source-note">${escapeHtml(slide.sourceNote)}</div>` : ''}
   </div>`;
 }
@@ -1301,13 +1358,12 @@ function slideQualityBadge(slide) {
   return `<div class="slide-quality-badge" data-severity="${highCount ? 'high' : 'medium'}">${escapeHtml(label)}</div>`;
 }
 
-function bindWelcomeTips(canvas) {
+// Example prompts are seeds the user still edits, so a tip prefills the
+// floating bubble composer (PPT Live's only input) instead of submitting.
+function bindWelcomeTips(canvas, handlers) {
   canvas.querySelectorAll('[data-welcome-prompt]').forEach((node) => {
     node.addEventListener('click', () => {
-      const input = byId('topicInput');
-      if (!input) return;
-      input.value = node.dataset.welcomePrompt || node.textContent || '';
-      input.focus();
+      handlers?.useWelcomePrompt?.(node.dataset.welcomePrompt || node.textContent || '');
     });
   });
 }
@@ -1398,79 +1454,8 @@ export function normalizeSlideDocument(html) {
   return `<!DOCTYPE html><html><head><meta charset="UTF-8"></head><body>${source}</body></html>`;
 }
 
-function elementHtml(element, theme, editable, selectedId) {
-  const selected = editable && selectedId === element.id;
-  const style = [
-    `left:${element.x}%`,
-    `top:${element.y}%`,
-    `width:${element.w}%`,
-    `height:${element.h}%`,
-    `font-size:${fontSizeCss(element.style.fontSize)}`,
-    `font-weight:${element.style.fontWeight}`,
-    `color:${resolveColor(element.style.color, theme)}`,
-    `text-align:${element.style.align || 'left'}`,
-    `background:${resolveColor(element.style.background, theme)}`,
-    `opacity:${element.style.opacity}`,
-    `border-radius:${element.style.borderRadius}px`,
-  ].join(';');
-  let content = '';
-  if (element.type === 'list') {
-    content = `<ul>${(element.items || []).map((item, index) => editable
-      ? `<li data-edit-list="${escapeHtml(element.id)}" data-item-index="${index}" contenteditable="true" spellcheck="false">${escapeHtml(item)}</li>`
-      : `<li>${escapeHtml(item)}</li>`).join('')}</ul>`;
-  } else if (element.type === 'metric') {
-    content = `<strong>${escapeHtml(element.text)}</strong><span>${escapeHtml(element.label)}</span>`;
-  } else if (element.type === 'chart') {
-    const max = Math.max(1, ...(element.data || []).map((point) => Number(point.value) || 0));
-    content = `<b>${escapeHtml(element.text)}</b><div class="chart-bars">${(element.data || []).map((point) => `<span><i style="height:${Math.max(8, (Number(point.value) || 0) / max * 100)}%"></i><em>${escapeHtml(point.label)}</em></span>`).join('')}</div>`;
-  } else if (element.type === 'media') {
-    content = `<span>${escapeHtml(element.text || t('mediaPlaceholder'))}</span>`;
-  } else {
-    content = editable
-      ? `<span class="editable-text" data-edit-text="${escapeHtml(element.id)}" contenteditable="true" spellcheck="false">${escapeHtml(element.text || '')}</span>`
-      : escapeHtml(element.text || '');
-  }
-  return `<div class="slide-element element-${element.type}${selected ? ' is-selected' : ''}" data-element-id="${escapeHtml(element.id)}" data-editable="${editable ? 'true' : 'false'}" style="${style}">${content}${selected ? '<i class="resize-handle"></i>' : ''}</div>`;
-}
-
-export function resolveColor(value, theme) {
-  if (!value || value === 'transparent') return 'transparent';
-  if (value === 'ink') return theme.ink;
-  if (value === 'muted') return theme.muted;
-  if (value === 'primary') return theme.primary;
-  if (value === 'accent') return theme.accent;
-  if (value === 'panel') return theme.panel || '#ffffff';
-  if (value === 'soft') return colorMix(theme.primary, 0.1);
-  if (value === 'background') return theme.background;
-  return value;
-}
-
-function colorMix(hex, alpha) {
-  const raw = String(hex || '#0f766e').replace('#', '');
-  const int = parseInt(raw.length === 3 ? raw.split('').map((x) => x + x).join('') : raw, 16);
-  const r = (int >> 16) & 255;
-  const g = (int >> 8) & 255;
-  const b = int & 255;
-  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
-}
-
-function fontSizeCss(value) {
-  const size = Math.max(8, Number(value) || 24);
-  const cqw = Math.round((size / 10.2) * 1000) / 1000;
-  return `clamp(8px, ${cqw}cqw, ${size}px)`;
-}
-
 function byId(id) {
   return document.getElementById(id);
-}
-
-function value(id, next) {
-  const node = byId(id);
-  if (node && document.activeElement !== node) node.value = next ?? '';
-}
-
-function val(id) {
-  return byId(id)?.value || '';
 }
 
 function text(id, value) {

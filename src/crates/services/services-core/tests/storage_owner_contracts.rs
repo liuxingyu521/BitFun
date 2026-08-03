@@ -1,6 +1,7 @@
+#![cfg(feature = "local-storage")]
+
 use bitfun_services_core::persistence::{PersistenceService, StorageOptions};
 use bitfun_services_core::storage_cleanup::{CleanupPolicy, CleanupRoots, CleanupService};
-use bitfun_services_core::workspace_instructions::read_workspace_instruction_files;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::fs;
@@ -166,30 +167,6 @@ async fn cleanup_service_trims_oldest_cache_files_when_size_exceeds_policy() {
 }
 
 #[tokio::test]
-async fn workspace_instruction_files_reads_agents_then_claude_and_skips_empty_files() {
-    let temp = tempfile::tempdir().expect("tempdir");
-    fs::write(temp.path().join("AGENTS.md"), "agent rules\n").expect("agents");
-    fs::write(temp.path().join("CLAUDE.md"), "claude rules\n").expect("claude");
-
-    let files = read_workspace_instruction_files(temp.path())
-        .await
-        .expect("instruction files");
-
-    assert_eq!(files.len(), 2);
-    assert_eq!(files[0].name, "AGENTS.md");
-    assert_eq!(files[0].content, "agent rules\n");
-    assert_eq!(files[1].name, "CLAUDE.md");
-    assert_eq!(files[1].content, "claude rules\n");
-
-    fs::write(temp.path().join("AGENTS.md"), "").expect("empty agents");
-    let files = read_workspace_instruction_files(temp.path())
-        .await
-        .expect("instruction files");
-    assert_eq!(files.len(), 1);
-    assert_eq!(files[0].name, "CLAUDE.md");
-}
-
-#[tokio::test]
 async fn token_usage_service_persists_records_and_filters_subagents_by_default() {
     let temp = tempfile::tempdir().expect("tempdir");
     let service =
@@ -199,6 +176,7 @@ async fn token_usage_service_persists_records_and_filters_subagents_by_default()
 
     service
         .record_usage(
+            "model-config-a".to_string(),
             "model-a".to_string(),
             "session-a".to_string(),
             "turn-a".to_string(),
@@ -212,6 +190,7 @@ async fn token_usage_service_persists_records_and_filters_subagents_by_default()
         .expect("record main");
     service
         .record_usage(
+            "model-config-a".to_string(),
             "model-a".to_string(),
             "session-a".to_string(),
             "turn-sub".to_string(),
@@ -263,6 +242,7 @@ async fn token_usage_clear_does_not_replay_cached_record_batches() {
 
     service
         .record_usage(
+            "model-config-old".to_string(),
             "model-old".to_string(),
             "session-old".to_string(),
             "turn-old".to_string(),
@@ -277,6 +257,7 @@ async fn token_usage_clear_does_not_replay_cached_record_batches() {
     service.clear_all_stats().await.expect("clear usage");
     service
         .record_usage(
+            "model-config-new".to_string(),
             "model-new".to_string(),
             "session-new".to_string(),
             "turn-new".to_string(),
@@ -324,6 +305,7 @@ async fn token_usage_all_range_ignores_non_date_record_files() {
 
     service
         .record_usage(
+            "model-config-a".to_string(),
             "model-a".to_string(),
             "session-a".to_string(),
             "turn-a".to_string(),

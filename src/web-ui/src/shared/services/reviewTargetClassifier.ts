@@ -75,29 +75,6 @@ interface PathTagRule {
   evidence: string;
 }
 
-export const FRONTEND_REVIEW_DOMAIN_TAGS: ReviewDomainTag[] = [
-  'frontend_ui',
-  'frontend_style',
-  'frontend_i18n',
-  'frontend_contract',
-  'desktop_contract',
-  'web_server_contract',
-];
-
-export interface ReviewerApplicabilityRule {
-  subagentId: string;
-  matchingTags: ReviewDomainTag[];
-  runWhenTargetUnknown: boolean;
-}
-
-const REVIEWER_APPLICABILITY_RULES: ReviewerApplicabilityRule[] = [
-  {
-    subagentId: 'ReviewFrontend',
-    matchingTags: FRONTEND_REVIEW_DOMAIN_TAGS,
-    runWhenTargetUnknown: true,
-  },
-];
-
 const LAYERED_BACKEND_CRATE_PREFIXES = [
   'src/crates/interfaces/acp/',
   'src/crates/assembly/',
@@ -106,26 +83,6 @@ const LAYERED_BACKEND_CRATE_PREFIXES = [
   'src/crates/contracts/',
   'src/crates/execution/',
 ];
-
-export function getReviewerApplicabilityRule(
-  subagentId: string,
-): ReviewerApplicabilityRule | undefined {
-  return REVIEWER_APPLICABILITY_RULES.find((rule) => rule.subagentId === subagentId);
-}
-
-export function shouldRunReviewerForTarget(
-  subagentId: string,
-  target: ReviewTargetClassification,
-): boolean {
-  const rule = getReviewerApplicabilityRule(subagentId);
-  if (!rule) {
-    return true;
-  }
-  if (target.resolution === 'unknown') {
-    return rule.runWhenTargetUnknown;
-  }
-  return rule.matchingTags.some((tag) => target.tags.includes(tag));
-}
 
 const PATH_TAG_RULES: PathTagRule[] = [
   {
@@ -171,10 +128,12 @@ const PATH_TAG_RULES: PathTagRule[] = [
     evidence: 'Desktop API surface may affect frontend invoke contract',
   },
   {
-    id: 'api-layer-contract',
+    // Keep retired-path changes classified for deletion and historical-branch
+    // review; this is path compatibility, not a live module claim.
+    id: 'retired-api-layer-contract',
     tags: ['api_layer', 'frontend_contract'],
     match: { pathPrefixes: ['src/crates/adapters/api-layer/'] },
-    evidence: 'API layer may affect frontend/backend contract',
+    evidence: 'Retired API layer path changed; verify deletion or historical compatibility',
   },
   {
     id: 'server-contract',

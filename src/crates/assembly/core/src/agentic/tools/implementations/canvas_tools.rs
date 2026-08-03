@@ -121,10 +121,6 @@ Returns a stable `bitfun-canvas://...` artifact reference. Use ReadCanvas to ins
         })
     }
 
-    fn needs_permissions(&self, _input: Option<&Value>) -> bool {
-        false
-    }
-
     async fn call_impl(
         &self,
         input: &Value,
@@ -318,10 +314,6 @@ Provide either `artifact_reference` or `canvas_id`, plus one complete replacemen
         })
     }
 
-    fn needs_permissions(&self, _input: Option<&Value>) -> bool {
-        false
-    }
-
     async fn call_impl(
         &self,
         input: &Value,
@@ -414,10 +406,6 @@ Use this for small, targeted edits such as changing a label, number, style prop,
                 }
             }
         })
-    }
-
-    fn needs_permissions(&self, _input: Option<&Value>) -> bool {
-        false
     }
 
     async fn call_impl(
@@ -831,7 +819,7 @@ mod tests {
                 Some(format!("workspace_{session_id}")),
                 std::env::temp_dir().join(format!("bitfun-canvas-tool-test-{}", uuid_short())),
             )),
-            unlocked_collapsed_tools: Vec::new(),
+            loaded_deferred_tool_specs: Vec::new(),
             primary_model_facts: tool_runtime::context::PrimaryModelFacts::default(),
             custom_data: HashMap::new(),
             computer_use_host: None,

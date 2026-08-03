@@ -17,10 +17,10 @@ use tokio::time::{timeout, Duration};
 
 use crate::api::app_state::AppState;
 use bitfun_core::agentic::tools::implementations::skills::mode_overrides::{
-    clear_user_mode_skill_overrides, load_project_mode_skills_document_local,
-    project_mode_skills_path_for_remote, save_project_mode_skills_document_local,
-    set_disabled_mode_skills_in_document, set_mode_skill_disabled_in_document,
-    set_user_mode_skill_state,
+    clear_user_mode_skill_overrides, load_globally_disabled_user_skills,
+    load_project_mode_skills_document_local, project_mode_skills_path_for_remote,
+    save_project_mode_skills_document_local, set_disabled_mode_skills_in_document,
+    set_global_user_skill_disabled, set_mode_skill_disabled_in_document, set_user_mode_skill_state,
 };
 use bitfun_core::agentic::tools::implementations::skills::{
     resolver::resolve_skill_default_enabled_for_mode, ModeSkillInfo, SkillData, SkillInfo,
@@ -46,6 +46,28 @@ const MARKET_DESC_FETCH_CONCURRENCY: usize = 6;
 const MARKET_DESC_MAX_LEN: usize = 220;
 
 static MARKET_DESCRIPTION_CACHE: OnceLock<RwLock<HashMap<String, String>>> = OnceLock::new();
+
+fn can_delete_owned_skill(source_id: &str, source_slot: &str, is_builtin: bool) -> bool {
+    if is_builtin {
+        return false;
+    }
+
+    let source_id = source_id.trim().to_ascii_lowercase();
+    if !source_id.is_empty() {
+        return matches!(source_id.as_str(), "bitfun" | "bitfun-system");
+    }
+
+    let source_slot = source_slot.trim().to_ascii_lowercase();
+    source_slot.starts_with("bitfun")
+}
+
+fn ensure_skill_can_be_deleted(skill: &SkillInfo) -> Result<(), String> {
+    if can_delete_owned_skill(&skill.source_id, &skill.source_slot, skill.is_builtin) {
+        Ok(())
+    } else {
+        Err("Only BitFun-owned, non-built-in Skills can be deleted from BitFun".to_string())
+    }
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SkillValidationResult {
@@ -99,6 +121,19 @@ pub struct ReplaceModeSkillSelectionRequest {
 pub struct ResetModeSkillSelectionRequest {
     pub mode_id: String,
     pub workspace_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetGlobalSkillDisabledRequest {
+    pub skill_key: String,
+    pub disabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GlobalSkillSettingsResponse {
+    pub globally_disabled_user_skill_keys: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -473,6 +508,51 @@ pub async fn get_skill_configs(
 
     serde_json::to_value(all_skills)
         .map_err(|e| format!("Failed to serialize skill configs: {}", e))
+}
+
+#[tauri::command]
+pub async fn get_global_skill_settings() -> Result<GlobalSkillSettingsResponse, String> {
+    let globally_disabled_user_skill_keys = load_globally_disabled_user_skills()
+        .await
+        .map_err(|error| format!("Failed to load global Skill settings: {}", error))?;
+    Ok(GlobalSkillSettingsResponse {
+        globally_disabled_user_skill_keys,
+    })
+}
+
+#[tauri::command]
+pub async fn set_global_skill_disabled(
+    request: SetGlobalSkillDisabledRequest,
+) -> Result<GlobalSkillSettingsResponse, String> {
+    let skill_key = request.skill_key.trim();
+    if !skill_key.starts_with("user::") {
+        return Err("Global Skill availability only applies to user-level Skills".to_string());
+    }
+
+    let known_skill = SkillRegistry::global()
+        .get_all_skills()
+        .await
+        .into_iter()
+        .any(|skill| skill.key == skill_key && skill.level == SkillLocation::User);
+    if !known_skill {
+        return Err(format!("User-level Skill '{}' was not found", skill_key));
+    }
+
+    let globally_disabled_user_skill_keys =
+        set_global_user_skill_disabled(skill_key, request.disabled)
+            .await
+            .map_err(|error| format!("Failed to update global Skill settings: {}", error))?;
+    if let Err(error) = bitfun_core::service::config::reload_global_config().await {
+        log::warn!(
+            "Failed to reload global configuration after Skill availability update: skill_key={}, error={}",
+            skill_key,
+            error
+        );
+    }
+
+    Ok(GlobalSkillSettingsResponse {
+        globally_disabled_user_skill_keys,
+    })
 }
 
 #[tauri::command]
@@ -907,6 +987,7 @@ pub async fn delete_skill(
             .find_skill_by_key_for_remote_workspace(&remote_workspace_fs, &remote_root, &skill_key)
             .await
             .ok_or_else(|| format!("Skill '{}' not found", skill_key))?;
+        ensure_skill_can_be_deleted(&skill_info)?;
 
         match skill_info.level {
             SkillLocation::Project => {
@@ -944,6 +1025,7 @@ pub async fn delete_skill(
         .find_skill_by_key_for_workspace(&skill_key, workspace_root.as_deref())
         .await
         .ok_or_else(|| format!("Skill '{}' not found", skill_key))?;
+    ensure_skill_can_be_deleted(&skill_info)?;
 
     let skill_path = std::path::PathBuf::from(&skill_info.path);
 
@@ -963,6 +1045,32 @@ pub async fn delete_skill(
         skill_path.display()
     );
     Ok(format!("Skill '{}' deleted successfully", skill_info.name))
+}
+
+#[cfg(test)]
+mod skill_delete_policy_tests {
+    use super::can_delete_owned_skill;
+
+    #[test]
+    fn only_bitfun_owned_non_builtin_skills_are_deletable() {
+        assert!(can_delete_owned_skill("bitfun", "bitfun", false));
+        assert!(can_delete_owned_skill("", "bitfun", false));
+        assert!(can_delete_owned_skill(
+            "bitfun-system",
+            "bitfun-system",
+            false
+        ));
+        assert!(!can_delete_owned_skill(
+            "bitfun-system",
+            "bitfun-system",
+            true
+        ));
+        assert!(!can_delete_owned_skill("opencode", "home.opencode", false));
+        assert!(!can_delete_owned_skill("codex", "home.codex", false));
+        assert!(!can_delete_owned_skill("future-ecosystem", "future", false));
+        assert!(!can_delete_owned_skill("", "future", false));
+        assert!(!can_delete_owned_skill("", "", false));
+    }
 }
 
 #[tauri::command]

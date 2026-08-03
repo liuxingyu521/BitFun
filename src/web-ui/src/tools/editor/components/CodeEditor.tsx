@@ -7,15 +7,12 @@
 
 import React, { useEffect, useState, useCallback, useRef, useMemo } from 'react';
 import { AlertCircle } from 'lucide-react';
-import * as monaco from 'monaco-editor';
+import type * as monaco from 'monaco-editor';
 import { monacoInitManager } from '../services/MonacoInitManager';
+import { getMonacoRuntime, monacoApi } from '../services/monacoRuntime';
 import { monacoModelManager } from '../services/MonacoModelManager';
 import { activeEditTargetService, createMonacoEditTarget } from '../services/ActiveEditTargetService';
-import { 
-  forceRegisterTheme,
-  BitFunDarkTheme,
-  BitFunDarkThemeMetadata 
-} from '../themes';
+import { monacoAppearanceAdapter } from '@/infrastructure/appearance/adapters/MonacoAppearanceAdapter';
 import { useMonacoLsp } from '@/tools/lsp/hooks/useMonacoLsp';
 import { lspExtensionRegistry } from '@/tools/lsp/services/LspExtensionRegistry';
 import { globalEventBus } from '@/infrastructure/event-bus';
@@ -27,6 +24,10 @@ import { createLogger } from '@/shared/utils/logger';
 import { sendDebugProbe } from '@/shared/utils/debugProbe';
 import { elapsedMs, nowMs } from '@/shared/utils/timing';
 import { isSamePath } from '@/shared/utils/pathUtils';
+import {
+  isPeerDeviceModeActive,
+  PEER_MODE_FILE_SYNC_POLL_MS,
+} from '@/infrastructure/peer-device/peerModeFlag';
 import {
   diskContentMatchesEditorForExternalSync,
   diskVersionFromMetadata,
@@ -74,8 +75,6 @@ export interface CodeEditorProps {
   showLineNumbers?: boolean;
   /** Show minimap */
   showMinimap?: boolean;
-  /** Editor theme */
-  theme?: 'vs-dark' | 'vs-light' | 'hc-black';
   /** CSS class name */
   className?: string;
   /** Content change callback */
@@ -245,7 +244,6 @@ const CodeEditor: React.FC<CodeEditorProps> = ({
     line_numbers: 'on',
     minimap: { enabled: showMinimap, side: 'right', size: 'proportional' }
   });
-  const [_currentThemeId, setCurrentThemeId] = useState<string>(BitFunDarkThemeMetadata.id);
   const isMemoryContent = initialContent !== undefined;
   const [cursorPosition, setCursorPosition] = useState({ line: 1, column: 1 });
   const [selection, setSelection] = useState({ chars: 0, lines: 0 });
@@ -662,7 +660,7 @@ const CodeEditor: React.FC<CodeEditorProps> = ({
           else if (latestEditorConfigRef.current) applyFontConfig(latestEditorConfigRef.current);
         } catch (_) {}
         
-        await monacoInitManager.initialize();
+        const monacoRuntime = await monacoInitManager.initialize();
 
         model = monacoModelManager.getOrCreateModel(
           filePath,
@@ -700,19 +698,7 @@ const CodeEditor: React.FC<CodeEditorProps> = ({
           }
         }
 
-        forceRegisterTheme(BitFunDarkThemeMetadata.id, BitFunDarkTheme);
-
-        let themeId = BitFunDarkThemeMetadata.id;
-        try {
-          const { themeService } = await import('@/infrastructure/theme');
-          const currentTheme = themeService.getCurrentTheme();
-          if (currentTheme) {
-            themeId = currentTheme.monaco ? currentTheme.id : (currentTheme.type === 'dark' ? BitFunDarkThemeMetadata.id : 'vs');
-            setCurrentThemeId(themeId);
-          }
-        } catch (error) {
-          log.warn('Failed to get current theme, using default', error);
-        }
+        const themeId = monacoAppearanceAdapter.attachMonaco(monacoRuntime);
         
         const editorOptions: monaco.editor.IStandaloneEditorConstructionOptions = {
           model: model,
@@ -807,7 +793,7 @@ const CodeEditor: React.FC<CodeEditorProps> = ({
           }
         };
 
-        editor = monaco.editor.create(container, editorOptions);
+        editor = monacoApi.editor.create(container, editorOptions);
         editorRef.current = editor;
         setEditorInstance(editor);
         const editTarget = createMonacoEditTarget(editor);
@@ -999,7 +985,7 @@ const CodeEditor: React.FC<CodeEditorProps> = ({
             const word = model!.getWordAtPosition(e.target.position);
             if (word && word.word !== lastHoverWordRef.current) {
               lastHoverWordRef.current = word.word;
-              const range = new monaco.Range(
+              const range = new monacoApi.Range(
                 e.target.position.lineNumber,
                 word.startColumn,
                 e.target.position.lineNumber,
@@ -1135,7 +1121,7 @@ const CodeEditor: React.FC<CodeEditorProps> = ({
     if (modelRef.current && monacoReady) {
       const currentLanguage = modelRef.current.getLanguageId();
       if (detectedLanguage !== currentLanguage) {
-        monaco.editor.setModelLanguage(modelRef.current, detectedLanguage);
+        monacoApi.editor.setModelLanguage(modelRef.current, detectedLanguage);
       }
     }
   }, [detectedLanguage, monacoReady]);
@@ -1513,7 +1499,7 @@ const CodeEditor: React.FC<CodeEditorProps> = ({
     userLanguageOverrideRef.current = true;
     setDetectedLanguage(languageId);
     if (modelRef.current && monacoReady) {
-      monaco.editor.setModelLanguage(modelRef.current, languageId);
+      monacoApi.editor.setModelLanguage(modelRef.current, languageId);
     }
   }, [monacoReady]);
 
@@ -1977,17 +1963,32 @@ const CodeEditor: React.FC<CodeEditorProps> = ({
       void checkFileModification();
     };
     const pollOffsetMs = getPollOffsetMs(filePath);
+    const pollIntervalMs = isPeerDeviceModeActive()
+      ? PEER_MODE_FILE_SYNC_POLL_MS
+      : FILE_SYNC_POLL_INTERVAL_MS;
     let intervalId: number | null = null;
     const timeoutId = window.setTimeout(() => {
       tick();
-      intervalId = window.setInterval(tick, FILE_SYNC_POLL_INTERVAL_MS + pollOffsetMs);
+      intervalId = window.setInterval(tick, pollIntervalMs + pollOffsetMs);
     }, 250 + pollOffsetMs);
+
+    const onPeerModeChanged = () => {
+      if (intervalId !== null) {
+        window.clearInterval(intervalId);
+      }
+      const nextIntervalMs = isPeerDeviceModeActive()
+        ? PEER_MODE_FILE_SYNC_POLL_MS
+        : FILE_SYNC_POLL_INTERVAL_MS;
+      intervalId = window.setInterval(tick, nextIntervalMs + pollOffsetMs);
+    };
+    window.addEventListener('peer-mode:changed', onPeerModeChanged);
 
     return () => {
       window.clearTimeout(timeoutId);
       if (intervalId !== null) {
         window.clearInterval(intervalId);
       }
+      window.removeEventListener('peer-mode:changed', onPeerModeChanged);
     };
   }, [checkFileModification, filePath, isActiveTab, isMemoryContent]);
 
@@ -2286,44 +2287,6 @@ const CodeEditor: React.FC<CodeEditorProps> = ({
     }
   }, [fileName, detectedLanguage, detectLanguageFromFileName]);
 
-  useEffect(() => {
-    const editor = editorRef.current;
-    if (!editor || !monacoReady) {
-      return;
-    }
-
-    let unsubscribeThemeService: (() => void) | null = null;
-    
-    (async () => {
-      try {
-        const { themeService } = await import('@/infrastructure/theme');
-        
-        unsubscribeThemeService = themeService.on('theme:after-change', (event) => {
-          if (event.theme) {
-            const newThemeId = event.theme.monaco ? event.theme.id : (event.theme.type === 'dark' ? BitFunDarkThemeMetadata.id : 'vs');
-            
-            setCurrentThemeId(newThemeId);
-            
-            // setTheme is global; updateOptions nudges this editor to re-render.
-            try {
-              editor.updateOptions({});
-            } catch (error) {
-              log.warn('Failed to update editor options', error);
-            }
-          }
-        });
-      } catch (error) {
-        log.warn('Failed to register theme listener', error);
-      }
-    })();
-
-    return () => {
-      if (unsubscribeThemeService) {
-        unsubscribeThemeService();
-      }
-    };
-  }, [monacoReady]);
-
   const loadingOverlayText = monacoReady
     ? t('editor.codeEditor.loadingFile')
     : t('editor.codeEditor.preparingEditor');
@@ -2335,6 +2298,13 @@ const CodeEditor: React.FC<CodeEditorProps> = ({
       data-editor-id={`editor-${filePath.replace(/[^a-zA-Z0-9]/g, '-')}`}
       data-file-path={filePath}
       data-readonly={readOnly ? 'true' : 'false'}
+      data-bf-component="editor-tool"
+      data-bf-part="root"
+      data-bf-state={[
+        loading && showLoadingOverlay && 'loading',
+        error && 'error',
+        largeFileMode && 'large-file',
+      ].filter(Boolean).join(' ') || undefined}
       onKeyDownCapture={handleContainerKeyDown}
     >
       {showBreadcrumb && (
@@ -2344,7 +2314,7 @@ const CodeEditor: React.FC<CodeEditorProps> = ({
         />
       )}
       
-      <div className="code-editor-tool__content" data-shortcut-scope="editor">
+      <div className="code-editor-tool__content" data-shortcut-scope="editor" data-bf-component="editor-tool" data-bf-part="content">
         <div 
           ref={containerRef} 
           style={{ 
@@ -2358,13 +2328,13 @@ const CodeEditor: React.FC<CodeEditorProps> = ({
       </div>
 
       {loading && showLoadingOverlay && (
-        <div className="code-editor-tool__loading-overlay">
+        <div className="code-editor-tool__loading-overlay" data-bf-component="editor-tool" data-bf-part="loading">
           <CubeLoading size="medium" text={loadingOverlayText} />
         </div>
       )}
 
       {error && (
-        <div className="code-editor-tool__error-overlay">
+        <div className="code-editor-tool__error-overlay" data-bf-component="editor-tool" data-bf-part="error">
           <AlertCircle className="code-editor-tool__error-icon" />
           <p className="code-editor-tool__error-message">{error}</p>
           <button
@@ -2378,7 +2348,7 @@ const CodeEditor: React.FC<CodeEditorProps> = ({
       )}
 
       {saving && (
-        <div className="code-editor-tool__saving-indicator">
+        <div className="code-editor-tool__saving-indicator" data-bf-component="editor-tool" data-bf-part="saving">
           {t('editor.codeEditor.saving')}
         </div>
       )}
@@ -2434,7 +2404,7 @@ const CodeEditor: React.FC<CodeEditorProps> = ({
         <LanguagePopover
           anchorRect={statusBarAnchorRect}
           currentLanguageId={detectedLanguage}
-          languages={monaco.languages.getLanguages()}
+          languages={getMonacoRuntime()?.languages.getLanguages() ?? []}
           onConfirm={handleLanguageConfirm}
           onClose={closeStatusBarPopover}
         />

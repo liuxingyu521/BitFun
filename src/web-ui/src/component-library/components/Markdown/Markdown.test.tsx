@@ -33,8 +33,8 @@ vi.mock('@/infrastructure/i18n', () => ({
   },
 }));
 
-vi.mock('@/infrastructure/theme', () => ({
-  useTheme: () => ({ isLight: false }),
+vi.mock('@/infrastructure/appearance', () => ({
+  useAppearance: () => ({ current: { mode: 'dark' } }),
 }));
 
 vi.mock('../Tooltip', () => ({
@@ -127,6 +127,107 @@ describe('Markdown file links', () => {
     });
 
     expect(mocks.getCurrentWorkspacePath).not.toHaveBeenCalled();
+  });
+
+  it('opens chat http links in the built-in browser by default', async () => {
+    container.className = 'bitfun-session-scene modern-flowchat-container';
+    const onCreateTab = vi.fn();
+    window.addEventListener('agent-create-tab', onCreateTab);
+
+    try {
+      await act(async () => {
+        root.render(<Markdown content={'[Example](https://example.com/docs)'} />);
+        await Promise.resolve();
+      });
+
+      const link = container.querySelector<HTMLAnchorElement>('a[href="https://example.com/docs"]');
+      expect(link).not.toBeNull();
+
+      await act(async () => {
+        link?.click();
+        await Promise.resolve();
+      });
+
+      expect(mocks.openExternal).not.toHaveBeenCalled();
+      expect(onCreateTab).toHaveBeenCalledTimes(1);
+      const event = onCreateTab.mock.calls[0][0] as CustomEvent;
+      expect(event.detail).toMatchObject({
+        type: 'browser',
+        data: { url: 'https://example.com/docs' },
+        duplicateCheckKey: 'browser-panel:https://example.com/docs',
+        replaceExisting: false,
+      });
+    } finally {
+      window.removeEventListener('agent-create-tab', onCreateTab);
+    }
+  });
+
+  it('expands a collapsed right panel before creating a browser tab', async () => {
+    vi.useFakeTimers();
+    container.className = 'bitfun-session-scene modern-flowchat-container';
+    (window as any).__BITFUN_LAYOUT_STATE__ = { rightPanelCollapsed: true };
+    const onExpandPanel = vi.fn();
+    const onCreateTab = vi.fn();
+    window.addEventListener('expand-right-panel', onExpandPanel);
+    window.addEventListener('agent-create-tab', onCreateTab);
+
+    try {
+      await act(async () => {
+        root.render(<Markdown content={'[Example](https://example.com/docs)'} />);
+        await Promise.resolve();
+      });
+
+      const link = container.querySelector<HTMLAnchorElement>('a[href="https://example.com/docs"]');
+      expect(link).not.toBeNull();
+
+      act(() => {
+        link?.click();
+      });
+
+      expect(onExpandPanel).toHaveBeenCalledTimes(1);
+      expect(onCreateTab).not.toHaveBeenCalled();
+
+      act(() => {
+        vi.advanceTimersByTime(300);
+      });
+
+      expect(onCreateTab).toHaveBeenCalledTimes(1);
+    } finally {
+      delete (window as any).__BITFUN_LAYOUT_STATE__;
+      window.removeEventListener('expand-right-panel', onExpandPanel);
+      window.removeEventListener('agent-create-tab', onCreateTab);
+      vi.useRealTimers();
+    }
+  });
+
+  it('opens modified chat link clicks in the external browser', async () => {
+    container.className = 'bitfun-session-scene modern-flowchat-container';
+    const onCreateTab = vi.fn();
+    window.addEventListener('agent-create-tab', onCreateTab);
+
+    try {
+      await act(async () => {
+        root.render(<Markdown content={'[Example](https://example.com/docs)'} />);
+        await Promise.resolve();
+      });
+
+      const link = container.querySelector<HTMLAnchorElement>('a[href="https://example.com/docs"]');
+      expect(link).not.toBeNull();
+
+      await act(async () => {
+        link?.dispatchEvent(new MouseEvent('click', {
+          bubbles: true,
+          cancelable: true,
+          ctrlKey: true,
+        }));
+        await Promise.resolve();
+      });
+
+      expect(mocks.openExternal).toHaveBeenCalledWith('https://example.com/docs');
+      expect(onCreateTab).not.toHaveBeenCalled();
+    } finally {
+      window.removeEventListener('agent-create-tab', onCreateTab);
+    }
   });
 
   it('routes same-label relative, absolute, and computer links independently', async () => {
@@ -247,7 +348,11 @@ describe('Markdown file links', () => {
 
     const image = container.querySelector<HTMLImageElement>('img[alt="ReLU 图像"]');
     expect(image).not.toBeNull();
-    expect(mocks.readFileContent).toHaveBeenCalledWith('C:/ExampleWorkspace/relu.png');
+    expect(mocks.readFileContent).toHaveBeenCalledWith(
+      'C:/ExampleWorkspace/relu.png',
+      'base64',
+      undefined,
+    );
     expect(image?.src).toBe('data:image/png;base64,cmVsdS1wbmc=');
     expect(mocks.getCurrentWorkspacePath).not.toHaveBeenCalled();
   });
@@ -268,9 +373,30 @@ describe('Markdown file links', () => {
 
     const image = container.querySelector<HTMLImageElement>('img[alt="Generated image"]');
     expect(image).not.toBeNull();
-    expect(mocks.readFileContent).toHaveBeenCalledWith(absolutePath);
+    expect(mocks.readFileContent).toHaveBeenCalledWith(absolutePath, 'base64', undefined);
     expect(image?.src).toBe('data:image/png;base64,cmVsdS1wbmc=');
     expect(image?.src.startsWith('http://')).toBe(false);
     expect(image?.src.startsWith('https://')).toBe(false);
+  });
+
+  it('routes remote markdown image reads through the session connection', async () => {
+    await act(async () => {
+      root.render(
+        <Markdown
+          content={'![Remote chart](artifacts/chart.png)'}
+          basePath={'/srv/project'}
+          remoteConnectionId={'remote-connection-1'}
+          onFileViewRequest={onFileViewRequest}
+        />,
+      );
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(mocks.readFileContent).toHaveBeenCalledWith(
+      '/srv/project/artifacts/chart.png',
+      'base64',
+      'remote-connection-1',
+    );
   });
 });

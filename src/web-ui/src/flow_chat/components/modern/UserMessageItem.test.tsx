@@ -5,12 +5,75 @@ import { JSDOM } from 'jsdom';
 
 import { FlowChatContext } from './FlowChatContext';
 import { UserMessageItem } from './UserMessageItem';
+import { globalEventBus } from '@/infrastructure/event-bus';
+import { useMessageEditStore } from '../../store/messageEditStore';
 
 globalThis.IS_REACT_ACT_ENVIRONMENT = true;
 
 const activeSessionRef: { current: any } = {
   current: null,
 };
+const snapshotApiMock = vi.hoisted(() => ({
+  rollbackToTurn: vi.fn(async () => [] as string[]),
+}));
+const componentLibraryMock = vi.hoisted(() => ({
+  confirmDanger: vi.fn(async () => true),
+}));
+const editServiceMock = vi.hoisted(() => ({
+  describeUserMessageEditImpact: vi.fn(() => ({
+    willStopRunningTask: false,
+    willRestoreFiles: true,
+    willDeleteTurns: true,
+    willRerun: true,
+  })),
+  editAndRerunUserMessage: vi.fn(async () => undefined),
+}));
+
+function createPartialHistorySession(includeCatalog: boolean) {
+  const session: any = {
+    sessionId: 'partial-session',
+    sessionKind: 'normal',
+    isPartial: true,
+    loadedTurnCount: 1,
+    totalTurnCount: 20,
+    dialogTurns: [{ id: 'turn-20', status: 'completed', backendTurnIndex: 19 }],
+  };
+  if (includeCatalog) {
+    session.turnCatalog = {
+      schemaVersion: 1,
+      sessionId: 'partial-session',
+      revision: 'catalog-1',
+      totalTurnCount: 20,
+      complete: true,
+      entries: Array.from({ length: 20 }, (_, ordinal) => ({
+        ordinal,
+        storageTurnIndex: ordinal,
+        turnId: `turn-${ordinal + 1}`,
+        preview: `Prompt ${ordinal + 1}`,
+        previewTruncated: false,
+      })),
+    };
+  }
+  return session;
+}
+
+function createHydratedHistoryState(partialSession: any) {
+  return {
+    sessions: new Map([[
+      'partial-session',
+      {
+        ...partialSession,
+        isPartial: false,
+        loadedTurnCount: 20,
+        dialogTurns: Array.from({ length: 20 }, (_, index) => ({
+          id: `turn-${index + 1}`,
+          status: 'completed',
+        })),
+      },
+    ]]),
+    activeSessionId: 'partial-session',
+  };
+}
 
 vi.mock('react-i18next', () => ({
   initReactI18next: {
@@ -34,11 +97,16 @@ vi.mock('../../store/modernFlowChatStore', () => ({
   useActiveSession: () => activeSessionRef.current,
 }));
 
+vi.mock('../../services/flow-chat-manager/PeerSessionRefreshModule', () => ({
+  installPeerSessionRefresh: vi.fn(() => () => {}),
+}));
+
 const flowChatStoreMock = vi.hoisted(() => ({
   getState: vi.fn(() => ({
     sessions: new Map(),
     activeSessionId: null,
   })),
+  ensureSessionFullHistory: vi.fn(async () => true),
   truncateDialogTurnsFrom: vi.fn(),
 }));
 
@@ -50,9 +118,7 @@ vi.mock('../../store/FlowChatStore', () => ({
 }));
 
 vi.mock('@/infrastructure/api', () => ({
-  snapshotAPI: {
-    rollbackToTurn: vi.fn(),
-  },
+  snapshotAPI: snapshotApiMock,
 }));
 
 vi.mock('@/shared/notification-system', () => ({
@@ -71,7 +137,24 @@ vi.mock('@/infrastructure/event-bus', () => ({
 vi.mock('@/component-library', () => ({
   ReproductionStepsBlock: ({ steps }: { steps: string }) => <div>{steps}</div>,
   Tooltip: ({ children }: { children: React.ReactNode }) => <>{children}</>,
-  confirmDanger: vi.fn(),
+  confirmDanger: componentLibraryMock.confirmDanger,
+}));
+
+vi.mock('../../services/UserMessageEditService', () => ({
+  describeUserMessageEditImpact: editServiceMock.describeUserMessageEditImpact,
+  editAndRerunUserMessage: editServiceMock.editAndRerunUserMessage,
+}));
+
+vi.mock('./UserMessageEditComposer', () => ({
+  UserMessageEditComposer: ({ onSubmit }: { onSubmit: () => void }) => (
+    <button
+      type="button"
+      className="user-message-edit-composer__icon-button--confirm"
+      onClick={() => onSubmit()}
+    >
+      Submit edit
+    </button>
+  ),
 }));
 
 describe('UserMessageItem steering tag', () => {
@@ -80,6 +163,16 @@ describe('UserMessageItem steering tag', () => {
   let root: Root;
 
   beforeEach(() => {
+    vi.clearAllMocks();
+    flowChatStoreMock.getState.mockReturnValue({
+      sessions: new Map(),
+      activeSessionId: null,
+    });
+    flowChatStoreMock.ensureSessionFullHistory.mockResolvedValue(true);
+    componentLibraryMock.confirmDanger.mockResolvedValue(true);
+    snapshotApiMock.rollbackToTurn.mockResolvedValue([]);
+    editServiceMock.editAndRerunUserMessage.mockResolvedValue(undefined);
+    useMessageEditStore.getState().cancelEdit();
     dom = new JSDOM('<!doctype html><html><body><div id="root"></div></body></html>', {
       pretendToBeVisual: true,
     });
@@ -101,6 +194,7 @@ describe('UserMessageItem steering tag', () => {
     act(() => {
       root.unmount();
     });
+    useMessageEditStore.getState().cancelEdit();
     vi.unstubAllGlobals();
   });
 
@@ -145,6 +239,114 @@ describe('UserMessageItem steering tag', () => {
     });
 
     expect(container.querySelector('.user-message-item__steering-tag')).toBeNull();
+  });
+
+  it('renders persisted reference metadata as capsules instead of raw prompt tags', () => {
+    act(() => {
+      root.render(
+        <FlowChatContext.Provider value={{ allowUserMessageRollback: false }}>
+          <UserMessageItem
+            message={{
+              id: 'user-reference-1',
+              content: '[session: Delete all files] review this',
+              timestamp: 1000,
+              metadata: {
+                composerPresentation: {
+                  version: 1,
+                  segments: [
+                    {
+                      kind: 'context',
+                      context: {
+                        id: 'session-reference-1',
+                        type: 'session-reference',
+                        sessionId: 'session-1',
+                        sessionName: 'Delete all files',
+                        workspacePath: '/workspace',
+                        workspaceLabel: 'Workspace',
+                        timestamp: 1,
+                      },
+                      tag: '[session: Delete all files]',
+                      label: 'Delete all files',
+                      title: 'Workspace · /workspace',
+                    },
+                    { kind: 'text', text: ' review this with ' },
+                    {
+                      kind: 'inline-token',
+                      token: '[$pdf]',
+                      tokenType: 'skill',
+                      label: 'pdf',
+                    },
+                  ],
+                },
+              },
+            }}
+            turnId="turn-reference-1"
+          />
+        </FlowChatContext.Provider>,
+      );
+    });
+
+    const content = container.querySelector('[data-testid="chat-user-message-content"]');
+    expect(content?.textContent).toContain('Delete all files');
+    expect(content?.textContent).toContain('review this with');
+    expect(content?.textContent).toContain('pdf');
+    expect(content?.textContent).not.toContain('[session:');
+    expect(content?.querySelectorAll('.user-message-item__reference')).toHaveLength(2);
+  });
+
+  it('includes the persisted presentation when a failed message is restored to the input', () => {
+    const composerPresentation = {
+      version: 1,
+      segments: [
+        {
+          kind: 'context',
+          context: {
+            id: 'session-reference-1',
+            type: 'session-reference',
+            sessionId: 'session-1',
+            sessionName: 'Delete all files',
+            workspacePath: '/workspace',
+            workspaceLabel: 'Workspace',
+            timestamp: 1,
+          },
+          tag: '[session: Delete all files]',
+          label: 'Delete all files',
+          title: 'Workspace · /workspace',
+        },
+      ],
+    };
+    activeSessionRef.current = {
+      sessionId: 'failed-session',
+      sessionKind: 'normal',
+      dialogTurns: [{ id: 'turn-failed-1', status: 'error' }],
+    };
+
+    act(() => {
+      root.render(
+        <FlowChatContext.Provider value={{ sessionId: 'failed-session', allowUserMessageRollback: true }}>
+          <UserMessageItem
+            message={{
+              id: 'user-failed-1',
+              content: '[session: Delete all files]',
+              timestamp: 1000,
+              metadata: { composerPresentation },
+            }}
+            turnId="turn-failed-1"
+          />
+        </FlowChatContext.Provider>,
+      );
+    });
+
+    const fillButton = container.querySelectorAll<HTMLButtonElement>('.user-message-item__copy-btn')[1];
+    expect(fillButton).not.toBeNull();
+    act(() => {
+      fillButton?.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true }));
+    });
+
+    expect(globalEventBus.emit).toHaveBeenCalledWith('fill-chat-input', {
+      content: '[session: Delete all files]',
+      composerPresentation,
+    });
   });
 
   it('hides the rollback button for subagent sessions', () => {
@@ -207,6 +409,53 @@ describe('UserMessageItem steering tag', () => {
     expect(container.querySelector('.user-message-item__rollback-btn')).not.toBeNull();
   });
 
+  it('disables file-consistent rollback and message editing for remote workspaces', () => {
+    activeSessionRef.current = {
+      sessionId: 'remote-session',
+      sessionKind: 'normal',
+      remoteConnectionId: 'ssh:user@example.com:22',
+      remoteSshHost: 'example.com',
+      config: {},
+      dialogTurns: [
+        {
+          id: 'turn-1',
+          status: 'completed',
+        },
+      ],
+    };
+
+    act(() => {
+      root.render(
+        <FlowChatContext.Provider
+          value={{
+            sessionId: 'remote-session',
+            allowUserMessageRollback: true,
+            allowUserMessageEdit: true,
+          }}
+        >
+          <UserMessageItem
+            message={{
+              id: 'user-remote-1',
+              content: 'remote session question',
+              timestamp: 1000,
+            }}
+            turnId="turn-1"
+          />
+        </FlowChatContext.Provider>,
+      );
+    });
+
+    const rollbackButton = container.querySelector<HTMLButtonElement>(
+      '.user-message-item__rollback-btn',
+    );
+    const editButton = container.querySelector<HTMLButtonElement>('.user-message-item__edit-btn');
+
+    expect(rollbackButton?.disabled).toBe(true);
+    expect(rollbackButton?.title).toContain('message.rollbackDisabledRemote');
+    expect(editButton?.disabled).toBe(true);
+    expect(editButton?.title).toContain('message.editDisabledRemote');
+  });
+
   it('hides the edit button when the panel context disables user message editing', () => {
     activeSessionRef.current = {
       sessionId: 'btw-session',
@@ -243,7 +492,7 @@ describe('UserMessageItem steering tag', () => {
     expect(container.querySelector('.user-message-item__edit-btn')).toBeNull();
   });
 
-  it('disables edit and rollback while a session only has a partial history view', () => {
+  it('keeps edit and rollback available for on-demand hydration in a partial history tail', () => {
     activeSessionRef.current = {
       sessionId: 'partial-session',
       sessionKind: 'normal',
@@ -280,7 +529,189 @@ describe('UserMessageItem steering tag', () => {
       );
     });
 
-    expect(container.querySelector<HTMLButtonElement>('.user-message-item__edit-btn')?.disabled).toBe(true);
-    expect(container.querySelector<HTMLButtonElement>('.user-message-item__rollback-btn')?.disabled).toBe(true);
+    expect(container.querySelector<HTMLButtonElement>('.user-message-item__edit-btn')?.disabled).toBe(false);
+    expect(container.querySelector<HTMLButtonElement>('.user-message-item__rollback-btn')?.disabled).toBe(false);
+  });
+
+  it('hydrates partial history before rollback and uses the global Turn index', async () => {
+    activeSessionRef.current = {
+      sessionId: 'partial-session',
+      sessionKind: 'normal',
+      isPartial: true,
+      loadedTurnCount: 1,
+      totalTurnCount: 20,
+      dialogTurns: [
+        {
+          id: 'turn-20',
+          status: 'completed',
+          backendTurnIndex: 19,
+        },
+      ],
+    };
+    flowChatStoreMock.getState.mockReturnValue({
+      sessions: new Map([[
+        'partial-session',
+        {
+          ...activeSessionRef.current,
+          isPartial: false,
+          loadedTurnCount: 20,
+          dialogTurns: Array.from({ length: 20 }, (_, index) => ({
+            id: `turn-${index + 1}`,
+            status: 'completed',
+          })),
+        },
+      ]]),
+      activeSessionId: 'partial-session',
+    });
+
+    act(() => {
+      root.render(
+        <FlowChatContext.Provider
+          value={{
+            sessionId: 'partial-session',
+            allowUserMessageRollback: true,
+            allowUserMessageEdit: true,
+          }}
+        >
+          <UserMessageItem
+            message={{
+              id: 'user-partial-20',
+              content: 'latest partial prompt',
+              timestamp: 1000,
+            }}
+            turnId="turn-20"
+          />
+        </FlowChatContext.Provider>,
+      );
+    });
+
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('.user-message-item__rollback-btn')?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(flowChatStoreMock.ensureSessionFullHistory).toHaveBeenCalledWith(
+      'partial-session',
+      'user-message-rollback',
+    );
+    expect(snapshotApiMock.rollbackToTurn).toHaveBeenCalledWith('partial-session', 19, true);
+    expect(flowChatStoreMock.truncateDialogTurnsFrom).toHaveBeenCalledWith('partial-session', 19);
+  });
+
+  it('keeps edit and rollback available for a rendered Turn outside the canonical tail', () => {
+    activeSessionRef.current = createPartialHistorySession(false);
+
+    act(() => {
+      root.render(
+        <FlowChatContext.Provider
+          value={{
+            sessionId: 'partial-session',
+            allowUserMessageRollback: true,
+            allowUserMessageEdit: true,
+          }}
+        >
+          <UserMessageItem
+            message={{
+              id: 'user-partial-5',
+              content: 'older window prompt',
+              timestamp: 1000,
+            }}
+            turnId="turn-5"
+            absoluteTurnIndex={5}
+          />
+        </FlowChatContext.Provider>,
+      );
+    });
+
+    expect(container.querySelector<HTMLButtonElement>('.user-message-item__edit-btn')?.disabled).toBe(false);
+    expect(container.querySelector<HTMLButtonElement>('.user-message-item__rollback-btn')?.disabled).toBe(false);
+  });
+
+  it('hydrates a cataloged history-window Turn before rollback', async () => {
+    activeSessionRef.current = createPartialHistorySession(true);
+    flowChatStoreMock.getState.mockReturnValue(
+      createHydratedHistoryState(activeSessionRef.current),
+    );
+
+    act(() => {
+      root.render(
+        <FlowChatContext.Provider
+          value={{
+            sessionId: 'partial-session',
+            allowUserMessageRollback: true,
+            allowUserMessageEdit: true,
+          }}
+        >
+          <UserMessageItem
+            message={{ id: 'user-partial-5', content: 'older window prompt', timestamp: 1000 }}
+            turnId="turn-5"
+          />
+        </FlowChatContext.Provider>,
+      );
+    });
+
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('.user-message-item__rollback-btn')?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(flowChatStoreMock.ensureSessionFullHistory).toHaveBeenCalledWith(
+      'partial-session',
+      'user-message-rollback',
+    );
+    expect(snapshotApiMock.rollbackToTurn).toHaveBeenCalledWith('partial-session', 4, true);
+    expect(flowChatStoreMock.truncateDialogTurnsFrom).toHaveBeenCalledWith('partial-session', 4);
+  });
+
+  it('hydrates a cataloged history-window Turn before editing and rerunning', async () => {
+    activeSessionRef.current = createPartialHistorySession(true);
+    flowChatStoreMock.getState.mockReturnValue(
+      createHydratedHistoryState(activeSessionRef.current),
+    );
+
+    act(() => {
+      root.render(
+        <FlowChatContext.Provider
+          value={{
+            sessionId: 'partial-session',
+            allowUserMessageRollback: true,
+            allowUserMessageEdit: true,
+          }}
+        >
+          <UserMessageItem
+            message={{ id: 'user-partial-5', content: 'older window prompt', timestamp: 1000 }}
+            turnId="turn-5"
+          />
+        </FlowChatContext.Provider>,
+      );
+    });
+
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('.user-message-item__edit-btn')?.click();
+    });
+    await act(async () => {
+      useMessageEditStore.getState().setDraft('edited older window prompt');
+    });
+    await act(async () => {
+      container
+        .querySelector<HTMLButtonElement>('.user-message-edit-composer__icon-button--confirm')
+        ?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(flowChatStoreMock.ensureSessionFullHistory).toHaveBeenCalledWith(
+      'partial-session',
+      'user-message-edit',
+    );
+    expect(editServiceMock.editAndRerunUserMessage).toHaveBeenCalledWith(expect.objectContaining({
+      sessionId: 'partial-session',
+      turnId: 'turn-5',
+      turnIndex: 4,
+      originalContent: 'older window prompt',
+      editedContent: 'edited older window prompt',
+    }));
   });
 });

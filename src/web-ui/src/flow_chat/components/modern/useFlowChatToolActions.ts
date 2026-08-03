@@ -58,7 +58,6 @@ function resolveToolContext(toolId: string): ResolvedToolContext {
 export function useFlowChatToolActions() {
   const handleToolConfirm = useCallback(async (
     toolId: string,
-    updatedInput?: any,
     permissionOptionId?: string,
     approve = true,
   ) => {
@@ -70,15 +69,9 @@ export function useFlowChatToolActions() {
         return;
       }
 
-      const finalInput = updatedInput || toolItem.toolCall?.input;
-
       flowChatStore.updateModelRoundItem(sessionId, turnId, toolId, {
         userConfirmed: approve,
         status: approve ? 'confirmed' : 'rejected',
-        toolCall: {
-          ...toolItem.toolCall,
-          input: finalInput,
-        },
         ...(approve ? {} : {
           requiresConfirmation: false,
           acpPermission: undefined,
@@ -102,13 +95,7 @@ export function useFlowChatToolActions() {
         return;
       }
 
-      const { agentService } = await import('../../../shared/services/agent-service');
-      await agentService.confirmToolExecution(
-        sessionId,
-        toolId,
-        'confirm',
-        finalInput,
-      );
+      log.warn('Ignoring legacy BitFun tool confirmation without a permission request id', { toolId });
     } catch (error) {
       log.error('Tool confirmation failed', error);
       notificationService.error(`Tool confirmation failed: ${error}`);
@@ -148,14 +135,7 @@ export function useFlowChatToolActions() {
         return;
       }
 
-      const { agentService } = await import('../../../shared/services/agent-service');
-      await agentService.confirmToolExecution(
-        sessionId,
-        toolId,
-        'reject',
-        undefined,
-        options?.instruction,
-      );
+      log.warn('Ignoring legacy BitFun tool rejection without a permission request id', { toolId });
     } catch (error) {
       log.error('Tool rejection failed', error);
       notificationService.error(`Tool rejection failed: ${error}`);

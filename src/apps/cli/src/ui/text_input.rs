@@ -106,19 +106,6 @@ impl TextInput {
         }
     }
 
-    pub(super) fn move_cursor_left(&mut self) {
-        if self.cursor > 0 {
-            self.cursor -= 1;
-        }
-    }
-
-    pub(super) fn move_cursor_right(&mut self) {
-        let char_count = self.input.chars().count();
-        if self.cursor < char_count {
-            self.cursor += 1;
-        }
-    }
-
     /// Returns (logical_line, col_in_line, char_offset_of_line_start)
     fn cursor_line_col(&self) -> (usize, usize, usize) {
         let mut line = 0;
@@ -188,6 +175,23 @@ impl TextInput {
         self.scroll_offset = 0;
     }
 
+    pub(super) fn set_text_and_cursor(&mut self, text: &str, cursor: usize) {
+        self.input = text.to_string();
+        self.cursor = cursor.min(self.input.chars().count());
+        self.scroll_offset = 0;
+    }
+
+    pub(super) fn replace_char_range(&mut self, start: usize, end: usize, replacement: &str) {
+        let char_count = self.input.chars().count();
+        let start = start.min(char_count);
+        let end = end.clamp(start, char_count);
+        let start_byte = self.char_pos_to_byte_pos(start);
+        let end_byte = self.char_pos_to_byte_pos(end);
+        self.input.replace_range(start_byte..end_byte, replacement);
+        self.cursor = start + replacement.chars().count();
+        self.scroll_offset = 0;
+    }
+
     /// Take input text and reset state. Returns None if input is blank.
     pub(super) fn take_input(&mut self) -> Option<String> {
         if self.input.trim().is_empty() {
@@ -199,9 +203,29 @@ impl TextInput {
     }
 
     pub(super) fn insert_paste(&mut self, text: &str) {
-        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-        for c in normalized.chars() {
-            self.handle_char(c);
+        let mut normalized = String::with_capacity(text.len());
+        let mut characters = text.chars().peekable();
+        while let Some(character) = characters.next() {
+            match character {
+                '\r' => {
+                    if characters.peek() == Some(&'\n') {
+                        characters.next();
+                    }
+                    normalized.push('\n');
+                }
+                '\t' => normalized.push_str("    "),
+                '\n' => normalized.push('\n'),
+                character if !character.is_control() && character != '\u{0}' => {
+                    normalized.push(character);
+                }
+                _ => {}
+            }
+        }
+
+        if !normalized.is_empty() {
+            let byte_pos = self.char_pos_to_byte_pos(self.cursor);
+            self.cursor += normalized.chars().count();
+            self.input.insert_str(byte_pos, &normalized);
         }
     }
 
@@ -435,5 +459,28 @@ mod tests {
     fn available_visual_width_is_always_nonzero() {
         assert_eq!(TextInput::avail_width(0, usize::MAX), 1);
         assert_eq!(TextInput::avail_width(u16::MAX, 0), u16::MAX as usize);
+    }
+
+    #[test]
+    fn paste_normalizes_newlines_and_expands_tabs_without_dropping_text() {
+        let mut input = TextInput::new();
+        input.set_text("ac");
+        input.cursor = 1;
+
+        input.insert_paste("b\t\r\nd");
+
+        assert_eq!(input.text(), "ab    \ndc");
+        assert_eq!(input.cursor, 8);
+    }
+
+    #[test]
+    fn large_paste_is_inserted_without_changing_content() {
+        let mut input = TextInput::new();
+        let pasted = "x".repeat(64 * 1024);
+
+        input.insert_paste(&pasted);
+
+        assert_eq!(input.text(), pasted);
+        assert_eq!(input.cursor, 64 * 1024);
     }
 }

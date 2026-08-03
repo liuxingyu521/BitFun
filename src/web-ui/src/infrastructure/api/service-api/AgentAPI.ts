@@ -2,13 +2,23 @@
 
 import { api } from './ApiClient';
 import { createTauriCommandError } from '../errors/TauriCommandError';
-import type { DialogTurnData, SessionRelationship } from '@/shared/types/session-history';
+import type {
+  DialogTurnData,
+  ModelRoundAttemptDiagnostic,
+  SessionRelationship,
+  SessionTurnCatalog,
+} from '@/shared/types/session-history';
 import type { ImageContextData as ImageInputContextData } from './ImageContextTypes';
 import type { AgentSource } from './CustomAgentAPI';
 import type {
   ReviewTargetEvidence,
   ReviewTeamRunManifest,
 } from '@/shared/services/reviewTeamService';
+import type {
+  SessionExecutionTarget,
+  SessionExecutionTargetRequest,
+} from './WorktreeAPI';
+import { toWorktreeCommandError } from './WorktreeAPI';
 
 
 
@@ -45,6 +55,9 @@ export interface CreateSessionRequest {
   sessionName: string;
   agentType: string;
   workspacePath: string;
+  projectWorkspacePath?: string;
+  executionTarget?: SessionExecutionTargetRequest;
+  requestId?: string;
   workspaceId?: string;
   remoteConnectionId?: string;
   remoteSshHost?: string;
@@ -60,6 +73,10 @@ export interface CreateSessionResponse {
   sessionId: string;
   sessionName: string;
   agentType: string;
+  workspacePath?: string;
+  workspaceId?: string;
+  projectWorkspacePath?: string;
+  executionTarget?: SessionExecutionTarget;
 }
 
  
@@ -68,17 +85,71 @@ export interface StartDialogTurnRequest {
   userInput: string;
   originalUserInput?: string;
   turnId?: string; 
+  execution?: AgentDialogTurnExecution;
   agentType: string; 
+  /** Concrete root where this session executes. */
   workspacePath?: string;
+  /** Stable project root used to locate persistence for worktree sessions. */
+  projectWorkspacePath?: string;
+  remoteConnectionId?: string;
+  remoteSshHost?: string;
   /** Optional multimodal image contexts (snake_case fields, aligned with backend ImageContextData). */
   imageContexts?: ImageInputContextData[];
   userMessageMetadata?: Record<string, unknown>;
 }
 
+export type AgentDialogTurnExecution =
+  | { kind: 'standard' }
+  | {
+      kind: 'fresh_external_subagent';
+      ecosystemId: string;
+      logicalId: string;
+    };
+
 export interface StartDialogTurnResponse {
   success: boolean;
   message: string;
 }
+
+export type PermissionReplyKind = 'once' | 'always' | 'reject';
+
+export interface PermissionRequestSource {
+  kind: 'tool_call' | 'provider' | 'extension';
+  identity: string;
+}
+
+export interface PermissionDelegationContext {
+  parentSessionId: string;
+  parentDialogTurnId?: string;
+  parentToolCallId: string;
+  subagentType: string;
+}
+
+export interface PermissionRequest {
+  requestId: string;
+  /** Model round that owns this permission request. */
+  roundId: string;
+  /** Stable permission order within the model round. */
+  order: number;
+  /** Provider/tool-stream call ID for correlating one concrete tool card. */
+  toolCallId?: string;
+  /** User-presentable workspace root; distinct from the stable project ID. */
+  projectPath?: string;
+  projectId: string;
+  sessionId: string;
+  agentId: string;
+  action: string;
+  resources: string[];
+  saveResources?: string[];
+  source: PermissionRequestSource;
+  delegation?: PermissionDelegationContext;
+  displayMetadata?: Record<string, unknown>;
+}
+
+export type PermissionRequestEvent =
+  | { event: 'asked'; request: PermissionRequest }
+  | { event: 'replied'; requestId: string; reply: { reply: PermissionReplyKind }; source: string }
+  | { event: 'cancelled'; requestId: string; reason: string };
 
 export interface CompactSessionRequest {
   sessionId: string;
@@ -153,6 +224,7 @@ export interface SessionViewRestoreTiming {
   visibilityMetadataDurationMs: number;
   loadSessionWithTurnsDurationMs: number;
   normalizeTurnIdsDurationMs: number;
+  turnCatalogDurationMs?: number;
   totalDurationMs: number;
   turnLoad: SessionTurnLoadTiming;
 }
@@ -160,12 +232,45 @@ export interface SessionViewRestoreTiming {
 export interface RestoreSessionViewResponse {
   session: SessionInfo;
   turns: DialogTurnData[];
+  turnCatalog?: SessionTurnCatalog;
   contextRestoreState: 'ready' | 'pending';
   isPartial?: boolean;
   loadedTurnCount?: number;
   totalTurnCount?: number;
   timings?: SessionViewRestoreTiming;
 }
+
+export interface LoadSessionTurnWindowRequest {
+  sessionId: string;
+  workspacePath: string;
+  includeInternal?: boolean;
+  targetStorageTurnIndex: number;
+  expectedTurnId?: string;
+  expectedCatalogRevision?: string;
+  before?: number;
+  after?: number;
+  remoteConnectionId?: string;
+  remoteSshHost?: string;
+}
+
+export type LoadSessionTurnWindowResponse =
+  | {
+      status: 'ready';
+      catalogRevision: string;
+      totalTurnCount: number;
+      startOrdinal: number;
+      endOrdinalExclusive: number;
+      targetTurnId: string;
+      turns: DialogTurnData[];
+    }
+  | {
+      status: 'stale';
+      catalog: SessionTurnCatalog;
+    }
+  | {
+      status: 'not-found';
+      catalog: SessionTurnCatalog;
+    };
 
 export interface EnsureAssistantBootstrapRequest {
   sessionId: string;
@@ -199,6 +304,17 @@ export interface EnsureAssistantBootstrapResponse {
 export interface UpdateSessionModelRequest {
   sessionId: string;
   modelName: string;
+  workspacePath?: string;
+  remoteConnectionId?: string;
+  remoteSshHost?: string;
+  includeInternal?: boolean;
+}
+
+export type AgentContextReloadTarget = 'all' | 'skills' | 'instructions';
+
+export interface AgentContextReloadRequest {
+  sessionId: string;
+  target: AgentContextReloadTarget;
 }
 
 export interface UpdateSessionTitleRequest {
@@ -333,6 +449,8 @@ export interface SubagentSessionLinkedEvent extends AgenticEvent {
   parentDialogTurnId: string;
   parentToolCallId: string;
   agentType?: string;
+  modelId?: string;
+  focusedReviewDisplayLabel?: string;
 }
 
 export type DeepReviewQueueStatus =
@@ -403,8 +521,10 @@ export interface ModelRoundCompletedEvent extends AgenticEvent {
   hasToolCalls?: boolean;
   durationMs?: number;
   providerId?: string;
-  modelId?: string;
-  modelAlias?: string;
+  /** Resolved AI model configuration ID. */
+  modelConfigId?: string;
+  /** Provider model name sent on the request. */
+  effectiveModelName?: string;
   firstChunkMs?: number;
   firstVisibleOutputMs?: number;
   streamDurationMs?: number;
@@ -413,12 +533,21 @@ export interface ModelRoundCompletedEvent extends AgenticEvent {
   tokenDetails?: unknown;
 }
 
+export interface ModelRoundAttemptSupersededEvent extends AgenticEvent {
+  turnId: string;
+  roundId: string;
+  diagnostic: ModelRoundAttemptDiagnostic;
+}
+
 export interface ModelRoundStartedEvent extends AgenticEvent {
   turnId: string;
   roundId: string;
   roundGroupId?: string;
   roundIndex: number;
-  modelId?: string;
+  /** Resolved AI model configuration ID. */
+  modelConfigId?: string;
+  /** Provider model name sent on the request. */
+  effectiveModelName?: string;
 }
 
 export interface AcpContextUsageUpdatedEvent extends AgenticEvent {
@@ -461,6 +590,9 @@ export class AgentAPI {
     try {
       return await api.invoke<CreateSessionResponse>('create_session', { request });
     } catch (error) {
+      if (request.executionTarget && request.executionTarget.kind !== 'local') {
+        throw toWorktreeCommandError(error);
+      }
       throw createTauriCommandError('create_session', error, request);
     }
   }
@@ -749,6 +881,22 @@ export class AgentAPI {
     }
   }
 
+  async loadSessionTurnWindow(
+    request: LoadSessionTurnWindowRequest,
+  ): Promise<LoadSessionTurnWindowResponse> {
+    try {
+      return await api.invoke<LoadSessionTurnWindowResponse>('load_session_turn_window', {
+        request,
+      });
+    } catch (error) {
+      throw createTauriCommandError('load_session_turn_window', error, {
+        sessionId: request.sessionId,
+        workspacePath: request.workspacePath,
+        targetStorageTurnIndex: request.targetStorageTurnIndex,
+      });
+    }
+  }
+
   async setSessionMemoryMode(
     request: SetSessionMemoryModeRequest
   ): Promise<SetSessionMemoryModeResponse> {
@@ -803,6 +951,16 @@ export class AgentAPI {
     }
   }
 
+  async reloadSessionContext(
+    request: AgentContextReloadRequest,
+  ): Promise<void> {
+    try {
+      await api.invoke<void>('reload_session_context', { request });
+    } catch (error) {
+      throw createTauriCommandError('reload_session_context', error, request);
+    }
+  }
+
   async updateSessionTitle(request: UpdateSessionTitleRequest): Promise<string> {
     try {
       return await api.invoke<string>('update_session_title', { request });
@@ -827,32 +985,58 @@ export class AgentAPI {
     }
   }
 
-  async confirmToolExecution(sessionId: string, toolId: string): Promise<void> {
+  async listPendingPermissionRequests(): Promise<PermissionRequest[]> {
     try {
-      await api.invoke<void>('confirm_tool_execution', {
-        request: {
-          sessionId,
-          toolId
-        }
-      });
+      return await api.invoke<PermissionRequest[]>('list_pending_permission_requests');
     } catch (error) {
-      throw createTauriCommandError('confirm_tool_execution', error, { sessionId, toolId });
+      throw createTauriCommandError('list_pending_permission_requests', error);
     }
   }
 
-   
-  async rejectToolExecution(sessionId: string, toolId: string, reason?: string): Promise<void> {
+  async subscribePermissionRequests(): Promise<void> {
     try {
-      await api.invoke<void>('reject_tool_execution', {
-        request: {
-          sessionId,
-          toolId,
-          reason
-        }
-      });
+      await api.invoke<void>('subscribe_permission_requests');
     } catch (error) {
-      throw createTauriCommandError('reject_tool_execution', error, { sessionId, toolId, reason });
+      throw createTauriCommandError('subscribe_permission_requests', error);
     }
+  }
+
+  async respondPermission(
+    requestId: string,
+    reply: PermissionReplyKind,
+    feedback?: string,
+  ): Promise<void> {
+    const request = {
+      requestId,
+      reply,
+      ...(feedback?.trim() ? { feedback: feedback.trim() } : {}),
+    };
+    try {
+      await api.invoke<void>('respond_permission', { request });
+    } catch (error) {
+      throw createTauriCommandError('respond_permission', error, request);
+    }
+  }
+
+  async respondPermissionBatch(
+    requestId: string,
+    reply: PermissionReplyKind,
+    feedback?: string,
+  ): Promise<string[]> {
+    const request = {
+      requestId,
+      reply,
+      ...(feedback?.trim() ? { feedback: feedback.trim() } : {}),
+    };
+    try {
+      return await api.invoke<string[]>('respond_permission_batch', { request });
+    } catch (error) {
+      throw createTauriCommandError('respond_permission_batch', error, request);
+    }
+  }
+
+  onPermissionRequestEvent(callback: (event: PermissionRequestEvent) => void): () => void {
+    return api.listen<PermissionRequestEvent>('permission://event', callback);
   }
   
 
@@ -884,15 +1068,18 @@ export class AgentAPI {
   }
 
    
-  onModelRoundStarted(callback: (event: AgenticEvent) => void): () => void {
-    return api.listen<AgenticEvent>('agentic://model-round-started', callback);
+  onModelRoundStarted(callback: (event: ModelRoundStartedEvent) => void): () => void {
+    return api.listen<ModelRoundStartedEvent>('agentic://model-round-started', callback);
   }
 
   onModelRoundCompleted(callback: (event: ModelRoundCompletedEvent) => void): () => void {
     return api.listen<ModelRoundCompletedEvent>('agentic://model-round-completed', callback);
   }
 
-   
+  onModelRoundAttemptSuperseded(callback: (event: ModelRoundAttemptSupersededEvent) => void): () => void {
+    return api.listen<ModelRoundAttemptSupersededEvent>('agentic://model-round-attempt-superseded', callback);
+  }
+
   onTextChunk(callback: (event: TextChunkEvent) => void): () => void {
     return api.listen<TextChunkEvent>('agentic://text-chunk', callback);
   }
@@ -1034,10 +1221,25 @@ export class AgentAPI {
     return api.listen<SessionTitleGeneratedEvent>('session_title_generated', callback);
   }
 
-  async cancelSession(sessionId: string): Promise<void> {
+  async cancelSession(
+    sessionId: string,
+    options?: { cancelDescendants?: boolean },
+  ): Promise<{
+    cancelled: boolean;
+    dialogTurnId: string | null;
+  }> {
     try {
-      await api.invoke<void>('cancel_session', {
-        request: { sessionId }
+      const request = {
+        sessionId,
+        ...(options?.cancelDescendants === undefined
+          ? {}
+          : { cancelDescendants: options.cancelDescendants }),
+      };
+      return await api.invoke<{
+        cancelled: boolean;
+        dialogTurnId: string | null;
+      }>('cancel_session', {
+        request,
       });
     } catch (error) {
       throw createTauriCommandError('cancel_session', error, { sessionId });

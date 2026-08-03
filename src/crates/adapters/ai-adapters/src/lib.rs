@@ -1,12 +1,12 @@
 #![doc = include_str!("../README.md")]
 
-#[cfg(feature = "cli-credentials")]
-pub mod cli_credentials;
 pub mod client;
 pub mod diagnostics;
 pub mod model_selector;
 pub mod providers;
 pub mod stream;
+#[cfg(feature = "subscription-auth")]
+pub mod subscription_auth;
 pub mod tool_call_accumulator;
 pub mod trace;
 pub mod types;
@@ -19,7 +19,7 @@ pub use model_selector::{
 pub use stream::{UnifiedResponse, UnifiedTokenUsage, UnifiedToolCall};
 pub use trace::{
     ModelExchangeRequestAttempt, ModelExchangeRequestTraceHandle, ModelExchangeResponseTrace,
-    ModelExchangeTraceConfig, ModelExchangeTraceSink,
+    ModelExchangeRoundAttempt, ModelExchangeTraceConfig, ModelExchangeTraceSink,
 };
 pub use types::{
     resolve_request_url, AIConfig, ConnectionTestMessageCode, ConnectionTestResult, GeminiResponse,

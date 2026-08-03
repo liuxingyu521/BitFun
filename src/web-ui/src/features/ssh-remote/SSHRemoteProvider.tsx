@@ -11,15 +11,21 @@ import { flowChatStore } from '@/flow_chat/store/FlowChatStore';
 import { ACPClientAPI } from '@/infrastructure/api/service-api/ACPClientAPI';
 import { normalizeRemoteWorkspacePath } from '@/shared/utils/pathUtils';
 import { notificationService } from '@/shared/notification-system';
+import { isPeerDeviceModeActive } from '@/infrastructure/peer-device/peerModeFlag';
 import {
   SSHContext,
   type ConnectionStatus,
   type SSHContextValue,
 } from './SSHRemoteContext';
+import {
+  REMOTE_WORKSPACE_RECONNECT_TIMEOUT_MS,
+  reconnectUntilDeadline,
+  remoteReconnectTimeoutSeconds,
+} from './remoteWorkspaceReconnect';
 
 const log = createLogger('SSHRemoteProvider');
 const pendingAcpCapabilityRefreshes = new Set<string>();
-const REMOTE_WORKSPACE_RECONNECT_TIMEOUT_MS = 60_000;
+const RECONNECT_TIMEOUT_SECONDS = remoteReconnectTimeoutSeconds();
 
 function refreshRemoteAcpCapabilities(connectionId: string): void {
   const normalized = connectionId.trim();
@@ -140,6 +146,11 @@ export const SSHRemoteProvider: React.FC<SSHRemoteProviderProps> = ({ children }
   const remoteWorkspaceRef = useRef<RemoteWorkspace | null>(null);
   const startHeartbeatRef = useRef<(connId: string) => void>(() => {});
   const checkRemoteWorkspaceRef = useRef<() => Promise<void>>(async () => {});
+  const checkRemoteWorkspaceInFlightRef = useRef(false);
+  const reconnectByConnectionRef = useRef(new Map<
+    string,
+    Promise<false | { connectionId: string; connectionName: string; sshHost?: string }>
+  >());
 
   workspaceStatusesRef.current = workspaceStatuses;
   remoteWorkspaceRef.current = remoteWorkspace;
@@ -154,6 +165,17 @@ export const SSHRemoteProvider: React.FC<SSHRemoteProviderProps> = ({ children }
     if (st === 'connecting') {
       const timeoutId = window.setTimeout(() => {
         workspaceStatusTimeouts.current.delete(connId);
+
+        // Peer Device Mode: the peer owns SSH connections. Never run the
+        // controller-side timeout removal — it would route removal invokes to
+        // the peer and delete its workspaces.
+        if (isPeerDeviceModeActive()) {
+          setWorkspaceStatuses(prev =>
+            prev[connId] === 'connecting' ? { ...prev, [connId]: 'connected' } : prev
+          );
+          return;
+        }
+
         if (workspaceStatusesRef.current[connId] !== 'connecting') {
           return;
         }
@@ -197,18 +219,9 @@ export const SSHRemoteProvider: React.FC<SSHRemoteProviderProps> = ({ children }
 
         notificationService.error(
           pathList
-            ? `Remote workspace connection timed out after 60 seconds and was removed: ${pathList}`
-            : 'Remote workspace connection timed out after 60 seconds.',
+            ? `Remote workspace connection timed out after ${RECONNECT_TIMEOUT_SECONDS} seconds. The saved workspace was kept for retry: ${pathList}`
+            : `Remote workspace connection timed out after ${RECONNECT_TIMEOUT_SECONDS} seconds. The saved workspace was kept for retry.`,
           { duration: 8000 }
-        );
-
-        void Promise.allSettled(
-          openedRemoteWorkspaces.map(workspace =>
-            Promise.allSettled([
-              workspaceManager.removeRemoteWorkspace(workspace.connectionId, workspace.remotePath),
-              sshApi.removeWorkspace(workspace.connectionId, workspace.remotePath),
-            ])
-          )
         );
       }, REMOTE_WORKSPACE_RECONNECT_TIMEOUT_MS);
 
@@ -218,36 +231,29 @@ export const SSHRemoteProvider: React.FC<SSHRemoteProviderProps> = ({ children }
     setWorkspaceStatuses(prev => ({ ...prev, [connId]: st }));
   }, []);
 
-  const clearWorkspaceStatus = useCallback((connId: string) => {
-    const existingTimeout = workspaceStatusTimeouts.current.get(connId);
-    if (existingTimeout !== undefined) {
-      window.clearTimeout(existingTimeout);
-      workspaceStatusTimeouts.current.delete(connId);
-    }
-    setWorkspaceStatuses(prev => {
-      if (!(connId in prev)) return prev;
-      const next = { ...prev };
-      delete next[connId];
-      return next;
-    });
-  }, []);
-
-  const forgetRemoteWorkspace = useCallback(async (workspace: RemoteWorkspace) => {
-    log.info('Forgetting remote workspace restore entry', {
-      connectionId: workspace.connectionId,
-      remotePath: workspace.remotePath,
-    });
-    clearWorkspaceStatus(workspace.connectionId);
-    await Promise.allSettled([
-      workspaceManager.removeRemoteWorkspace(workspace.connectionId, workspace.remotePath),
-      sshApi.removeWorkspace(workspace.connectionId, workspace.remotePath),
-    ]);
-  }, [clearWorkspaceStatus]);
-
   const reportRemoteWorkspaceReconnectFailure = useCallback((workspace: RemoteWorkspace) => {
+    if (isPeerDeviceModeActive()) {
+      return;
+    }
     const path = normalizeRemoteWorkspacePath(workspace.remotePath);
     notificationService.error(
-      `Remote workspace could not reconnect within 60 seconds and was removed: ${path}`,
+      `Remote workspace could not reconnect within ${RECONNECT_TIMEOUT_SECONDS} seconds. It remains saved for retry: ${path}`,
+      { duration: 8000 }
+    );
+  }, []);
+
+  const reportRemoteWorkspaceRestoreDeferred = useCallback((
+    workspace: RemoteWorkspace,
+    reason: 'missing-connection' | 'missing-password'
+  ) => {
+    if (isPeerDeviceModeActive()) {
+      return;
+    }
+    const path = normalizeRemoteWorkspacePath(workspace.remotePath);
+    notificationService.warning(
+      reason === 'missing-password'
+        ? `Remote workspace was kept. Re-enter its SSH password to reconnect: ${path}`
+        : `Remote workspace was kept, but its saved SSH connection is unavailable: ${path}`,
       { duration: 8000 }
     );
   }, []);
@@ -266,89 +272,148 @@ export const SSHRemoteProvider: React.FC<SSHRemoteProviderProps> = ({ children }
     };
   }, []);
 
-  // Try to reconnect a single remote workspace with retries.
-  // Returns the reconnected workspace info on success, false on failure.
-  // Waits RETRY_WAIT_MS between each attempt (fixed, not exponential).
-  const RETRY_WAIT_MS = 10_000;
-
+  // Try to reconnect a single remote workspace until the reconnect budget expires.
+  // Fast connection failures must keep retrying inside the budget; only then remove.
   const tryReconnectWithRetry = useCallback(async (
     workspace: RemoteWorkspace,
-    maxRetries: number,
-    timeoutMs: number
+    timeoutMs: number = REMOTE_WORKSPACE_RECONNECT_TIMEOUT_MS
   ): Promise<false | { workspace: RemoteWorkspace; connectionId: string }> => {
-    log.info('tryReconnectWithRetry: starting', { workspace, maxRetries, timeoutMs });
+    const connectionKey = workspace.connectionId.trim();
+    let reconnect = reconnectByConnectionRef.current.get(connectionKey);
 
-    const savedConnections = await sshApi.listSavedConnections();
-    const savedConn = savedConnections.find(c => c.id === workspace.connectionId);
+    if (!reconnect) {
+      log.info('tryReconnectWithRetry: starting connection restore', {
+        connectionId: connectionKey,
+        timeoutMs,
+      });
+      reconnect = (async () => {
+        const savedConnections = await sshApi.listSavedConnections();
+        const savedConn = savedConnections.find(c => c.id === connectionKey);
 
-    if (!savedConn) {
-      log.warn('No saved connection found for workspace', { connectionId: workspace.connectionId });
+        if (!savedConn) {
+          log.warn('No saved connection found for workspace', { connectionId: connectionKey });
+          return false;
+        }
+
+        // Determine auth method from tagged enum (password uses empty string; backend fills from vault)
+        let authMethod: SSHConnectionConfig['auth'];
+        if (savedConn.authType.type === 'PrivateKey') {
+          authMethod = {
+            type: 'PrivateKey',
+            keyPath: savedConn.authType.keyPath,
+            certificatePath: savedConn.authType.certificatePath,
+          };
+        } else if (savedConn.authType.type === 'Agent') {
+          authMethod = {
+            type: 'Agent',
+            keyFingerprint: savedConn.authType.keyFingerprint,
+            fallbackKeyPath: savedConn.authType.fallbackKeyPath,
+          };
+        } else if (savedConn.authType.type === 'KeyboardInteractive') {
+          return false;
+        } else {
+          // Caller must only invoke password reconnect when vault has a password (see checkRemoteWorkspace).
+          authMethod = { type: 'Password', password: '' };
+        }
+
+        const reconnectConfig: SSHConnectionConfig = {
+          id: savedConn.id,
+          name: savedConn.name,
+          host: savedConn.host,
+          port: savedConn.port,
+          username: savedConn.username,
+          auth: authMethod,
+          defaultWorkspace: savedConn.defaultWorkspace,
+          proxyJump: savedConn.proxyJump,
+          container: savedConn.container,
+          options: savedConn.options,
+        };
+
+        const result = await reconnectUntilDeadline({
+          totalTimeoutMs: timeoutMs,
+          attempt: async (attemptTimeoutMs, attempt) => {
+            if (isPeerDeviceModeActive()) {
+              // Abort controller-side reconnects: connecting now would open an SSH
+              // session on the peer with controller-local credentials.
+              throw new Error('Peer device mode activated');
+            }
+            log.info(`Attempting to reconnect (attempt ${attempt})`, {
+              connectionId: connectionKey,
+              host: reconnectConfig.host,
+              attemptTimeoutMs,
+            });
+
+            const connectWithTimeout = async (): Promise<{ connectionId: string }> => {
+              const connectionResult = await sshApi.connect(reconnectConfig);
+              if (!connectionResult.success || !connectionResult.connectionId) {
+                throw new Error(connectionResult.error || 'Connection failed');
+              }
+              return { connectionId: connectionResult.connectionId };
+            };
+
+            let timeoutId: number | undefined;
+            try {
+              const timeoutPromise = new Promise<never>((_, reject) => {
+                timeoutId = window.setTimeout(
+                  () => reject(new Error('Connection timeout')),
+                  attemptTimeoutMs
+                );
+              });
+              return await Promise.race([connectWithTimeout(), timeoutPromise]);
+            } catch (err) {
+              log.warn(`Reconnect attempt ${attempt} failed`, {
+                connectionId: connectionKey,
+                error: err,
+              });
+              throw err;
+            } finally {
+              if (timeoutId !== undefined) {
+                window.clearTimeout(timeoutId);
+              }
+            }
+          },
+        });
+
+        if (result === false) {
+          return false;
+        }
+        return {
+          connectionId: result.connectionId,
+          connectionName: savedConn.name,
+          sshHost: reconnectConfig.host?.trim() || workspace.sshHost?.trim() || undefined,
+        };
+      })();
+      reconnectByConnectionRef.current.set(connectionKey, reconnect);
+      const clearReconnect = () => {
+        if (reconnectByConnectionRef.current.get(connectionKey) === reconnect) {
+          reconnectByConnectionRef.current.delete(connectionKey);
+        }
+      };
+      void reconnect.then(clearReconnect, clearReconnect);
+    } else {
+      log.debug('Joining in-flight remote connection restore', { connectionId: connectionKey });
+    }
+
+    const result = await reconnect;
+    if (result === false) {
       return false;
     }
 
-    // Determine auth method from tagged enum (password uses empty string; backend fills from vault)
-    let authMethod: SSHConnectionConfig['auth'] | null = null;
-    if (savedConn.authType.type === 'PrivateKey') {
-      authMethod = { type: 'PrivateKey', keyPath: savedConn.authType.keyPath };
-    } else {
-      // Caller must only invoke password reconnect when vault has a password (see checkRemoteWorkspace).
-      authMethod = { type: 'Password', password: '' };
-    }
-
-    const reconnectConfig: SSHConnectionConfig = {
-      id: savedConn.id,
-      name: savedConn.name,
-      host: savedConn.host,
-      port: savedConn.port,
-      username: savedConn.username,
-      auth: authMethod,
+    // A connection can own several opened workspace roots. Connect once, then
+    // register every caller's path against the shared live transport.
+    await sshApi.openWorkspace(result.connectionId, workspace.remotePath);
+    const reconnectedWorkspace: RemoteWorkspace = {
+      connectionId: result.connectionId,
+      connectionName: result.connectionName,
+      remotePath: workspace.remotePath,
+      sshHost: result.sshHost,
     };
-
-    for (let attempt = 1; attempt <= maxRetries; attempt++) {
-      try {
-        log.info(`Attempting to reconnect (${attempt}/${maxRetries})`, {
-          connectionId: workspace.connectionId,
-          host: reconnectConfig.host,
-        });
-
-        const connectWithTimeout = async (): Promise<{ connectionId: string }> => {
-          const result = await sshApi.connect(reconnectConfig);
-          if (!result.success || !result.connectionId) {
-            throw new Error(result.error || 'Connection failed');
-          }
-          return { connectionId: result.connectionId };
-        };
-
-        const timeoutPromise = new Promise<never>((_, reject) => {
-          setTimeout(() => reject(new Error('Connection timeout')), timeoutMs);
-        });
-
-        const result = await Promise.race([connectWithTimeout(), timeoutPromise]);
-
-        // Successfully connected — open the workspace in SSH state manager
-        await sshApi.openWorkspace(result.connectionId, workspace.remotePath);
-        const reconnectedWorkspace: RemoteWorkspace = {
-          connectionId: result.connectionId,
-          connectionName: savedConn.name,
-          remotePath: workspace.remotePath,
-          sshHost: reconnectConfig.host?.trim() || workspace.sshHost?.trim() || undefined,
-        };
-
-        log.info('Successfully reconnected to remote workspace', {
-          originalConnectionId: workspace.connectionId,
-          newConnectionId: result.connectionId,
-        });
-        return { workspace: reconnectedWorkspace, connectionId: result.connectionId };
-      } catch (err) {
-        log.warn(`Reconnect attempt ${attempt}/${maxRetries} failed`, { connectionId: workspace.connectionId, error: err });
-        if (attempt < maxRetries) {
-          // Fixed 10-second wait between retries
-          await new Promise(resolve => setTimeout(resolve, RETRY_WAIT_MS));
-        }
-      }
-    }
-
-    return false;
+    log.info('Successfully reconnected to remote workspace', {
+      originalConnectionId: workspace.connectionId,
+      newConnectionId: result.connectionId,
+      remotePath: workspace.remotePath,
+    });
+    return { workspace: reconnectedWorkspace, connectionId: result.connectionId };
   }, []);
 
   const statusRef = useRef<ConnectionStatus>(status);
@@ -373,6 +438,13 @@ export const SSHRemoteProvider: React.FC<SSHRemoteProviderProps> = ({ children }
       clearInterval(heartbeatInterval.current);
     }
 
+    // Peer Device Mode routes product invokes to the peer; controller-local SSH
+    // heartbeats must not flood HostInvoke with unrelated connection checks.
+    if (isPeerDeviceModeActive()) {
+      heartbeatInterval.current = null;
+      return;
+    }
+
     heartbeatInterval.current = window.setInterval(async () => {
       try {
         const connected = await sshApi.isConnected(connId);
@@ -387,6 +459,15 @@ export const SSHRemoteProvider: React.FC<SSHRemoteProviderProps> = ({ children }
   startHeartbeatRef.current = startHeartbeat;
 
   const checkRemoteWorkspace = useCallback(async () => {
+    if (isPeerDeviceModeActive()) {
+      log.info('checkRemoteWorkspace: skipped while peer device mode is active');
+      return;
+    }
+    if (checkRemoteWorkspaceInFlightRef.current) {
+      log.debug('checkRemoteWorkspace: skipped because startup restore is already in progress');
+      return;
+    }
+    checkRemoteWorkspaceInFlightRef.current = true;
     try {
       // ── Collect all remote workspaces to reconnect ──────────────────────
       const wmState0 = workspaceManager.getState();
@@ -462,6 +543,9 @@ export const SSHRemoteProvider: React.FC<SSHRemoteProviderProps> = ({ children }
           if (!hasVault) {
             skipPasswordAutoReconnect.add(ws.connectionId);
           }
+        } else if (sc?.authType.type === 'KeyboardInteractive') {
+          // Interactive responses are intentionally never persisted.
+          skipPasswordAutoReconnect.add(ws.connectionId);
         }
       }
 
@@ -510,19 +594,21 @@ export const SSHRemoteProvider: React.FC<SSHRemoteProviderProps> = ({ children }
           }
 
           if (missingSavedConnections.has(workspace.connectionId)) {
-            log.info('Skipping remote workspace restore because its saved connection is gone', {
+            log.info('Deferring remote workspace restore because its saved connection is unavailable', {
               connectionId: workspace.connectionId,
               remotePath: workspace.remotePath,
             });
-            await forgetRemoteWorkspace(workspace);
+            setWorkspaceStatus(workspace.connectionId, 'error');
+            reportRemoteWorkspaceRestoreDeferred(workspace, 'missing-connection');
             return { ok: false as const };
           }
 
           if (skipPasswordAutoReconnect.has(workspace.connectionId)) {
-            log.info('Skipping auto-reconnect: password auth but no stored password', {
+            log.info('Deferring auto-reconnect: password auth but no stored password', {
               connectionId: workspace.connectionId,
             });
-            await forgetRemoteWorkspace(workspace);
+            setWorkspaceStatus(workspace.connectionId, 'error');
+            reportRemoteWorkspaceRestoreDeferred(workspace, 'missing-password');
             return { ok: false as const };
           }
 
@@ -530,11 +616,7 @@ export const SSHRemoteProvider: React.FC<SSHRemoteProviderProps> = ({ children }
             connectionId: workspace.connectionId,
             remotePath: workspace.remotePath,
           });
-          const result = await tryReconnectWithRetry(
-            workspace,
-            1,
-            REMOTE_WORKSPACE_RECONNECT_TIMEOUT_MS
-          );
+          const result = await tryReconnectWithRetry(workspace);
 
           if (result !== false) {
             log.info('Reconnection successful', { newConnectionId: result.connectionId });
@@ -568,8 +650,8 @@ export const SSHRemoteProvider: React.FC<SSHRemoteProviderProps> = ({ children }
             connectionId: workspace.connectionId,
             auth: savedConn?.authType.type,
           });
+          setWorkspaceStatus(workspace.connectionId, 'error');
           reportRemoteWorkspaceReconnectFailure(workspace);
-          await forgetRemoteWorkspace(workspace);
           return { ok: false as const };
         })
       );
@@ -587,10 +669,12 @@ export const SSHRemoteProvider: React.FC<SSHRemoteProviderProps> = ({ children }
       }
     } catch (e) {
       log.error('checkRemoteWorkspace failed', e);
+    } finally {
+      checkRemoteWorkspaceInFlightRef.current = false;
     }
   }, [
-    forgetRemoteWorkspace,
     reportRemoteWorkspaceReconnectFailure,
+    reportRemoteWorkspaceRestoreDeferred,
     setWorkspaceStatus,
     tryReconnectWithRetry,
   ]);
@@ -614,6 +698,28 @@ export const SSHRemoteProvider: React.FC<SSHRemoteProviderProps> = ({ children }
     return unsubscribe;
   }, [checkRemoteWorkspace]);
 
+  // Pause controller SSH heartbeats / reconnect while Peer Device Mode is active.
+  useEffect(() => {
+    const onPeerModeChanged = (event: Event) => {
+      const detail = (event as CustomEvent<{ active?: boolean }>).detail;
+      if (detail?.active === true) {
+        if (heartbeatInterval.current) {
+          clearInterval(heartbeatInterval.current);
+          heartbeatInterval.current = null;
+        }
+        // Cancel pending controller-side reconnect timeouts; the peer owns the
+        // SSH lifecycle now, so these must never fire their removal path.
+        for (const timeoutId of workspaceStatusTimeouts.current.values()) {
+          window.clearTimeout(timeoutId);
+        }
+        workspaceStatusTimeouts.current.clear();
+        log.info('Paused SSH heartbeat while peer device mode is active');
+      }
+    };
+    window.addEventListener('peer-mode:changed', onPeerModeChanged);
+    return () => window.removeEventListener('peer-mode:changed', onPeerModeChanged);
+  }, []);
+
   useEffect(() => {
     return workspaceManager.addEventListener(event => {
       const workspace =
@@ -624,7 +730,20 @@ export const SSHRemoteProvider: React.FC<SSHRemoteProviderProps> = ({ children }
         return;
       }
       const connId = workspace.connectionId?.trim();
-      if (connId && !workspaceStatusesRef.current[connId]) {
+      if (!connId) {
+        return;
+      }
+      if (isPeerDeviceModeActive()) {
+        // Peer Device Mode: the peer owns the SSH connection lifecycle. Mirror
+        // its opened remote workspaces as connected and never run the
+        // controller-side reconnect/timeout removal path — those invokes route
+        // to the peer and would delete the peer's workspace.
+        if (workspaceStatusesRef.current[connId] !== 'connected') {
+          setWorkspaceStatus(connId, 'connected');
+        }
+        return;
+      }
+      if (!workspaceStatusesRef.current[connId]) {
         setWorkspaceStatus(connId, 'connecting');
       }
       void checkRemoteWorkspaceRef.current();

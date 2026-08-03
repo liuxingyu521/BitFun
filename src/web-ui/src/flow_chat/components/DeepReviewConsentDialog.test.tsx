@@ -295,17 +295,24 @@ describeWithJsdom('DeepReviewConsentDialog', () => {
     expect(container.querySelector('[role="dialog"]')?.getAttribute('aria-modal')).toBe('true');
     expect(container.querySelector('[role="dialog"]')?.getAttribute('aria-label')).toBe('Review plan');
     expect(container.textContent).toContain('1 file');
-    expect(container.textContent).toContain('2 optional checks not needed');
-    expect(container.textContent).toContain('BitFun selected the most relevant checks for this target.');
+    expect(container.textContent).toContain('2 optional review work items not run');
+    expect(container.textContent).toContain(
+      '2 optional review work items were not run. This result reflects only the completed review scope.',
+    );
     expect(container.textContent).not.toContain('Estimated reviewer prompt input');
     expect(container.textContent).not.toContain('Reviewer prompt input only');
-    expect(container.textContent).toContain('Independent checks: 3 planned review agent run');
-    expect(container.textContent).toContain('Up to 4 review agent runs may occur without another confirmation.');
+    expect(container.textContent).not.toContain('Maximum checks:');
+    expect(container.textContent).not.toContain('Expected checks:');
     expect(container.textContent).not.toContain('up to 4 initial calls');
     expect(container.textContent).toContain('Run strategy: Standard');
     expect(container.textContent).not.toContain('Do not show this again');
     expect(container.textContent).not.toContain('Risk areas: Backend core');
-    expect(container.textContent).toContain('Planned review agent runs; model requests and token use are not estimated here.');
+    expect(container.textContent).toContain(
+      'This review investigates the target more thoroughly and adds additional checks only when they are useful.',
+    );
+    expect(container.textContent).not.toContain('token');
+    expect(container.textContent).not.toContain('request');
+    expect(container.textContent).not.toContain('review budget');
     expect(container.textContent).not.toContain('1 extra specialist');
     expect(container.textContent).not.toContain('Review depth: Risk-expanded');
     expect(container.textContent).not.toContain('Frontend reviewer');
@@ -314,6 +321,29 @@ describeWithJsdom('DeepReviewConsentDialog', () => {
     expect(container.textContent).not.toContain('Configuration issue');
     expect(container.textContent).not.toContain('Logic reviewer');
     expect(container.textContent).not.toContain('Custom security reviewer');
+  });
+
+  it('does not expose the internal check allowance', async () => {
+    const result = vi.fn();
+    const basePreview = buildPreviewWithoutSkippedReviewers();
+    const preview: ReviewTeamRunManifest = {
+      ...basePreview,
+      tokenBudget: {
+        ...basePreview.tokenBudget,
+        estimatedReviewerCalls: 1,
+        maxReviewerCalls: 1,
+      },
+    };
+
+    await act(async () => {
+      root.render(<Harness preview={preview} onResult={result} />);
+    });
+    await act(async () => {
+      container.querySelector('button')?.dispatchEvent(new window.Event('click', { bubbles: true }));
+    });
+
+    expect(container.textContent).not.toContain('Maximum checks:');
+    expect(container.textContent).not.toContain('1 checks');
   });
 
   it('uses a generic target summary when the review is not file-based', async () => {
@@ -344,7 +374,9 @@ describeWithJsdom('DeepReviewConsentDialog', () => {
     expect(container.textContent).toContain('Provided context');
     expect(container.textContent).not.toContain('0 files');
     expect(container.textContent).not.toContain('Risk areas:');
-    expect(container.textContent).toContain('Planned review agent runs; model requests and token use are not estimated here.');
+    expect(container.textContent).toContain(
+      'This review investigates the target more thoroughly and adds additional checks only when they are useful.',
+    );
   });
 
   it('still opens when skip preference is set but reviewers are skipped', async () => {
@@ -426,7 +458,9 @@ describeWithJsdom('DeepReviewConsentDialog', () => {
     expect(container.querySelectorAll('.deep-review-consent__strategy-heading')).toHaveLength(0);
     expect(container.textContent).not.toContain('Quick is narrower');
     expect(container.textContent).not.toContain('Risk areas: Backend core');
-    expect(container.textContent).toContain('Planned review agent runs; model requests and token use are not estimated here.');
+    expect(container.textContent).toContain(
+      'This review investigates the target more thoroughly and adds additional checks only when they are useful.',
+    );
     expect(container.textContent).not.toContain('1 extra specialist');
     expect(container.textContent).not.toContain('Expected cost:');
     expect(container.querySelectorAll('.deep-review-consent__strategy-selected-summary')).toHaveLength(0);
@@ -434,7 +468,9 @@ describeWithJsdom('DeepReviewConsentDialog', () => {
     expect(container.querySelectorAll('.deep-review-consent__strategy-option')).toHaveLength(0);
     expect(container.querySelectorAll('.deep-review-consent__strategy-option--active')).toHaveLength(0);
     expect(container.textContent).not.toContain('Team default');
-    expect(container.textContent).toContain('Standard adds independent coverage while keeping cost practical.');
+    expect(container.textContent).toContain(
+      'Standard review examines the selected target in more depth and adds additional checks only when useful.',
+    );
     expect(container.querySelectorAll('.deep-review-consent__strategy-option-summary')).toHaveLength(0);
 
     const quickStrategyButton = Array.from(container.querySelectorAll('button'))

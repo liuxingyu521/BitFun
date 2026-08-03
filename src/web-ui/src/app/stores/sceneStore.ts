@@ -77,6 +77,8 @@ interface SceneState {
   closeScene:   (id: SceneTabId) => void;
   goBack:       () => void;
   goForward:    () => void;
+  /** Reset tabs/history when entering or exiting Peer Device Mode. */
+  resetForPeerSwitch: () => void;
 }
 
 function buildDefaultTabs(): SceneTab[] {
@@ -129,28 +131,8 @@ export const useSceneStore = create<SceneState>((set, get) => ({
   navCursor:   0,
 
   openScene: (id) => {
-    // Auto-close welcome tab when any other scene is explicitly opened
-    if (id !== WELCOME_SCENE_ID) {
-      const state = get();
-      if (state.openTabs.some(t => t.id === WELCOME_SCENE_ID)) {
-        const tabsWithoutWelcome = state.openTabs.filter(t => t.id !== WELCOME_SCENE_ID);
-        const histWithoutWelcome = state.navHistory.filter(h => h !== WELCOME_SCENE_ID);
-
-        // If the first opened scene is not session, companion-open session alongside it
-        let companionTabs = tabsWithoutWelcome;
-        if (id !== AGENT_SCENE_ID && !tabsWithoutWelcome.some(t => t.id === AGENT_SCENE_ID)) {
-          companionTabs = [buildSceneTab(AGENT_SCENE_ID, 0), ...tabsWithoutWelcome];
-        }
-
-        set({
-          openTabs:   ensureAgentFirst(companionTabs),
-          navHistory: histWithoutWelcome,
-          navCursor:  Math.max(0, histWithoutWelcome.length - 1),
-        });
-      }
-    }
-
-    const { openTabs, activeTabId, navHistory, navCursor } = get();
+    const state = get();
+    const { activeTabId } = state;
 
     // Already active — re-sync left nav in case user navigated back to MainNav
     if (id === activeTabId) {
@@ -162,23 +144,43 @@ export const useSceneStore = create<SceneState>((set, get) => ({
       return;
     }
 
+    const isAlreadyOpen = state.openTabs.some(tab => tab.id === id);
+    const def = getSceneDef(id);
+    const isMiniappTab = typeof id === 'string' && id.startsWith('miniapp:');
+    if (!isAlreadyOpen && !def && !isMiniappTab) return;
+
+    let openTabs = state.openTabs;
+    let navHistory = state.navHistory;
+    let navCursor = state.navCursor;
+
+    // Compute welcome removal and the target activation as one store update.
+    // Publishing the intermediate "welcome is active but no longer mounted"
+    // snapshot gives React a blank viewport that looks like a full page refresh.
+    if (id !== WELCOME_SCENE_ID && openTabs.some(tab => tab.id === WELCOME_SCENE_ID)) {
+      openTabs = openTabs.filter(tab => tab.id !== WELCOME_SCENE_ID);
+      navHistory = navHistory.filter(historyId => historyId !== WELCOME_SCENE_ID);
+      navCursor = Math.max(0, navHistory.length - 1);
+
+      // If the first opened scene is not session, companion-open session alongside it.
+      if (id !== AGENT_SCENE_ID && !openTabs.some(tab => tab.id === AGENT_SCENE_ID)) {
+        openTabs = [buildSceneTab(AGENT_SCENE_ID, 0), ...openTabs];
+      }
+    }
+
     const histUpdate = pushHistory(navHistory, navCursor, id);
 
     // Already open → just activate
-    if (openTabs.find(t => t.id === id)) {
-      set(state => ({
+    if (openTabs.some(tab => tab.id === id)) {
+      const activatedAt = Date.now();
+      set({
         activeTabId: id,
-        openTabs: state.openTabs.map(t =>
-          t.id === id ? { ...t, lastUsed: Date.now() } : t
-        ),
+        openTabs: ensureAgentFirst(openTabs.map(tab =>
+          tab.id === id ? { ...tab, lastUsed: activatedAt } : tab
+        )),
         ...histUpdate,
-      }));
+      });
       return;
     }
-
-    const def = getSceneDef(id);
-    const isMiniappTab = typeof id === 'string' && id.startsWith('miniapp:');
-    if (!def && !isMiniappTab) return;
 
     let next = [...openTabs];
 
@@ -187,7 +189,7 @@ export const useSceneStore = create<SceneState>((set, get) => ({
       const victim = selectOldestReplaceableTab(next);
       if (!victim) return;
       const evictedId = victim.id;
-      next = next.filter(t => t.id !== evictedId);
+      next = next.filter(tab => tab.id !== evictedId);
       const afterEvict = removeFromHistory(
         histUpdate.navHistory,
         histUpdate.navCursor,
@@ -256,6 +258,17 @@ export const useSceneStore = create<SceneState>((set, get) => ({
         return;
       }
     }
+  },
+
+  resetForPeerSwitch: () => {
+    const tabs = buildDefaultTabs();
+    const activeTabId: SceneTabId = tabs[0]?.id ?? WELCOME_SCENE_ID;
+    set({
+      openTabs: tabs,
+      activeTabId,
+      navHistory: [activeTabId],
+      navCursor: 0,
+    });
   },
 }));
 

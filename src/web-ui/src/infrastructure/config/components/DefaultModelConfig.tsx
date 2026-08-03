@@ -2,21 +2,17 @@
 
 import React, { useState, useEffect, useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
-import {
-  Layers,
-  Sparkles,
-} from 'lucide-react';
-import { Select, CubeLoading, type SelectOption } from '@/component-library';
+import { Layers } from 'lucide-react';
+import { Select, CubeLoading } from '@/component-library';
 import { notificationService } from '@/shared/notification-system';
 import { configManager } from '../services/ConfigManager';
-import { getProviderDisplayName } from '../services/modelConfigs';
-import { getEffectiveReasoningMode, isReasoningVisiblyEnabled } from '../utils/reasoning';
 import type {
   AIModelConfig,
   DefaultModels,
 } from '../types';
 import { ConfigPageRow } from './common';
 import { createLogger } from '@/shared/utils/logger';
+import { useModelSelectPresentation } from './ModelSelectPresentation';
 import './DefaultModelConfig.scss';
 
 const log = createLogger('DefaultModelConfig');
@@ -24,15 +20,11 @@ const log = createLogger('DefaultModelConfig');
 const normalizeSelectValue = (value: string | number | (string | number)[]): string | number =>
   Array.isArray(value) ? (value[0] ?? '') : value;
 
-type ModelSelectOption = SelectOption & {
-  meta?: string;
-  enableThinking?: boolean;
-};
-
-type DefaultModelSlot = 'primary' | 'fast' | 'image_understanding';
+type DefaultModelSlot = 'primary' | 'fast' | 'image_understanding' | 'speech_recognition';
 
 export const DefaultModelConfig: React.FC = () => {
   const { t } = useTranslation('settings/default-model');
+  const { buildModelOption, renderModelOption, renderModelValue } = useModelSelectPresentation();
   const renderOptionalLabel = (text: string) => (
     <>
       {text}
@@ -47,6 +39,7 @@ export const DefaultModelConfig: React.FC = () => {
     primary: null,
     fast: null,
     image_understanding: null,
+    speech_recognition: null,
   });
 
   const loadData = useCallback(async () => {
@@ -64,6 +57,7 @@ export const DefaultModelConfig: React.FC = () => {
         primary: defaultModelsConfig?.primary || null,
         fast: defaultModelsConfig?.fast || null,
         image_understanding: defaultModelsConfig?.image_understanding || null,
+        speech_recognition: defaultModelsConfig?.speech_recognition || null,
       });
     } catch (error) {
       log.error('Failed to load data', error);
@@ -96,73 +90,6 @@ export const DefaultModelConfig: React.FC = () => {
     return model?.model_name;
   }, [models]);
 
-  const formatContextWindow = useCallback((contextWindow?: number) => {
-    if (!contextWindow) return null;
-    return `${Math.round(contextWindow / 1000)}k`;
-  }, []);
-
-  const buildModelMeta = useCallback((model: AIModelConfig) => {
-    const parts = [getProviderDisplayName(model)];
-    const contextWindow = formatContextWindow(model.context_window);
-
-    if (contextWindow) {
-      parts.push(contextWindow);
-    }
-
-    if (model.reasoning_effort) {
-      parts.push(model.reasoning_effort);
-    }
-
-    return parts.join(' · ');
-  }, [formatContextWindow]);
-
-  const buildModelOption = useCallback((model: AIModelConfig): ModelSelectOption => ({
-    label: model.model_name,
-    value: model.id!,
-    meta: buildModelMeta(model),
-    enableThinking: isReasoningVisiblyEnabled(getEffectiveReasoningMode(model)),
-  }), [buildModelMeta]);
-
-  const renderModelOption = useCallback((option: SelectOption) => {
-    const modelOption = option as ModelSelectOption;
-
-    return (
-      <div className="default-model-config__model-option">
-        <div className="default-model-config__model-option-title">
-          <span className="default-model-config__model-option-name">{modelOption.label}</span>
-          {modelOption.enableThinking && (
-            <Sparkles size={12} className="default-model-config__model-option-thinking" />
-          )}
-        </div>
-        {modelOption.meta && (
-          <div className="default-model-config__model-option-meta">{modelOption.meta}</div>
-        )}
-      </div>
-    );
-  }, []);
-
-  const renderModelValue = useCallback((option?: SelectOption | SelectOption[]) => {
-    const selectedOption = Array.isArray(option) ? option[0] : option;
-    if (!selectedOption) return null;
-
-    const modelOption = selectedOption as ModelSelectOption;
-    return (
-      <span className="select__value default-model-config__model-value">
-        <span className="default-model-config__model-value-text">
-          <span className="default-model-config__model-value-title">
-            <span className="default-model-config__model-value-name">{modelOption.label}</span>
-            {modelOption.enableThinking && (
-              <Sparkles size={12} className="default-model-config__model-option-thinking" />
-            )}
-          </span>
-          {modelOption.meta && (
-            <span className="default-model-config__model-value-meta">{modelOption.meta}</span>
-          )}
-        </span>
-      </span>
-    );
-  }, []);
-
   
   const slotLabel = useCallback((slot: DefaultModelSlot): string => {
     switch (slot) {
@@ -172,6 +99,8 @@ export const DefaultModelConfig: React.FC = () => {
         return t('core.fast.label');
       case 'image_understanding':
         return t('optional.capabilities.image_understanding.label');
+      case 'speech_recognition':
+        return t('optional.capabilities.speech_recognition.label');
       default: {
         const exhaustive: never = slot;
         return exhaustive;
@@ -215,10 +144,14 @@ export const DefaultModelConfig: React.FC = () => {
     const capabilities = Array.isArray(model.capabilities) ? model.capabilities : [];
     return model.category === 'multimodal' || capabilities.includes('image_understanding');
   });
+  const speechRecognitionModels = enabledModels.filter(model => {
+    const capabilities = Array.isArray(model.capabilities) ? model.capabilities : [];
+    return model.category === 'speech_recognition' || capabilities.includes('speech_recognition');
+  });
 
   if (loading) {
     return (
-      <div className="default-model-config__loading">
+      <div className="default-model-config__loading" data-bf-component="default-model-config" data-bf-part="loading" data-bf-state="loading">
         <CubeLoading size="small" />
         <p>{t('loading')}</p>
       </div>
@@ -227,7 +160,7 @@ export const DefaultModelConfig: React.FC = () => {
 
   if (models.length === 0) {
     return (
-      <div className="default-model-config__empty">
+      <div className="default-model-config__empty" data-bf-component="default-model-config" data-bf-part="empty" data-bf-state="empty">
         <Layers size={48} />
         <p>{t('empty.noModels')}</p>
       </div>
@@ -235,20 +168,22 @@ export const DefaultModelConfig: React.FC = () => {
   }
 
   return (
-    <div className="default-model-config">
+    <div className="default-model-config" data-bf-component="default-model-config" data-bf-part="root">
       <ConfigPageRow
         label={t('core.primary.label')}
         description={t('core.primary.description')}
         align="center"
       >
         <Select
+          data-bf-component="default-model-config"
+          data-bf-part="primaryModel"
           value={defaultModels.primary || ''}
           onChange={(value) => handleDefaultModelChange('primary', normalizeSelectValue(value))}
           placeholder={t('core.primary.placeholder')}
           options={enabledModels.map(buildModelOption)}
           renderOption={renderModelOption}
           renderValue={renderModelValue}
-          className="default-model-config__model-select"
+          className="model-select-presentation__select"
           disabled={enabledModels.length === 0}
           size="small"
         />
@@ -260,6 +195,8 @@ export const DefaultModelConfig: React.FC = () => {
         align="center"
       >
         <Select
+          data-bf-component="default-model-config"
+          data-bf-part="lightweightModel"
           value={defaultModels.fast || ''}
           onChange={(value) => handleDefaultModelChange('fast', normalizeSelectValue(value))}
           placeholder={t('core.fast.placeholder')}
@@ -269,7 +206,7 @@ export const DefaultModelConfig: React.FC = () => {
           ]}
           renderOption={renderModelOption}
           renderValue={renderModelValue}
-          className="default-model-config__model-select"
+          className="model-select-presentation__select"
           size="small"
         />
       </ConfigPageRow>
@@ -280,6 +217,8 @@ export const DefaultModelConfig: React.FC = () => {
         align="center"
       >
         <Select
+          data-bf-component="default-model-config"
+          data-bf-part="embeddingModel"
           value={defaultModels.image_understanding || ''}
           onChange={(value) => handleDefaultModelChange('image_understanding', normalizeSelectValue(value))}
           placeholder={t('optional.selectModel')}
@@ -289,7 +228,28 @@ export const DefaultModelConfig: React.FC = () => {
           ]}
           renderOption={renderModelOption}
           renderValue={renderModelValue}
+          className="model-select-presentation__select"
+          size="small"
+        />
+      </ConfigPageRow>
+
+      <ConfigPageRow
+        label={renderOptionalLabel(t('optional.capabilities.speech_recognition.label'))}
+        description={t('optional.capabilities.speech_recognition.description')}
+        align="center"
+      >
+        <Select
+          value={defaultModels.speech_recognition || ''}
+          onChange={(value) => handleDefaultModelChange('speech_recognition', normalizeSelectValue(value))}
+          placeholder={t('optional.notSet')}
+          options={[
+            { label: t('optional.notSet'), value: '' },
+            ...speechRecognitionModels.map(buildModelOption),
+          ]}
+          renderOption={renderModelOption}
+          renderValue={renderModelValue}
           className="default-model-config__model-select"
+          disabled={speechRecognitionModels.length === 0}
           size="small"
         />
       </ConfigPageRow>

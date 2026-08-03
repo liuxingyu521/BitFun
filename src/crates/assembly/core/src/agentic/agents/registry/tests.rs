@@ -1,5 +1,5 @@
 use super::support::merge_dynamic_mcp_tools;
-use super::AgentRegistry;
+use super::{AgentRegistry, ExternalSubagentRegistration, ExternalSubagentRoute};
 use crate::agentic::agents::definitions::custom::{CustomMode, CustomSubagent, CustomSubagentKind};
 use crate::agentic::agents::registry::builtin::default_model_id_for_builtin_agent;
 use crate::agentic::agents::registry::types::{
@@ -17,7 +17,8 @@ use bitfun_agent_runtime::custom_agent::{
     CustomAgentKind, CustomAgentLevel,
 };
 use bitfun_agent_runtime::sdk::{RuntimeAgentRegistry, RuntimeAgentRegistryQuery};
-use std::collections::HashMap;
+use bitfun_product_domains::external_sources::EcosystemId;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -65,6 +66,60 @@ fn test_project_entry(id: &str, model: &str) -> AgentEntry {
         visibility_policy: SubagentVisibilityPolicy::public(),
         custom_config: Some(CustomSubagentConfig {
             model: model.to_string(),
+            model_is_explicit: true,
+        }),
+    }
+}
+
+fn test_project_custom_entry(id: &str, review: bool) -> AgentEntry {
+    let mut agent = CustomSubagent::new(
+        id.to_string(),
+        "Project custom subagent".to_string(),
+        vec!["Read".to_string()],
+        "prompt".to_string(),
+        review,
+        format!("{id}.md"),
+        CustomSubagentKind::Project,
+    );
+    agent.data.review = review;
+
+    AgentEntry {
+        category: AgentCategory::SubAgent,
+        source: AgentSource::Project,
+        subagent_source: Some(SubAgentSource::Project),
+        agent: Arc::new(agent),
+        visibility_policy: SubagentVisibilityPolicy::public(),
+        custom_config: Some(CustomSubagentConfig {
+            model: "fast".to_string(),
+            model_is_explicit: true,
+        }),
+    }
+}
+
+fn test_source_custom_entry(id: &str, prompt: &str, kind: CustomSubagentKind) -> AgentEntry {
+    let source = match kind {
+        CustomSubagentKind::Project => AgentSource::Project,
+        CustomSubagentKind::User => AgentSource::User,
+    };
+    let subagent_source = subagent_source_from_custom_kind(kind);
+    let agent = CustomSubagent::new(
+        id.to_string(),
+        format!("{id} description"),
+        vec!["Read".to_string()],
+        prompt.to_string(),
+        true,
+        format!("{id}.md"),
+        kind,
+    );
+    AgentEntry {
+        category: AgentCategory::SubAgent,
+        source,
+        subagent_source: Some(subagent_source),
+        agent: Arc::new(agent),
+        visibility_policy: SubagentVisibilityPolicy::public(),
+        custom_config: Some(CustomSubagentConfig {
+            model: "fast".to_string(),
+            model_is_explicit: true,
         }),
     }
 }
@@ -75,6 +130,98 @@ fn insert_project_subagent(registry: &AgentRegistry, workspace: &Path, id: &str,
     registry
         .write_project_subagents()
         .insert(workspace.to_path_buf(), entries);
+}
+
+#[test]
+fn source_qualified_key_resolves_the_matching_custom_subagent() {
+    let registry = AgentRegistry::new();
+    let workspace = PathBuf::from("source-qualified-review-workspace");
+    let id = "SameNamedReviewer";
+    registry.write_agents().insert(
+        id.to_string(),
+        test_source_custom_entry(id, "user review guidance", CustomSubagentKind::User),
+    );
+    registry.write_project_subagents().insert(
+        workspace.clone(),
+        HashMap::from([(
+            id.to_string(),
+            test_source_custom_entry(id, "project review guidance", CustomSubagentKind::Project),
+        )]),
+    );
+
+    let project = registry
+        .get_custom_agent_detail_by_key_inner(
+            "project::bitfun::SameNamedReviewer",
+            Some(&workspace),
+        )
+        .expect("project key should select the project definition");
+    let user = registry
+        .get_custom_agent_detail_by_key_inner("user::bitfun::SameNamedReviewer", Some(&workspace))
+        .expect("user key should select the user definition");
+
+    assert_eq!(project.prompt, "project review guidance");
+    assert_eq!(user.prompt, "user review guidance");
+}
+
+#[tokio::test]
+async fn review_lookup_is_scoped_to_the_requested_workspace() {
+    let registry = AgentRegistry::new();
+    let review_workspace = PathBuf::from("review-workspace");
+    let ordinary_workspace = PathBuf::from("ordinary-workspace");
+    let agent_id = "SharedProjectAgent";
+
+    registry.write_project_subagents().insert(
+        review_workspace.clone(),
+        HashMap::from([(
+            agent_id.to_string(),
+            test_project_custom_entry(agent_id, true),
+        )]),
+    );
+    registry.write_project_subagents().insert(
+        ordinary_workspace.clone(),
+        HashMap::from([(
+            agent_id.to_string(),
+            test_project_custom_entry(agent_id, false),
+        )]),
+    );
+
+    assert_eq!(
+        registry
+            .get_subagent_is_review_for_workspace(agent_id, Some(&review_workspace))
+            .await,
+        Some(true)
+    );
+    assert_eq!(
+        registry
+            .get_subagent_is_review_for_workspace(agent_id, Some(&ordinary_workspace))
+            .await,
+        Some(false)
+    );
+    assert_eq!(
+        registry
+            .get_subagent_is_review_for_workspace(agent_id, None)
+            .await,
+        None,
+        "a project agent must not leak into an unrelated workspace lookup"
+    );
+}
+
+#[tokio::test]
+async fn review_lookup_cold_loads_the_requested_project_registry() {
+    let env = CustomAgentTestEnv::new("bitfun-project-review-lookup");
+    let registry = AgentRegistry::new();
+    let agent_id = "ProjectReviewer";
+    write_project_custom_review_subagent(
+        &env.workspace_agents_dir.join("project-reviewer.md"),
+        agent_id,
+    );
+
+    assert_eq!(
+        registry
+            .get_subagent_is_review_for_workspace(agent_id, Some(&env.workspace_root))
+            .await,
+        Some(true)
+    );
 }
 
 #[test]
@@ -205,6 +352,8 @@ fn generate_doc_hidden_agent_defaults_to_fast() {
 fn deep_review_family_defaults_to_fast() {
     for agent_type in [
         "DeepReview",
+        "ReviewWorker",
+        "ReviewGeneral",
         "ReviewBusinessLogic",
         "ReviewPerformance",
         "ReviewSecurity",
@@ -222,16 +371,16 @@ fn deep_review_family_defaults_to_fast() {
 }
 
 #[tokio::test]
-async fn frontend_reviewer_is_registered_as_review_subagent() {
+async fn dynamic_reviewer_is_registered_as_review_subagent() {
     let registry = AgentRegistry::new();
     let subagents = registry.get_subagents_info(None).await;
-    let frontend = subagents
+    let worker = subagents
         .iter()
-        .find(|agent| agent.id == "ReviewFrontend")
-        .expect("ReviewFrontend should be registered as a subagent");
+        .find(|agent| agent.id == "ReviewWorker")
+        .expect("ReviewWorker should be registered as a subagent");
 
-    assert!(frontend.is_review);
-    assert!(frontend.is_readonly);
+    assert!(worker.is_review);
+    assert!(worker.is_readonly);
 }
 
 #[test]
@@ -239,6 +388,8 @@ fn built_in_readonly_reviewers_are_marked_as_review_agents() {
     let registry = AgentRegistry::new();
 
     for agent_type in [
+        "ReviewWorker",
+        "ReviewGeneral",
         "ReviewBusinessLogic",
         "ReviewPerformance",
         "ReviewSecurity",
@@ -255,6 +406,17 @@ fn built_in_readonly_reviewers_are_marked_as_review_agents() {
     }
 }
 
+#[test]
+fn historical_reviewer_invocations_bind_to_the_current_worker_runtime() {
+    let registry = AgentRegistry::new();
+    let binding = registry
+        .resolve_subagent_for_fresh_invocation("ReviewSecurity", None, false)
+        .expect("the historical reviewer alias should resolve");
+
+    assert_eq!(binding.logical_id, "ReviewSecurity");
+    assert_eq!(binding.runtime_agent_key, "ReviewWorker");
+}
+
 #[tokio::test]
 async fn task_visible_subagents_are_filtered_by_parent_agent() {
     let registry = AgentRegistry::new();
@@ -265,6 +427,7 @@ async fn task_visible_subagents_are_filtered_by_parent_agent() {
             workspace_root: None,
             list_scope: SubagentListScope::TaskVisible,
             include_disabled: false,
+            external_sources_supported: false,
         })
         .await;
     assert!(agentic_visible.iter().any(|agent| agent.id == "Explore"));
@@ -290,9 +453,13 @@ async fn task_visible_subagents_are_filtered_by_parent_agent() {
             workspace_root: None,
             list_scope: SubagentListScope::TaskVisible,
             include_disabled: false,
+            external_sources_supported: false,
         })
         .await;
     assert!(deep_review_visible
+        .iter()
+        .any(|agent| agent.id == "ReviewWorker"));
+    assert!(!deep_review_visible
         .iter()
         .any(|agent| agent.id == "ReviewSecurity"));
     assert!(!deep_review_visible
@@ -305,6 +472,7 @@ async fn task_visible_subagents_are_filtered_by_parent_agent() {
             workspace_root: None,
             list_scope: SubagentListScope::TaskVisible,
             include_disabled: false,
+            external_sources_supported: false,
         })
         .await;
     assert!(deep_research_visible
@@ -312,7 +480,7 @@ async fn task_visible_subagents_are_filtered_by_parent_agent() {
         .any(|agent| agent.id == "ResearchSpecialist"));
     assert!(!deep_research_visible
         .iter()
-        .any(|agent| agent.id == "ReviewSecurity"));
+        .any(|agent| agent.id == "ReviewWorker"));
 }
 
 #[test]
@@ -415,6 +583,7 @@ async fn prompt_stability_task_visible_subagents_are_sorted_deterministically() 
         Some(SubAgentSource::User),
         Some(CustomSubagentConfig {
             model: "fast".to_string(),
+            model_is_explicit: true,
         }),
     );
     registry.register_agent(
@@ -426,6 +595,7 @@ async fn prompt_stability_task_visible_subagents_are_sorted_deterministically() 
         Some(SubAgentSource::User),
         Some(CustomSubagentConfig {
             model: "fast".to_string(),
+            model_is_explicit: true,
         }),
     );
     registry.set_user_custom_agents_loaded(true);
@@ -436,6 +606,7 @@ async fn prompt_stability_task_visible_subagents_are_sorted_deterministically() 
             workspace_root: Some(&workspace),
             list_scope: SubagentListScope::RegistryManagement,
             include_disabled: false,
+            external_sources_supported: false,
         })
         .await;
 
@@ -475,6 +646,7 @@ async fn parent_subagent_overrides_follow_source_scopes() {
         Some(SubAgentSource::User),
         Some(CustomSubagentConfig {
             model: "fast".to_string(),
+            model_is_explicit: true,
         }),
     );
     registry.set_user_custom_agents_loaded(true);
@@ -498,6 +670,7 @@ async fn parent_subagent_overrides_follow_source_scopes() {
             visibility_policy: SubagentVisibilityPolicy::public(),
             custom_config: Some(CustomSubagentConfig {
                 model: "fast".to_string(),
+                model_is_explicit: true,
             }),
         },
     );
@@ -510,6 +683,7 @@ async fn parent_subagent_overrides_follow_source_scopes() {
         workspace_root: Some(&workspace),
         list_scope: SubagentListScope::RegistryManagement,
         include_disabled: true,
+        external_sources_supported: false,
     };
 
     let project_override_key = "project::bitfun::ProjectScout".to_string();
@@ -742,7 +916,12 @@ async fn updating_custom_mode_model_persists_and_keeps_mode_category() {
         .load_custom_agents_from_test_roots(None, &env.discovery_roots(None))
         .await;
     registry
-        .update_and_save_custom_agent_config("PlannerPlus", Some("primary".to_string()), None)
+        .update_and_save_custom_agent_config(
+            "PlannerPlus",
+            Some("primary".to_string()),
+            false,
+            None,
+        )
         .expect("mode model update should save");
 
     let mode = registry
@@ -940,6 +1119,25 @@ fn write_project_custom_subagent(path: &Path, id: &str) {
         .expect("project subagent markdown should save");
 }
 
+fn write_project_custom_review_subagent(path: &Path, id: &str) {
+    let mut subagent = CustomSubagent::new_with_id(
+        id.to_string(),
+        id.to_string(),
+        "Project review subagent".to_string(),
+        vec!["Read".to_string()],
+        "Review the relevant files.".to_string(),
+        true,
+        path.to_string_lossy().to_string(),
+        CustomSubagentKind::Project,
+        "fast".to_string(),
+        UserContextPolicy::empty().with_workspace_instructions(),
+    );
+    subagent.data.review = true;
+    subagent
+        .save_to_file(None)
+        .expect("project review subagent markdown should save");
+}
+
 fn unique_suffix() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -948,4 +1146,170 @@ fn unique_suffix() -> String {
         .expect("system time should be after UNIX epoch")
         .as_nanos()
         .to_string()
+}
+
+#[tokio::test]
+async fn external_routes_are_workspace_scoped_fail_closed_and_generation_leased() {
+    let registry = AgentRegistry::new();
+    let workspace = PathBuf::from("C:/workspace/external-agent-registry");
+    let runtime_v1 = "external::candidate::behavior-v1";
+    let agent_v1: Arc<dyn Agent> = Arc::new(TestAgent {
+        id: runtime_v1.to_string(),
+    });
+    registry.install_external_subagent_routes(
+        &workspace,
+        vec![ExternalSubagentRegistration {
+            runtime_key: runtime_v1.to_string(),
+            logical_id: "Explore".to_string(),
+            ecosystem_id: EcosystemId::new("opencode").unwrap(),
+            provider_label: "OpenCode".to_string(),
+            model_binding: super::ExternalSubagentModelBinding::Fixed {
+                model_id: "inherit".to_string(),
+                configuration_fingerprint: "model-config-v1".to_string(),
+            },
+            hidden: false,
+            agent: agent_v1,
+        }],
+        [(
+            "explore".to_string(),
+            ExternalSubagentRoute::External(runtime_v1.to_string()),
+        )]
+        .into_iter()
+        .collect(),
+    );
+
+    let local_only = registry
+        .get_subagents_for_query(&SubagentQueryContext {
+            parent_agent_type: Some("agentic"),
+            workspace_root: Some(&workspace),
+            list_scope: SubagentListScope::TaskVisible,
+            include_disabled: false,
+            external_sources_supported: false,
+        })
+        .await;
+    assert!(local_only
+        .iter()
+        .any(|agent| { agent.id == "Explore" && agent.source == AgentSource::Builtin }));
+
+    let external = registry
+        .get_subagents_for_query(&SubagentQueryContext {
+            parent_agent_type: Some("agentic"),
+            workspace_root: Some(&workspace),
+            list_scope: SubagentListScope::TaskVisible,
+            include_disabled: false,
+            external_sources_supported: true,
+        })
+        .await;
+    let projected = external
+        .iter()
+        .find(|agent| agent.id == "Explore")
+        .expect("external route replaces the same-name local projection");
+    assert_eq!(projected.source, AgentSource::External);
+    assert_eq!(
+        projected.external_provider_label.as_deref(),
+        Some("OpenCode")
+    );
+    assert_eq!(projected.model.as_deref(), Some("inherit"));
+    assert_eq!(projected.model_is_explicit, Some(true));
+    assert!(!projected.supports_follow_up);
+    assert!(registry.is_external_subagent_route("Explore", Some(&workspace)));
+    assert!(registry.is_external_subagent_route("EXPLORE", Some(&workspace)));
+    assert!(!registry.is_external_subagent_route("Explore", None));
+    assert!(!registry.is_external_subagent_route("Explore", Some(Path::new("C:/workspace/other"))));
+    assert!(registry
+        .resolve_external_subagent_for_fresh_invocation(
+            "Explore",
+            &EcosystemId::new("claude-code").unwrap(),
+            Some(&workspace),
+        )
+        .is_none());
+    assert!(registry
+        .resolve_external_subagent_for_fresh_invocation(
+            "Explore",
+            &EcosystemId::new("opencode").unwrap(),
+            None,
+        )
+        .is_none());
+    let command_binding = registry
+        .resolve_external_subagent_for_fresh_invocation(
+            "Explore",
+            &EcosystemId::new("opencode").unwrap(),
+            Some(&workspace),
+        )
+        .expect("command delegation resolves only the exact external ecosystem route");
+    assert_eq!(command_binding.runtime_agent_key, runtime_v1);
+    drop(command_binding);
+
+    let binding = registry
+        .resolve_subagent_for_fresh_invocation("Explore", Some(&workspace), true)
+        .expect("external invocation binding");
+    assert_eq!(binding.runtime_agent_key, runtime_v1);
+    assert!(!binding.supports_follow_up);
+    let leased_model = binding
+        .lease
+        .as_ref()
+        .expect("external binding keeps a generation lease")
+        .model_binding();
+    assert_eq!(leased_model.fixed_model_id(), Some("inherit"));
+    assert_eq!(
+        leased_model.configuration_fingerprint(),
+        Some("model-config-v1")
+    );
+
+    let runtime_v2 = "external::candidate::behavior-v2";
+    let agent_v2: Arc<dyn Agent> = Arc::new(TestAgent {
+        id: runtime_v2.to_string(),
+    });
+    registry.install_external_subagent_routes(
+        &workspace,
+        vec![ExternalSubagentRegistration {
+            runtime_key: runtime_v2.to_string(),
+            logical_id: "Explore".to_string(),
+            ecosystem_id: EcosystemId::new("opencode").unwrap(),
+            provider_label: "OpenCode".to_string(),
+            model_binding: super::ExternalSubagentModelBinding::Fixed {
+                model_id: "inherit".to_string(),
+                configuration_fingerprint: "model-config-v2".to_string(),
+            },
+            hidden: false,
+            agent: agent_v2,
+        }],
+        [(
+            "explore".to_string(),
+            ExternalSubagentRoute::External(runtime_v2.to_string()),
+        )]
+        .into_iter()
+        .collect(),
+    );
+    assert!(registry.get_agent(runtime_v1, Some(&workspace)).is_some());
+    assert_eq!(
+        binding
+            .lease
+            .as_ref()
+            .expect("old generation remains leased")
+            .model_binding()
+            .configuration_fingerprint(),
+        Some("model-config-v1")
+    );
+
+    registry.install_external_subagent_routes(
+        &workspace,
+        Vec::new(),
+        [("Explore".to_string(), ExternalSubagentRoute::Unavailable)]
+            .into_iter()
+            .collect(),
+    );
+    assert!(registry.get_agent(runtime_v1, Some(&workspace)).is_some());
+    assert!(registry.get_agent(runtime_v2, Some(&workspace)).is_none());
+    assert!(registry
+        .resolve_subagent_for_fresh_invocation("Explore", Some(&workspace), true)
+        .is_none());
+    assert!(registry.is_external_subagent_route("Explore", Some(&workspace)));
+    registry.install_external_subagent_routes(&workspace, Vec::new(), BTreeMap::new());
+    assert!(registry
+        .resolve_subagent_for_fresh_invocation("Explore", Some(&workspace), true)
+        .is_none());
+    assert!(registry.is_external_subagent_route("Explore", Some(&workspace)));
+    drop(binding);
+    assert!(registry.get_agent(runtime_v1, Some(&workspace)).is_none());
 }

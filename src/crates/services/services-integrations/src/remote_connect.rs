@@ -7,6 +7,7 @@
 //! assembly, concrete runtime hosts, and IM bot command routing that still needs
 //! session/runtime hosts stay in `bitfun-core` until their ports are explicit.
 
+pub mod account;
 pub mod bot;
 mod chat_projection;
 pub mod device;
@@ -14,9 +15,13 @@ pub mod encryption;
 mod lan;
 mod mobile_web_upload;
 mod ngrok;
+mod page_upload;
 pub mod pairing;
 pub mod qr_generator;
 pub mod relay_client;
+mod relay_http;
+pub mod session_store;
+pub mod sync_state;
 
 use bitfun_events::AgenticEvent;
 use bitfun_runtime_ports::{
@@ -45,6 +50,14 @@ pub use mobile_web_upload::upload_mobile_web_to_relay;
 pub use ngrok::{
     cleanup_all_ngrok, detect_running_ngrok, is_ngrok_available, start_ngrok_tunnel, NgrokTunnel,
 };
+pub use page_upload::{
+    create_page_open_link_on_relay, delete_page_from_relay, delete_page_version_on_relay,
+    deploy_page_version_on_relay, join_relay_url, list_page_versions_from_relay,
+    list_pages_from_relay, publish_page_content_on_relay, publish_page_to_relay,
+    save_page_version_from_inline_files, save_page_version_to_relay, unpublish_page_from_relay,
+    update_page_on_relay, PageContentPublishResult, PageInfo, PageOpenLink, PagePublishResult,
+    PageSaveVersionResult, PageVersionInfo,
+};
 pub use pairing::{PairingChallenge, PairingProtocol, PairingResponse, PairingState, QrPayload};
 pub use qr_generator::QrGenerator;
 pub use relay_client::{
@@ -56,6 +69,14 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+pub(crate) fn bitfun_home_dir() -> Option<PathBuf> {
+    std::env::var_os("BITFUN_HOME")
+        .or_else(|| std::env::var_os("BITFUN_E2E_HOME"))
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+        .or_else(|| dirs::home_dir().map(|home| home.join(".bitfun")))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -97,8 +118,12 @@ pub fn build_remote_session_create_request(
         session_name: session_name.into(),
         agent_type: agent_type.into(),
         workspace_path: workspace_path.map(Into::into),
+        project_workspace_path: None,
+        execution_target: None,
+        workspace_id: None,
         remote_connection_id: workspace_identity.remote_connection_id,
         remote_ssh_host: workspace_identity.remote_ssh_host,
+        model_id: None,
         metadata,
     }
 }
@@ -318,7 +343,6 @@ pub enum RemoteDialogQueuePriority {
 pub struct RemoteDialogSubmissionPolicy {
     pub source: RemoteConnectSubmissionSource,
     pub queue_priority: RemoteDialogQueuePriority,
-    pub skip_tool_confirmation: bool,
 }
 
 impl RemoteDialogSubmissionPolicy {
@@ -326,7 +350,6 @@ impl RemoteDialogSubmissionPolicy {
         Self {
             source,
             queue_priority: RemoteDialogQueuePriority::Normal,
-            skip_tool_confirmation: true,
         }
     }
 }
@@ -529,14 +552,13 @@ fn is_remote_absolute_workspace_path(path: &str) -> bool {
 
 pub fn resolve_remote_workspace_path(raw: &str, workspace_root: Option<&Path>) -> Option<PathBuf> {
     let stripped = strip_remote_workspace_path_prefix(raw);
-
-    if is_remote_absolute_workspace_path(stripped) {
-        return Some(PathBuf::from(stripped));
-    }
-
     let workspace_root = workspace_root?;
     let canonical_root = std::fs::canonicalize(workspace_root).ok()?;
-    let candidate = canonical_root.join(stripped);
+    let candidate = if is_remote_absolute_workspace_path(stripped) {
+        PathBuf::from(stripped)
+    } else {
+        canonical_root.join(stripped)
+    };
     let canonical_candidate = std::fs::canonicalize(candidate).ok()?;
 
     if canonical_candidate.starts_with(&canonical_root) {
@@ -893,6 +915,8 @@ pub fn remote_recent_workspaces_response(
                 name: workspace.name,
                 last_opened: workspace.last_opened,
                 workspace_kind: Some(workspace.kind.as_wire_str().to_string()),
+                remote_connection_id: workspace.remote_connection_id,
+                remote_ssh_host: workspace.remote_ssh_host,
             })
             .collect(),
     }
@@ -921,12 +945,16 @@ pub fn remote_workspace_updated_response(
             success: true,
             path: Some(update.path),
             project_name: Some(update.name),
+            remote_connection_id: update.remote_connection_id,
+            remote_ssh_host: update.remote_ssh_host,
             error: None,
         },
         Err(message) => RemoteResponse::WorkspaceUpdated {
             success: false,
             path: None,
             project_name: None,
+            remote_connection_id: None,
+            remote_ssh_host: None,
             error: Some(message),
         },
     }
@@ -1049,9 +1077,18 @@ where
         RemoteCommand::ListRecentWorkspaces => {
             remote_recent_workspaces_response(host.recent_workspaces().await)
         }
-        RemoteCommand::SetWorkspace { path } => {
-            remote_workspace_updated_response(host.open_workspace(path).await)
-        }
+        RemoteCommand::SetWorkspace {
+            path,
+            remote_connection_id,
+            remote_ssh_host,
+        } => remote_workspace_updated_response(
+            host.open_workspace(
+                path,
+                remote_connection_id.as_deref(),
+                remote_ssh_host.as_deref(),
+            )
+            .await,
+        ),
         RemoteCommand::ListAssistants => {
             remote_assistant_list_response(host.assistant_workspaces().await)
         }
@@ -1169,7 +1206,7 @@ pub trait RemoteSessionRuntimeHost: Send + Sync {
         &self,
         session_storage_dir: &Path,
         session_id: &str,
-    ) -> (Vec<ChatMessage>, bool);
+    ) -> Result<(Vec<ChatMessage>, bool), String>;
     async fn delete_session(
         &self,
         session_storage_dir: &Path,
@@ -1196,11 +1233,12 @@ where
 
             let Some(workspace_path) = workspace_path
                 .as_deref()
-                .filter(|path| !path.is_empty())
+                .map(str::trim)
+                .filter(|path| !path.is_empty() && *path != "/")
                 .map(PathBuf::from)
             else {
                 return RemoteResponse::Error {
-                    message: "workspace_path is required for ListSessions".to_string(),
+                    message: "No workspace is open on the remote device; select a recent workspace or create one first".to_string(),
                 };
             };
 
@@ -1269,7 +1307,8 @@ where
             } else {
                 workspace_path
                     .as_deref()
-                    .filter(|path| !path.is_empty())
+                    .map(str::trim)
+                    .filter(|path| !path.is_empty() && *path != "/")
                     .map(ToOwned::to_owned)
             };
 
@@ -1278,7 +1317,7 @@ where
                     message: if is_claw {
                         "Failed to get or create assistant workspace".to_string()
                     } else {
-                        "workspace_path is required for CreateSession".to_string()
+                        "No workspace is open on the remote device; select a recent workspace or create one first".to_string()
                     },
                 };
             };
@@ -1340,9 +1379,13 @@ where
                     ),
                 };
             };
-            let (chat_messages, has_more) = host
+            let (chat_messages, has_more) = match host
                 .load_remote_chat_messages(&session_storage_dir, session_id)
-                .await;
+                .await
+            {
+                Ok(messages) => messages,
+                Err(message) => return RemoteResponse::Error { message },
+            };
             remote_messages_response(session_id.clone(), chat_messages, has_more)
         }
         RemoteCommand::DeleteSession { session_id } => {
@@ -1373,13 +1416,16 @@ where
 #[async_trait::async_trait]
 pub trait RemotePollRuntimeHost: Send + Sync {
     fn ensure_tracker(&self, session_id: &str) -> Arc<RemoteSessionStateTracker>;
+    /// Hydrate permission requests that may have been registered before the
+    /// remote tracker observed the corresponding tool event.
+    fn sync_pending_permissions(&self, _session_id: &str, _tracker: &RemoteSessionStateTracker) {}
     async fn load_model_catalog(&self, session_id: &str) -> Option<RemoteModelCatalog>;
     async fn resolve_session_storage_dir(&self, session_id: &str) -> Option<PathBuf>;
     async fn load_remote_chat_messages(
         &self,
         session_storage_dir: &Path,
         session_id: &str,
-    ) -> (Vec<ChatMessage>, bool);
+    ) -> Result<(Vec<ChatMessage>, bool), String>;
 }
 
 pub async fn handle_remote_poll_command<H>(host: &H, command: &RemoteCommand) -> RemoteResponse
@@ -1399,16 +1445,22 @@ where
     };
 
     let tracker = host.ensure_tracker(session_id);
+    host.sync_pending_permissions(session_id, &tracker);
     let current_version = tracker.version();
     let current_model_catalog = host.load_model_catalog(session_id).await;
     let model_catalog_delta =
         remote_model_catalog_poll_delta(current_model_catalog, *known_model_catalog_version);
+    let persistence_dirty = tracker.is_persistence_dirty();
 
-    if *since_version == current_version && *since_version > 0 && !model_catalog_delta.changed {
+    if *since_version == current_version
+        && *since_version > 0
+        && !model_catalog_delta.changed
+        && !persistence_dirty
+    {
         return remote_no_change_poll_response(current_version);
     }
 
-    let needs_persistence = *since_version == 0 || tracker.is_persistence_dirty();
+    let needs_persistence = *since_version == 0 || persistence_dirty;
     if !needs_persistence {
         return remote_snapshot_poll_response(
             &tracker,
@@ -1425,9 +1477,13 @@ where
             ),
         };
     };
-    let (all_chat_messages, _) = host
+    let (all_chat_messages, _) = match host
         .load_remote_chat_messages(&session_storage_dir, session_id)
-        .await;
+        .await
+    {
+        Ok(messages) => messages,
+        Err(message) => return RemoteResponse::Error { message },
+    };
     let total_msg_count = all_chat_messages.len();
     let new_messages = all_chat_messages
         .into_iter()
@@ -1445,13 +1501,14 @@ where
 
 #[async_trait::async_trait]
 pub trait RemoteInteractionRuntimeHost: Send + Sync {
-    async fn confirm_tool(
-        &self,
-        tool_id: &str,
-        updated_input: Option<serde_json::Value>,
-    ) -> Result<(), String>;
-    async fn reject_tool(&self, tool_id: &str, reason: String) -> Result<(), String>;
     async fn cancel_tool(&self, tool_id: &str, reason: String) -> Result<(), String>;
+    async fn confirm_tool(&self, tool_id: &str) -> Result<(), String>;
+    async fn reject_tool(&self, tool_id: &str, reason: String) -> Result<(), String>;
+    async fn get_permission_mode(&self) -> Result<RemotePermissionMode, String>;
+    async fn set_permission_mode(
+        &self,
+        mode: RemotePermissionMode,
+    ) -> Result<RemotePermissionMode, String>;
     fn answer_question(&self, tool_id: &str, answers: serde_json::Value) -> Result<(), String>;
 }
 
@@ -1463,24 +1520,30 @@ where
     H: RemoteInteractionRuntimeHost + ?Sized,
 {
     match command {
-        RemoteCommand::ConfirmTool {
-            tool_id,
-            updated_input,
-        } => remote_interaction_accepted_response(
+        RemoteCommand::ConfirmTool { tool_id } => remote_interaction_accepted_response(
             "confirm_tool",
             tool_id.clone(),
-            host.confirm_tool(tool_id, updated_input.clone()).await,
+            host.confirm_tool(tool_id).await,
         ),
-        RemoteCommand::RejectTool { tool_id, reason } => {
-            let reject_reason = reason
-                .clone()
-                .unwrap_or_else(|| "User rejected".to_string());
-            remote_interaction_accepted_response(
-                "reject_tool",
-                tool_id.clone(),
-                host.reject_tool(tool_id, reject_reason).await,
+        RemoteCommand::RejectTool { tool_id, reason } => remote_interaction_accepted_response(
+            "reject_tool",
+            tool_id.clone(),
+            host.reject_tool(
+                tool_id,
+                reason
+                    .clone()
+                    .unwrap_or_else(|| "User rejected".to_string()),
             )
-        }
+            .await,
+        ),
+        RemoteCommand::GetPermissionMode => match host.get_permission_mode().await {
+            Ok(mode) => RemoteResponse::PermissionMode { mode },
+            Err(message) => RemoteResponse::Error { message },
+        },
+        RemoteCommand::SetPermissionMode { mode } => match host.set_permission_mode(*mode).await {
+            Ok(mode) => RemoteResponse::PermissionMode { mode },
+            Err(message) => RemoteResponse::Error { message },
+        },
         RemoteCommand::CancelTool { tool_id, reason } => {
             let cancel_reason = reason
                 .clone()
@@ -1693,6 +1756,7 @@ pub fn resolve_remote_agent_type(mobile_type: Option<&str>) -> &'static str {
         Some("code") | Some("agentic") | Some("Agentic") => "agentic",
         Some("multitask") | Some("Multitask") => "Multitask",
         Some("cowork") | Some("Cowork") => "Cowork",
+        Some("claw") | Some("Claw") | Some("assistant") | Some("chat") => "Claw",
         Some("plan") | Some("Plan") => "Plan",
         Some("debug") | Some("Debug") => "debug",
         _ => "agentic",
@@ -1828,10 +1892,6 @@ pub fn build_remote_chat_messages(turns: Vec<RemoteChatHistoryTurn>) -> Vec<Chat
                 Some(turn.user_images)
             },
         });
-
-        if turn.is_in_progress {
-            continue;
-        }
 
         struct OrderedEntry {
             order_index: Option<usize>,
@@ -1977,6 +2037,10 @@ pub struct RecentWorkspaceEntry {
     pub last_opened: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_connection_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_ssh_host: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2013,6 +2077,14 @@ pub struct RemoteToolStatus {
     pub tool_input: Option<serde_json::Value>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemotePermissionMode {
+    Ask,
+    Auto,
+    FullAccess,
+}
+
 /// Commands that remote clients can send to the desktop runtime.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
@@ -2021,6 +2093,10 @@ pub enum RemoteCommand {
     ListRecentWorkspaces,
     SetWorkspace {
         path: String,
+        #[serde(default)]
+        remote_connection_id: Option<String>,
+        #[serde(default)]
+        remote_ssh_host: Option<String>,
     },
     ListAssistants,
     SetAssistant {
@@ -2075,17 +2151,20 @@ pub enum RemoteCommand {
     DeleteSession {
         session_id: String,
     },
+    CancelTool {
+        tool_id: String,
+        reason: Option<String>,
+    },
     ConfirmTool {
         tool_id: String,
-        updated_input: Option<serde_json::Value>,
     },
     RejectTool {
         tool_id: String,
         reason: Option<String>,
     },
-    CancelTool {
-        tool_id: String,
-        reason: Option<String>,
+    GetPermissionMode,
+    SetPermissionMode {
+        mode: RemotePermissionMode,
     },
     AnswerQuestion {
         tool_id: String,
@@ -2111,7 +2190,56 @@ pub enum RemoteCommand {
         path: String,
         session_id: Option<String>,
     },
+    /// Ask the paired desktop to delegate its logged-in account identity
+    /// (token + master_key) to this room-channel client so it can call the
+    /// relay device APIs directly. Answered by the host runtime; other hosts
+    /// return an error response.
+    GetDelegatedIdentity,
     Ping,
+
+    // ── Device-to-device distributed control ──────────────────────────────
+    //
+    // These variants are carried *inside* an encrypted device-to-device
+    // payload (see `RelayMessage::DeviceMessage`). The relay never sees them
+    // in cleartext; the receiving device decrypts the outer envelope with the
+    // account master_key, then deserializes the inner JSON into `RemoteCommand`.
+    //
+    // Currently sent over the HTTP /api/sync/* path (encrypted with master_key)
+    // or the WS device-messaging path. The relay routes by device_id only.
+    /// Push a serialized chat session to a peer device so it can import it.
+    SendSessionToDevice {
+        /// The opaque session blob (exported session JSON, encrypted by the
+        /// caller before it reaches this layer if sent over WS).
+        session_data: String,
+        session_id: String,
+        session_name: Option<String>,
+    },
+    /// Ask a peer device to execute a prompt in an existing or new session.
+    ExecuteOnDevice {
+        session_id: Option<String>,
+        content: String,
+        agent_type: Option<String>,
+        workspace_path: Option<String>,
+    },
+    /// Query a peer device for workspace / session info (read-only).
+    DeviceQueryInfo,
+    /// Create a new workspace directory on the peer device.
+    CreateWorkspace {
+        path: String,
+    },
+    /// Proxy a desktop product Tauri command onto the peer host.
+    /// Used by Peer Device Mode so the controller UI can reuse the same invoke surface.
+    HostInvoke {
+        command: String,
+        #[serde(default)]
+        args: serde_json::Value,
+    },
+    /// Push a UI event from peer to controller (same event name as local Tauri emit).
+    DeviceEvent {
+        event: String,
+        #[serde(default)]
+        payload: serde_json::Value,
+    },
 }
 
 /// Responses sent from desktop back to remote clients.
@@ -2139,6 +2267,10 @@ pub enum RemoteResponse {
         success: bool,
         path: Option<String>,
         project_name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        remote_connection_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        remote_ssh_host: Option<String>,
         error: Option<String>,
     },
     AssistantList {
@@ -2225,6 +2357,9 @@ pub enum RemoteResponse {
         action: String,
         target_id: String,
     },
+    PermissionMode {
+        mode: RemotePermissionMode,
+    },
     FileContent {
         name: String,
         content_base64: String,
@@ -2245,6 +2380,44 @@ pub enum RemoteResponse {
         mime_type: String,
     },
     Pong,
+    /// Device-to-device: a session was received and imported.
+    SessionReceived {
+        session_id: String,
+    },
+    /// Device-to-device: a command was accepted by the peer device.
+    DeviceAccepted {
+        message: String,
+    },
+    /// Device-to-device: info response from a peer device.
+    DeviceInfo {
+        device_name: Option<String>,
+        workspace_path: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace_kind: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        remote_connection_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        remote_ssh_host: Option<String>,
+        session_count: Option<usize>,
+    },
+    /// Result of a HostInvoke proxy call (JSON-compatible with local invoke).
+    HostInvokeResult {
+        ok: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        value: Option<serde_json::Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    /// Event already delivered out-of-band; ack only.
+    DeviceEventAccepted,
+    /// Delegated account identity for a paired room-channel client.
+    /// `master_key` is base64-encoded; `device_id` is the delegating host.
+    DelegateIdentity {
+        token: String,
+        user_id: String,
+        master_key: String,
+        device_id: String,
+    },
     Error {
         message: String,
     },
@@ -2263,6 +2436,15 @@ pub trait RemoteCommandRuntimeHost: Send + Sync {
     async fn handle_poll_command(&self, command: &RemoteCommand) -> RemoteResponse;
     async fn handle_workspace_file_command(&self, command: &RemoteCommand) -> RemoteResponse;
     async fn handle_interaction_command(&self, command: &RemoteCommand) -> RemoteResponse;
+
+    /// Handle a device-to-device command arriving from a peer in the same
+    /// account.  Default implementation returns an error so existing
+    /// implementors don't break.
+    async fn handle_device_command(&self, _command: &RemoteCommand) -> RemoteResponse {
+        RemoteResponse::Error {
+            message: "Device-to-device commands are not supported on this device".to_string(),
+        }
+    }
 
     async fn submit_dialog(
         &self,
@@ -2310,6 +2492,8 @@ where
 
         RemoteCommand::ConfirmTool { .. }
         | RemoteCommand::RejectTool { .. }
+        | RemoteCommand::GetPermissionMode
+        | RemoteCommand::SetPermissionMode { .. }
         | RemoteCommand::CancelTool { .. }
         | RemoteCommand::AnswerQuestion { .. } => host.handle_interaction_command(command).await,
 
@@ -2356,6 +2540,20 @@ where
             })
             .await,
         ),
+
+        // Answered by the host runtime (which owns the delegated identity
+        // provider) before dispatch reaches this router; this is the fallback
+        // for hosts that cannot delegate an account identity.
+        RemoteCommand::GetDelegatedIdentity => RemoteResponse::Error {
+            message: "Delegated identity is not available on this host".to_string(),
+        },
+
+        RemoteCommand::SendSessionToDevice { .. }
+        | RemoteCommand::ExecuteOnDevice { .. }
+        | RemoteCommand::DeviceQueryInfo
+        | RemoteCommand::CreateWorkspace { .. }
+        | RemoteCommand::HostInvoke { .. }
+        | RemoteCommand::DeviceEvent { .. } => host.handle_device_command(command).await,
     }
 }
 
@@ -2537,6 +2735,39 @@ impl RemoteSessionStateTracker {
         self.bump_version();
     }
 
+    pub fn sync_pending_permission(
+        &self,
+        tool_id: String,
+        tool_name: String,
+        input_preview: Option<String>,
+        tool_input: Option<serde_json::Value>,
+    ) {
+        let mut state = self.state.write().unwrap();
+        if state.turn_id.is_none() {
+            return;
+        }
+        let already_pending = state
+            .active_tools
+            .iter()
+            .any(|tool| tool.id == tool_id && tool.status == "pending_confirmation");
+        if already_pending {
+            return;
+        }
+        Self::upsert_active_tool(
+            &mut state,
+            &tool_id,
+            &tool_name,
+            "pending_confirmation",
+            input_preview,
+            tool_input,
+            false,
+        );
+        state.session_state = "running".to_string();
+        state.turn_status = "active".to_string();
+        drop(state);
+        self.bump_version();
+    }
+
     pub fn finalize_completed_turn(&self) {
         let mut state = self.state.write().unwrap();
         if matches!(
@@ -2557,6 +2788,20 @@ impl RemoteSessionStateTracker {
 
     pub fn mark_persistence_clean(&self) {
         self.state.write().unwrap().persistence_dirty = false;
+    }
+
+    fn invalidate_history_projection(&self) {
+        let mut state = self.state.write().unwrap();
+        state.turn_id = None;
+        state.turn_status.clear();
+        state.accumulated_text.clear();
+        state.accumulated_thinking.clear();
+        state.active_tools.clear();
+        state.active_items.clear();
+        state.session_state = "idle".to_string();
+        state.persistence_dirty = true;
+        drop(state);
+        self.bump_version();
     }
 
     fn find_mergeable_item(
@@ -2751,22 +2996,26 @@ impl RemoteSessionStateTracker {
                 }
             }
             AE::ToolEvent { tool_event, .. } => {
+                let tool_id = tool_event.tool_id().to_string();
+                let tool_name = tool_event.effective_tool_name().to_string();
+                let effective_params = match tool_event {
+                    bitfun_events::ToolEventData::Started {
+                        identity, params, ..
+                    }
+                    | bitfun_events::ToolEventData::ConfirmationNeeded {
+                        identity, params, ..
+                    } => Some(
+                        bitfun_agent_tools::effective_tool_invocation(&identity.tool_name, params)
+                            .1
+                            .clone(),
+                    ),
+                    _ => None,
+                };
                 if let Ok(value) = serde_json::to_value(tool_event) {
                     let event_type = value
                         .get("event_type")
                         .and_then(|value| value.as_str())
                         .unwrap_or("");
-                    let tool_id = value
-                        .get("tool_id")
-                        .and_then(|value| value.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let tool_name = value
-                        .get("tool_name")
-                        .and_then(|value| value.as_str())
-                        .unwrap_or("")
-                        .to_string();
-
                     let mut state = self.state.write().unwrap();
                     let allow_name_fallback = tool_id.is_empty() && !tool_name.is_empty();
                     let mut pending_tool_event: Option<TrackerEvent> = None;
@@ -2783,7 +3032,7 @@ impl RemoteSessionStateTracker {
                             );
                         }
                         "ConfirmationNeeded" => {
-                            let params = value.get("params").cloned();
+                            let params = effective_params.clone();
                             let input_preview = params.as_ref().and_then(make_slim_tool_params);
                             Self::upsert_active_tool(
                                 &mut state,
@@ -2796,7 +3045,7 @@ impl RemoteSessionStateTracker {
                             );
                         }
                         "Started" => {
-                            let params = value.get("params").cloned();
+                            let params = effective_params.clone();
                             let input_preview = params.as_ref().and_then(make_slim_tool_params);
                             let tool_input = if tool_name == "AskUserQuestion"
                                 || tool_name == "Task"
@@ -2997,6 +3246,9 @@ impl RemoteSessionStateTracker {
                 drop(state);
                 self.bump_version();
             }
+            AE::SessionHistoryChanged { .. } if is_direct => {
+                self.invalidate_history_projection();
+            }
             AE::SessionTitleGenerated { title, .. } if is_direct => {
                 let mut state = self.state.write().unwrap();
                 state.title = title.clone();
@@ -3160,7 +3412,7 @@ pub fn remote_persisted_poll_response(
     let (send_messages, send_total) = if turn_finished && !has_assistant_msg {
         (None, None)
     } else {
-        if !new_messages.is_empty() {
+        if !new_messages.is_empty() || active_turn.is_none() {
             tracker.mark_persistence_clean();
         }
         (Some(new_messages), Some(total_msg_count))
@@ -3191,6 +3443,7 @@ fn non_empty_title(title: String) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
     struct FakeWorkspaceHost;
@@ -3215,13 +3468,22 @@ mod tests {
                 name: "project".to_string(),
                 last_opened: "2026-05-29T00:00:00Z".to_string(),
                 kind: RemoteWorkspaceKind::Normal,
+                remote_connection_id: None,
+                remote_ssh_host: None,
             }]
         }
 
-        async fn open_workspace(&self, path: &str) -> Result<RemoteWorkspaceUpdate, String> {
+        async fn open_workspace(
+            &self,
+            path: &str,
+            _remote_connection_id: Option<&str>,
+            _remote_ssh_host: Option<&str>,
+        ) -> Result<RemoteWorkspaceUpdate, String> {
             Ok(RemoteWorkspaceUpdate {
                 path: path.to_string(),
                 name: "opened".to_string(),
+                remote_connection_id: None,
+                remote_ssh_host: None,
             })
         }
 
@@ -3240,6 +3502,8 @@ mod tests {
             Ok(RemoteWorkspaceUpdate {
                 path: path.to_string(),
                 name: "assistant".to_string(),
+                remote_connection_id: None,
+                remote_ssh_host: None,
             })
         }
     }
@@ -3267,6 +3531,8 @@ mod tests {
                 &host,
                 &RemoteCommand::SetWorkspace {
                     path: "/workspace/next".to_string(),
+                    remote_connection_id: None,
+                    remote_ssh_host: None,
                 },
             )
             .await,
@@ -3274,6 +3540,8 @@ mod tests {
                 success: true,
                 path: Some("/workspace/next".to_string()),
                 project_name: Some("opened".to_string()),
+                remote_connection_id: None,
+                remote_ssh_host: None,
                 error: None,
             }
         );
@@ -3284,6 +3552,7 @@ mod tests {
         created_requests: Mutex<Vec<AgentSessionCreateRequest>>,
         list_identities: Mutex<Vec<RemoteSessionWorkspaceIdentity>>,
         removed_trackers: Mutex<Vec<String>>,
+        history_error: Option<String>,
     }
 
     #[async_trait::async_trait]
@@ -3369,8 +3638,11 @@ mod tests {
             &self,
             _session_storage_dir: &Path,
             _session_id: &str,
-        ) -> (Vec<ChatMessage>, bool) {
-            (
+        ) -> Result<(Vec<ChatMessage>, bool), String> {
+            if let Some(error) = self.history_error.as_ref() {
+                return Err(error.clone());
+            }
+            Ok((
                 vec![ChatMessage {
                     id: "message-1".to_string(),
                     role: "user".to_string(),
@@ -3383,7 +3655,7 @@ mod tests {
                     items: None,
                 }],
                 false,
-            )
+            ))
         }
 
         async fn delete_session(
@@ -3498,8 +3770,36 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn remote_session_handler_propagates_history_outcome_unknown() {
+        let host = FakeSessionHost {
+            history_error: Some("Session history restore is incomplete".to_string()),
+            ..Default::default()
+        };
+
+        let response = handle_remote_session_command(
+            &host,
+            &RemoteCommand::GetSessionMessages {
+                session_id: "session-a".to_string(),
+                limit: None,
+                before_message_id: None,
+            },
+        )
+        .await;
+
+        assert_eq!(
+            response,
+            RemoteResponse::Error {
+                message: "Session history restore is incomplete".to_string(),
+            }
+        );
+    }
+
     struct FakePollHost {
         tracker: Arc<RemoteSessionStateTracker>,
+        storage_dir: Option<PathBuf>,
+        messages: Vec<ChatMessage>,
+        history_read_count: Arc<AtomicUsize>,
     }
 
     #[async_trait::async_trait]
@@ -3513,15 +3813,16 @@ mod tests {
         }
 
         async fn resolve_session_storage_dir(&self, _session_id: &str) -> Option<PathBuf> {
-            None
+            self.storage_dir.clone()
         }
 
         async fn load_remote_chat_messages(
             &self,
             _session_storage_dir: &Path,
             _session_id: &str,
-        ) -> (Vec<ChatMessage>, bool) {
-            (Vec::new(), false)
+        ) -> Result<(Vec<ChatMessage>, bool), String> {
+            self.history_read_count.fetch_add(1, Ordering::Relaxed);
+            Ok((self.messages.clone(), false))
         }
     }
 
@@ -3529,6 +3830,9 @@ mod tests {
     async fn remote_poll_handler_preserves_missing_workspace_error() {
         let host = FakePollHost {
             tracker: Arc::new(RemoteSessionStateTracker::new("session-a".to_string())),
+            storage_dir: None,
+            messages: Vec::new(),
+            history_read_count: Arc::new(AtomicUsize::new(0)),
         };
 
         let response = handle_remote_poll_command(
@@ -3551,27 +3855,94 @@ mod tests {
         );
     }
 
-    #[derive(Default)]
-    struct FakeInteractionHost {
-        rejected: Mutex<Vec<(String, String)>>,
+    #[tokio::test]
+    async fn history_change_invalidates_clean_poll_cache_and_reports_a_shorter_projection() {
+        let tracker = Arc::new(RemoteSessionStateTracker::new("session-a".to_string()));
+        tracker.handle_agentic_event(&AgenticEvent::DialogTurnStarted {
+            session_id: "session-a".to_string(),
+            turn_id: "turn-hidden".to_string(),
+            turn_index: 1,
+            user_input: "hidden".to_string(),
+            original_user_input: None,
+            user_message_metadata: None,
+        });
+        tracker.mark_persistence_clean();
+        let previous_version = tracker.version();
+        let history_read_count = Arc::new(AtomicUsize::new(0));
+        let host = FakePollHost {
+            tracker: tracker.clone(),
+            storage_dir: Some(PathBuf::from("/workspace/project/.bitfun/sessions")),
+            messages: vec![ChatMessage {
+                id: "message-visible".to_string(),
+                role: "user".to_string(),
+                content: "visible".to_string(),
+                timestamp: "1".to_string(),
+                metadata: None,
+                tools: None,
+                thinking: None,
+                items: None,
+                images: None,
+            }],
+            history_read_count: history_read_count.clone(),
+        };
+
+        tracker.handle_agentic_event(&AgenticEvent::SessionHistoryChanged {
+            session_id: "session-a".to_string(),
+        });
+
+        assert_eq!(tracker.version(), previous_version + 1);
+        assert!(tracker.is_persistence_dirty());
+        assert!(tracker.snapshot_active_turn().is_none());
+        let response = handle_remote_poll_command(
+            &host,
+            &RemoteCommand::PollSession {
+                session_id: "session-a".to_string(),
+                since_version: previous_version,
+                known_msg_count: 2,
+                known_model_catalog_version: None,
+            },
+        )
+        .await;
+
+        assert_eq!(history_read_count.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            response,
+            RemoteResponse::SessionPoll {
+                version: previous_version + 1,
+                changed: true,
+                session_state: Some("idle".to_string()),
+                title: None,
+                new_messages: Some(Vec::new()),
+                total_msg_count: Some(1),
+                active_turn: None,
+                model_catalog: Box::new(None),
+            }
+        );
+        assert!(!tracker.is_persistence_dirty());
     }
+
+    #[derive(Default)]
+    struct FakeInteractionHost;
 
     #[async_trait::async_trait]
     impl RemoteInteractionRuntimeHost for FakeInteractionHost {
-        async fn confirm_tool(
-            &self,
-            _tool_id: &str,
-            _updated_input: Option<serde_json::Value>,
-        ) -> Result<(), String> {
+        async fn confirm_tool(&self, _tool_id: &str) -> Result<(), String> {
             Ok(())
         }
 
-        async fn reject_tool(&self, tool_id: &str, reason: String) -> Result<(), String> {
-            self.rejected
-                .lock()
-                .unwrap()
-                .push((tool_id.to_string(), reason));
+        async fn reject_tool(&self, _tool_id: &str, _reason: String) -> Result<(), String> {
             Ok(())
+        }
+
+        async fn get_permission_mode(&self) -> Result<RemotePermissionMode, String> {
+            Ok(RemotePermissionMode::Ask)
+        }
+
+        async fn set_permission_mode(
+            &self,
+            mode: RemotePermissionMode,
+        ) -> Result<RemotePermissionMode, String> {
+            Ok(mode)
         }
 
         async fn cancel_tool(&self, _tool_id: &str, _reason: String) -> Result<(), String> {
@@ -3585,31 +3956,5 @@ mod tests {
         ) -> Result<(), String> {
             Ok(())
         }
-    }
-
-    #[tokio::test]
-    async fn remote_interaction_handler_preserves_default_reject_reason() {
-        let host = FakeInteractionHost::default();
-
-        let response = handle_remote_interaction_command(
-            &host,
-            &RemoteCommand::RejectTool {
-                tool_id: "tool-1".to_string(),
-                reason: None,
-            },
-        )
-        .await;
-
-        assert_eq!(
-            response,
-            RemoteResponse::InteractionAccepted {
-                action: "reject_tool".to_string(),
-                target_id: "tool-1".to_string(),
-            }
-        );
-        assert_eq!(
-            host.rejected.lock().unwrap().as_slice(),
-            [("tool-1".to_string(), "User rejected".to_string())]
-        );
     }
 }

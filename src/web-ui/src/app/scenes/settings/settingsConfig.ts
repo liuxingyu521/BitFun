@@ -9,13 +9,17 @@ export type ConfigTab =
   | 'basics'
   | 'appearance'
   | 'models'
+  | 'worktrees'
   | 'archived-sessions'
   | 'session-personalization'
   | 'session-permissions'
   | 'quick-actions'
+  | 'voice-input'
   | 'review'
   | 'memories'
   | 'mcp-tools'
+  | 'external-sources'
+  | 'hooks'
   | 'acp-agents'
   // | 'lsp' // temporarily hidden from config center
   | 'editor'
@@ -71,7 +75,6 @@ export const SETTINGS_CATEGORIES: ConfigCategoryDef[] = [
           'language',
           'locale',
           'i18n',
-          'theme',
           'appearance',
           'font',
           'fonts',
@@ -95,6 +98,9 @@ export const SETTINGS_CATEGORIES: ConfigCategoryDef[] = [
           'model',
           'temperature',
           'token',
+          'session title',
+          'auto title',
+          'subagent',
         ],
       },
       {
@@ -108,6 +114,19 @@ export const SETTINGS_CATEGORIES: ConfigCategoryDef[] = [
           'sessions',
           'restore',
           'unarchive',
+        ],
+      },
+      {
+        id: 'worktrees',
+        labelKey: 'configCenter.tabs.worktrees',
+        descriptionKey: 'configCenter.tabDescriptions.worktrees',
+        keywords: [
+          'git',
+          'worktree',
+          'isolation',
+          'parallel',
+          'branch',
+          'session',
         ],
       },
       {
@@ -134,7 +153,6 @@ export const SETTINGS_CATEGORIES: ConfigCategoryDef[] = [
         descriptionKey: 'configCenter.tabDescriptions.sessionPersonalization',
         keywords: [
           'session',
-          'title',
           'companion',
           'agent',
           'pixel',
@@ -181,6 +199,12 @@ export const SETTINGS_CATEGORIES: ConfigCategoryDef[] = [
         ],
       },
       {
+        id: 'voice-input',
+        labelKey: 'configCenter.tabs.voiceInput',
+        descriptionKey: 'configCenter.tabDescriptions.voiceInput',
+        keywords: ['voice', 'speech', 'microphone', 'dictation', 'transcription', 'audio'],
+      },
+      {
         id: 'review',
         labelKey: 'configCenter.tabs.review',
         descriptionKey: 'configCenter.tabDescriptions.review',
@@ -209,6 +233,37 @@ export const SETTINGS_CATEGORIES: ConfigCategoryDef[] = [
           'rollout',
           'learning',
           'knowledge',
+        ],
+      },
+      {
+        id: 'external-sources',
+        labelKey: 'configCenter.tabs.externalSources',
+        descriptionKey: 'configCenter.tabDescriptions.externalSources',
+        beta: true,
+        keywords: [
+          'external ai applications',
+          'import work',
+          'extensions',
+          'commands',
+          'opencode',
+          'claude code',
+          'codex',
+          'compatibility',
+        ],
+      },
+      {
+        id: 'hooks',
+        labelKey: 'configCenter.tabs.hooks',
+        descriptionKey: 'configCenter.tabDescriptions.hooks',
+        keywords: [
+          'hooks',
+          'hook',
+          'lifecycle',
+          'pretooluse',
+          'posttooluse',
+          'codex',
+          'automation',
+          'guardrail',
         ],
       },
       {
@@ -267,9 +322,9 @@ export const DEFAULT_SETTINGS_TAB: ConfigTab = 'basics';
 
 const KNOWN_TABS: ConfigTab[] = SETTINGS_CATEGORIES.flatMap((c) => c.tabs.map((t) => t.id));
 
-/** Map removed or renamed tabs; used by deep links and IDE actions. */
+/** Normalize supported settings deep links and IDE actions. */
 export function normalizeSettingsTab(section: string): ConfigTab {
-  if (section === 'theme' || section === 'font' || section === 'fonts') return 'appearance';
+  if (section === 'font' || section === 'fonts') return 'appearance';
   if (section === 'logging' || section === 'terminal') return 'basics';
   if (section === 'lsp') return DEFAULT_SETTINGS_TAB;
   if (section === 'session-config') return 'session-personalization';

@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 
-use super::{DetectedShell, ShellCandidate, ShellDetector, ShellDiscoverySource, ShellType};
+#[cfg(windows)]
+use super::DetectedShell;
+use super::{ShellCandidate, ShellDetector, ShellDiscoverySource, ShellType};
 
 #[cfg(windows)]
 pub(super) fn windows_command_candidates() -> Vec<ShellCandidate> {
@@ -103,28 +105,37 @@ pub(super) fn windows_pwsh_location_candidates(
 
 #[cfg(not(windows))]
 pub(super) fn posix_shell_candidates() -> Vec<ShellCandidate> {
-    let mut candidates = Vec::new();
-    for shell_type in [
+    [
         ShellType::Bash,
         ShellType::Zsh,
         ShellType::Fish,
         ShellType::Sh,
-    ] {
-        let executable = shell_type.default_executable();
-        candidates.extend(
-            ShellDetector::find_all_in_path(executable)
-                .into_iter()
-                .map(|path| {
-                    ShellCandidate::new(path, shell_type.clone(), ShellDiscoverySource::Path)
-                }),
-        );
-        for directory in ["/usr/local/bin", "/usr/bin", "/bin"] {
-            candidates.push(ShellCandidate::new(
-                PathBuf::from(directory).join(executable),
-                shell_type.clone(),
-                ShellDiscoverySource::SystemInstall,
-            ));
-        }
+    ]
+    .into_iter()
+    .flat_map(|shell_type| posix_shell_candidates_for(&shell_type))
+    .collect()
+}
+
+#[cfg(not(windows))]
+pub(super) fn posix_shell_candidates_for(shell_type: &ShellType) -> Vec<ShellCandidate> {
+    if !matches!(
+        shell_type,
+        ShellType::Bash | ShellType::Zsh | ShellType::Fish | ShellType::Sh
+    ) {
+        return Vec::new();
+    }
+
+    let executable = shell_type.default_executable();
+    let mut candidates = ShellDetector::find_all_in_path(executable)
+        .into_iter()
+        .map(|path| ShellCandidate::new(path, shell_type.clone(), ShellDiscoverySource::Path))
+        .collect::<Vec<_>>();
+    for directory in ["/usr/local/bin", "/usr/bin", "/bin"] {
+        candidates.push(ShellCandidate::new(
+            PathBuf::from(directory).join(executable),
+            shell_type.clone(),
+            ShellDiscoverySource::SystemInstall,
+        ));
     }
     candidates
 }
@@ -152,7 +163,7 @@ pub(super) fn non_windows_pwsh_candidates() -> Vec<ShellCandidate> {
 }
 
 #[cfg(windows)]
-pub(super) fn detect_git_bash() -> Option<DetectedShell> {
+pub(super) fn git_bash_candidates() -> Vec<ShellCandidate> {
     let mut paths = Vec::new();
     if let Some(git) = ShellDetector::find_all_in_path("git")
         .into_iter()
@@ -211,16 +222,26 @@ pub(super) fn detect_git_bash() -> Option<DetectedShell> {
                 .join("bash.exe"),
         ]);
     }
-    paths.into_iter().find_map(|path| {
-        let value = path.to_string_lossy().to_ascii_lowercase();
-        if value.contains("system32") || value.contains("syswow64") {
-            None
-        } else {
-            ShellDetector::validate_candidate(ShellCandidate::new(
-                path,
-                ShellType::Bash,
-                ShellDiscoverySource::SystemInstall,
-            ))
-        }
-    })
+    paths
+        .into_iter()
+        .filter_map(|path| {
+            let value = path.to_string_lossy().to_ascii_lowercase();
+            if value.contains("system32") || value.contains("syswow64") {
+                None
+            } else {
+                Some(ShellCandidate::new(
+                    path,
+                    ShellType::Bash,
+                    ShellDiscoverySource::SystemInstall,
+                ))
+            }
+        })
+        .collect()
+}
+
+#[cfg(windows)]
+pub(super) fn detect_git_bash() -> Option<DetectedShell> {
+    git_bash_candidates()
+        .into_iter()
+        .find_map(ShellDetector::validate_candidate)
 }

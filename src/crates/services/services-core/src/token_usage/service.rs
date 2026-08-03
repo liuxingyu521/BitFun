@@ -5,7 +5,7 @@ use super::types::{
 use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc};
 use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::fs;
@@ -133,7 +133,8 @@ impl TokenUsageService {
     #[allow(clippy::too_many_arguments)]
     pub async fn record_usage(
         &self,
-        model_id: String,
+        model_config_id: String,
+        effective_model_name: String,
         session_id: String,
         turn_id: String,
         input_tokens: u32,
@@ -155,7 +156,8 @@ impl TokenUsageService {
             .unwrap_or(0);
 
         let record = TokenUsageRecord {
-            model_id: model_id.clone(),
+            model_config_id: model_config_id.clone(),
+            effective_model_name: effective_model_name.clone(),
             session_id: session_id.clone(),
             turn_id,
             timestamp: now,
@@ -174,8 +176,14 @@ impl TokenUsageService {
         self.persist_record(&record).await?;
 
         debug!(
-            "Recorded token usage: model={}, session={}, input={}, output={}, total={}, is_subagent={}",
-            model_id, session_id, input_tokens, output_tokens, total_tokens, is_subagent
+            "Recorded token usage: model_config_id={}, effective_model_name={}, session={}, input={}, output={}, total={}, is_subagent={}",
+            model_config_id,
+            effective_model_name,
+            session_id,
+            input_tokens,
+            output_tokens,
+            total_tokens,
+            is_subagent
         );
 
         Ok(())
@@ -185,9 +193,9 @@ impl TokenUsageService {
         let mut model_stats = self.model_stats.write().await;
 
         let stats = model_stats
-            .entry(record.model_id.clone())
+            .entry(record.effective_model_name.clone())
             .or_insert_with(|| ModelTokenStats {
-                model_id: record.model_id.clone(),
+                model_id: record.effective_model_name.clone(),
                 ..Default::default()
             });
 
@@ -221,7 +229,7 @@ impl TokenUsageService {
             .entry(record.session_id.clone())
             .or_insert_with(|| SessionTokenStats {
                 session_id: record.session_id.clone(),
-                model_id: record.model_id.clone(),
+                model_id: record.effective_model_name.clone(),
                 total_input: 0,
                 total_output: 0,
                 total_cached: 0,
@@ -360,44 +368,75 @@ impl TokenUsageService {
         &self,
         query: TokenUsageQuery,
     ) -> Result<Vec<TokenUsageRecord>, String> {
+        self.query_records_filtered(query, None).await
+    }
+
+    /// Query records while bounding the returned and retained set to the
+    /// supplied session identities. The date files are still scanned once,
+    /// but unrelated records never accumulate in the request's working set.
+    pub async fn query_records_for_sessions(
+        &self,
+        query: TokenUsageQuery,
+        session_ids: &HashSet<String>,
+    ) -> Result<Vec<TokenUsageRecord>, String> {
+        self.query_records_filtered(query, Some(session_ids)).await
+    }
+
+    async fn query_records_filtered(
+        &self,
+        query: TokenUsageQuery,
+        session_ids: Option<&HashSet<String>>,
+    ) -> Result<Vec<TokenUsageRecord>, String> {
         let _usage_guard = self.usage_lifecycle.read().await;
-        let mut all_records = Vec::new();
         let record_paths = self.record_paths_for_range(&query.time_range).await?;
+        let offset = query.offset.unwrap_or(0);
+        let limit = query.limit.unwrap_or(usize::MAX);
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut matched = 0usize;
+        let mut records = Vec::new();
 
         for path in record_paths {
             let content = fs::read_to_string(&path)
                 .await
                 .map_err(|e| format!("Failed to read token usage records: {}", e))?;
             if let Ok(batch) = serde_json::from_str::<RecordsBatch>(&content) {
-                all_records.extend(batch.records);
+                for record in batch.records {
+                    if !query.include_subagent && record.is_subagent {
+                        continue;
+                    }
+                    if query
+                        .model_id
+                        .as_ref()
+                        .is_some_and(|model_id| &record.effective_model_name != model_id)
+                    {
+                        continue;
+                    }
+                    if query
+                        .session_id
+                        .as_ref()
+                        .is_some_and(|session_id| &record.session_id != session_id)
+                    {
+                        continue;
+                    }
+                    if session_ids
+                        .is_some_and(|session_ids| !session_ids.contains(&record.session_id))
+                    {
+                        continue;
+                    }
+                    if matched < offset {
+                        matched += 1;
+                        continue;
+                    }
+                    records.push(record);
+                    if records.len() == limit {
+                        return Ok(records);
+                    }
+                }
             }
         }
-
-        let include_subagent = query.include_subagent;
-        let filtered: Vec<TokenUsageRecord> = all_records
-            .into_iter()
-            .filter(|r| {
-                if !include_subagent && r.is_subagent {
-                    return false;
-                }
-                if let Some(ref model_id) = query.model_id {
-                    if &r.model_id != model_id {
-                        return false;
-                    }
-                }
-                if let Some(ref session_id) = query.session_id {
-                    if &r.session_id != session_id {
-                        return false;
-                    }
-                }
-                true
-            })
-            .collect();
-
-        let offset = query.offset.unwrap_or(0);
-        let limit = query.limit.unwrap_or(usize::MAX);
-
-        Ok(filtered.into_iter().skip(offset).take(limit).collect())
+        Ok(records)
     }
 
     async fn record_paths_for_range(&self, time_range: &TimeRange) -> Result<Vec<PathBuf>, String> {
@@ -504,13 +543,12 @@ impl TokenUsageService {
             }
             total_tokens += record.total_tokens as u64;
 
-            let model_stats =
-                by_model
-                    .entry(record.model_id.clone())
-                    .or_insert_with(|| ModelTokenStats {
-                        model_id: record.model_id.clone(),
-                        ..Default::default()
-                    });
+            let model_stats = by_model
+                .entry(record.effective_model_name.clone())
+                .or_insert_with(|| ModelTokenStats {
+                    model_id: record.effective_model_name.clone(),
+                    ..Default::default()
+                });
 
             model_stats.total_input += record.input_tokens as u64;
             model_stats.total_output += record.output_tokens as u64;
@@ -534,7 +572,7 @@ impl TokenUsageService {
                 .entry(record.session_id.clone())
                 .or_insert_with(|| SessionTokenStats {
                     session_id: record.session_id.clone(),
-                    model_id: record.model_id.clone(),
+                    model_id: record.effective_model_name.clone(),
                     total_input: 0,
                     total_output: 0,
                     total_cached: 0,
@@ -653,4 +691,64 @@ async fn read_records_batch(path: &Path) -> Result<RecordsBatch, String> {
             records: Vec::new(),
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[tokio::test]
+    async fn query_records_for_sessions_filters_before_returning_records() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let service = TokenUsageService::new(dir.path().to_path_buf())
+            .await
+            .expect("token usage service");
+        service
+            .record_usage(
+                "model-config-a".to_string(),
+                "model-a".to_string(),
+                "parent-session".to_string(),
+                "parent-turn".to_string(),
+                10,
+                2,
+                None,
+                None,
+                false,
+            )
+            .await
+            .expect("parent record");
+        service
+            .record_usage(
+                "model-config-b".to_string(),
+                "model-b".to_string(),
+                "unrelated-session".to_string(),
+                "unrelated-turn".to_string(),
+                20,
+                4,
+                None,
+                None,
+                false,
+            )
+            .await
+            .expect("unrelated record");
+
+        let records = service
+            .query_records_for_sessions(
+                TokenUsageQuery {
+                    model_id: None,
+                    session_id: None,
+                    time_range: TimeRange::All,
+                    limit: None,
+                    offset: None,
+                    include_subagent: true,
+                },
+                &HashSet::from(["parent-session".to_string()]),
+            )
+            .await
+            .expect("scoped records");
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].session_id, "parent-session");
+    }
 }

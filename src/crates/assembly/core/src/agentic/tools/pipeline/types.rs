@@ -6,10 +6,15 @@ use crate::agentic::round_preempt::DialogRoundInjectionInterrupt;
 use crate::agentic::tools::ToolRuntimeRestrictions;
 use crate::agentic::workspace::WorkspaceServices;
 use crate::agentic::WorkspaceBinding;
-use bitfun_runtime_ports::{DelegationPolicy, RemoteExecPort, TerminalPort};
+use bitfun_agent_tools::ResolvedToolInvocation;
+use bitfun_runtime_ports::{
+    DelegationPolicy, PermissionDelegationContext, RemoteExecPort, ResolvedPermissionPolicy,
+    TerminalPort,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::SystemTime;
+use tokio_util::sync::CancellationToken;
 pub use tool_runtime::context::PrimaryModelFacts;
 pub use tool_runtime::pipeline::SubagentBatchExecutionPolicy;
 
@@ -21,9 +26,13 @@ pub struct ToolExecutionOptions {
     pub max_retries: usize,
     /// Tool execution timeout (seconds), None means infinite waiting
     pub timeout_secs: Option<u64>,
-    pub confirm_before_run: bool,
-    /// Tool confirmation timeout (seconds), None means infinite waiting
-    pub confirmation_timeout_secs: Option<u64>,
+    /// Resolved host policy plus independent restriction layers.
+    pub permission_policy: ResolvedPermissionPolicy,
+    /// Automatically reply `once` to `ask` requests through the permission manager.
+    pub auto_approve_ask: bool,
+    /// Optional owner-provided token that latches cancellation before tool
+    /// validation and permission preflight have registered pipeline state.
+    pub parent_cancellation_token: Option<CancellationToken>,
 }
 
 impl Default for ToolExecutionOptions {
@@ -33,8 +42,9 @@ impl Default for ToolExecutionOptions {
             subagent_batch_execution_policy: SubagentBatchExecutionPolicy::default(),
             max_retries: 0,
             timeout_secs: None, // Default no timeout (infinite waiting)
-            confirm_before_run: true,
-            confirmation_timeout_secs: None, // Default no timeout (infinite waiting)
+            permission_policy: ResolvedPermissionPolicy::default(),
+            auto_approve_ask: false,
+            parent_cancellation_token: None,
         }
     }
 }
@@ -44,6 +54,20 @@ pub struct SubagentParentInfo {
     pub tool_call_id: String,
     pub session_id: String,
     pub dialog_turn_id: String,
+}
+
+impl SubagentParentInfo {
+    pub(crate) fn permission_delegation_context(
+        &self,
+        subagent_type: &str,
+    ) -> PermissionDelegationContext {
+        PermissionDelegationContext {
+            parent_session_id: self.session_id.clone(),
+            parent_dialog_turn_id: Some(self.dialog_turn_id.clone()),
+            parent_tool_call_id: self.tool_call_id.clone(),
+            subagent_type: subagent_type.to_string(),
+        }
+    }
 }
 
 impl From<SubagentParentInfo> for EventSubagentParentInfo {
@@ -69,9 +93,10 @@ pub struct ToolExecutionContext {
     pub primary_model_facts: PrimaryModelFacts,
     pub context_vars: HashMap<String, String>,
     pub subagent_parent_info: Option<SubagentParentInfo>,
+    pub permission_delegation: Option<PermissionDelegationContext>,
     pub(crate) delegation_policy: DelegationPolicy,
-    pub collapsed_tools: Vec<String>,
-    pub unlocked_collapsed_tools: Vec<String>,
+    pub deferred_tools: Vec<String>,
+    pub loaded_deferred_tool_specs: Vec<bitfun_agent_tools::LoadedDeferredToolSpec>,
     /// Allowed tools list (whitelist)
     /// If empty, allow all registered tools
     /// If not empty, only allow tools in the list to be executed
@@ -89,6 +114,11 @@ pub struct ToolExecutionContext {
 #[derive(Debug, Clone)]
 pub struct ToolTask {
     pub tool_call: ToolCall,
+    /// Position of this call in the model's tool-call array for the current
+    /// round. Permission requests inherit this value as their order key.
+    pub tool_call_order: u32,
+    pub invocation: ResolvedToolInvocation,
+    pub invocation_resolution_error: Option<String>,
     pub context: ToolExecutionContext,
     pub options: ToolExecutionOptions,
     pub state: ToolExecutionState,
@@ -103,8 +133,25 @@ impl ToolTask {
         context: ToolExecutionContext,
         options: ToolExecutionOptions,
     ) -> Self {
+        let invocation = ResolvedToolInvocation::direct(
+            tool_call.tool_name.clone(),
+            tool_call.arguments.clone(),
+        );
+        Self::new_resolved(tool_call, invocation, None, context, options)
+    }
+
+    pub fn new_resolved(
+        tool_call: ToolCall,
+        invocation: ResolvedToolInvocation,
+        invocation_resolution_error: Option<String>,
+        context: ToolExecutionContext,
+        options: ToolExecutionOptions,
+    ) -> Self {
         Self {
             tool_call,
+            tool_call_order: 0,
+            invocation,
+            invocation_resolution_error,
             context,
             options,
             state: ToolExecutionState::Queued { position: 0 },
@@ -113,13 +160,24 @@ impl ToolTask {
             completed_at: None,
         }
     }
+
+    pub fn effective_tool_name(&self) -> &str {
+        &self.invocation.effective_tool_name
+    }
+
+    pub fn effective_arguments(&self) -> &serde_json::Value {
+        &self.invocation.effective_arguments
+    }
 }
 
 /// Tool execution result wrapper
 #[derive(Debug, Clone)]
 pub struct ToolExecutionResult {
     pub tool_id: String,
+    /// Provider-facing tool name. For deferred calls this remains CallDeferredTool.
     pub tool_name: String,
+    /// Runtime target used for validation, permissions, hooks, and execution.
+    pub effective_tool_name: String,
     pub result: crate::agentic::core::ToolResult,
     pub execution_time_ms: u64,
 }

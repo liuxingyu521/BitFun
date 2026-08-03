@@ -1,5 +1,5 @@
 use crate::agentic::tools::framework::{
-    Tool, ToolRenderOptions, ToolResult, ToolUseContext, ValidationResult,
+    PermissionIntent, Tool, ToolRenderOptions, ToolResult, ToolUseContext, ValidationResult,
 };
 use crate::agentic::workspace::WorkspaceCommandOptions;
 use crate::infrastructure::events::event_system::get_global_event_system;
@@ -289,7 +289,7 @@ Usage notes:
   - The output may include the command echo and/or the shell prompt prefix (for example, a printed `PS` or `$` prompt line). Do not treat these as part of the command's actual result.
   - Avoid interactive commands that may block waiting for user input or open a pager/editor. Prefer non-interactive variants and explicit flags. For example, use `git --no-pager diff` instead of `git diff`, and avoid commands that prompt for confirmation unless the User explicitly asks for them.
   
-  - Prefer specialized tools for workspace file operations: Glob for file discovery, Grep for content search, Read for reading, Edit for modifying, Write for creating, and Delete for deletion. Prefer the Git tool (after loading it with GetToolSpec when collapsed) for Git subcommands such as status, diff, log, add, commit, branch, checkout, pull, and push. Use Bash for commands that genuinely need a shell, such as build/test/package CLIs, process control, scripts, and environment checks. Never use shell output only to communicate with the user.
+  - Prefer specialized tools for workspace file operations: Glob for file discovery, Grep for content search, Read for reading, Edit for modifying, Write for creating, and Delete for deletion. Prefer the Git tool for Git subcommands such as status, diff, log, add, commit, branch, checkout, pull, and push. When Git appears in the Deferred Tool Listing, load its schema with GetToolSpec and execute it through CallDeferredTool; otherwise call Git directly. Use Bash for commands that genuinely need a shell, such as build/test/package CLIs, process control, scripts, and environment checks. Never use shell output only to communicate with the user.
   - When issuing multiple commands:
     - If the commands are independent and can run in parallel, make multiple tool calls in a single message. For Git inspection, prefer parallel Git tool calls such as `{{"operation":"status"}}` and `{{"operation":"diff","args":"--stat"}}` instead of Bash.
     - If the commands depend on each other and must run sequentially, use a single Bash call with '&&' to chain them together (e.g., `git add . && git commit -m "message" && git push`). For instance, if one operation must complete before another starts (like mkdir before cp, Write before Bash for git operations, or git add before git commit), run these operations sequentially instead.
@@ -368,8 +368,21 @@ Usage notes:
         false
     }
 
-    fn needs_permissions(&self, _input: Option<&Value>) -> bool {
-        true
+    fn permission_intents(
+        &self,
+        input: &Value,
+        _context: &ToolUseContext,
+    ) -> BitFunResult<Vec<PermissionIntent>> {
+        let command = input
+            .get("command")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|command| !command.is_empty())
+            .ok_or_else(|| BitFunError::validation("command is required".to_string()))?;
+        Ok(vec![PermissionIntent::new(
+            "bash",
+            vec![command.to_string()],
+        )])
     }
 
     async fn validate_input(
@@ -482,6 +495,15 @@ Usage notes:
                 error_code: Some(400),
                 meta: None,
             };
+        }
+
+        if let Some(rejection) =
+            crate::agentic::execution::edit_constraint_guard::check_bash_command(
+                context,
+                command.unwrap_or_default(),
+            )
+        {
+            return rejection;
         }
 
         match Self::resolve_working_directory(input, context) {

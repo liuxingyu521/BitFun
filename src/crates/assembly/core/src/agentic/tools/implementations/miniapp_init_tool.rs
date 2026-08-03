@@ -1,6 +1,6 @@
 //! InitMiniApp tool — create a new MiniApp skeleton; AI then uses generic file tools to edit.
 
-use crate::agentic::tools::framework::{Tool, ToolResult, ToolUseContext};
+use crate::agentic::tools::framework::{PermissionIntent, Tool, ToolResult, ToolUseContext};
 use crate::infrastructure::events::{emit_global_event, BackendEvent};
 use crate::miniapp::try_get_global_miniapp_manager;
 use crate::miniapp::types::{
@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 const SKELETON_HTML: &str = r#"<!DOCTYPE html>
-<html data-theme-type="dark">
+<html data-bf-appearance-mode="dark">
 <head><meta charset="utf-8"></head>
 <body>
   <div id="app"></div>
@@ -69,7 +69,7 @@ Input: name, description, icon, category. The tool creates the app directory and
 - manifest (meta.json), source/index.html, source/style.css, source/ui.js, source/worker.js,
   package.json, storage.json.
 
-Returns app_id and the app root directory. Use the root directory and file names above with Read/Write/Edit to implement the app. The MiniApp uses window.app (app.fs, app.call, app.dialog, etc.) — see miniapp-dev skill for API reference."#
+Returns app_id and the app root directory. Use the root directory and file names above with Read/Write/Edit to implement the app, then call FinalizeMiniApp with the returned app_id. FinalizeMiniApp recompiles the edited files, persists the new content revision, and refreshes already-open runtimes. The MiniApp uses window.app (app.fs, app.call, app.dialog, etc.) — see miniapp-dev skill for API reference."#
             .to_string())
     }
 
@@ -107,8 +107,20 @@ Returns app_id and the app root directory. Use the root directory and file names
         false
     }
 
-    fn needs_permissions(&self, _input: Option<&Value>) -> bool {
-        false
+    fn permission_intents(
+        &self,
+        input: &Value,
+        _context: &ToolUseContext,
+    ) -> BitFunResult<Vec<PermissionIntent>> {
+        let name = input
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("unnamed")
+            .trim();
+        Ok(vec![PermissionIntent::new(
+            "custom_tool",
+            vec![format!("miniapp:InitMiniApp:{name}")],
+        )])
     }
 
     async fn call_impl(
@@ -202,7 +214,7 @@ Returns app_id and the app root directory. Use the root directory and file names
         .await;
 
         let result_text = format!(
-            "MiniApp '{}' skeleton created. app_id: {}. Root directory: {}. Use Read/Write/Edit tools with files under this root, then open in Toolbox to run.",
+            "MiniApp '{}' skeleton created. app_id: {}. Root directory: {}. Use Read/Write/Edit tools with files under this root, then call FinalizeMiniApp with this app_id before opening it.",
             app.name, app.id, app_dir_str
         );
 
@@ -221,11 +233,28 @@ Returns app_id and the app root directory. Use the root directory and file names
 #[cfg(test)]
 mod tests {
     use super::InitMiniAppTool;
-    use crate::agentic::tools::framework::{Tool, ToolExposure};
+    use crate::agentic::tools::framework::{Tool, ToolExposure, ToolUseContext};
+    use serde_json::json;
 
     #[test]
     fn init_miniapp_stays_expanded_for_assistant_creation() {
         let tool = InitMiniAppTool::new();
-        assert_eq!(tool.default_exposure(), ToolExposure::Expanded);
+        assert_eq!(tool.default_exposure(), ToolExposure::Direct);
+    }
+
+    #[test]
+    fn init_miniapp_emits_stable_permission_identity() {
+        let tool = InitMiniAppTool::new();
+        let context = ToolUseContext::for_tool_listing(None, None);
+        let intents = tool
+            .permission_intents(&json!({ "name": "Release Notes" }), &context)
+            .expect("permission intent");
+
+        assert_eq!(intents.len(), 1);
+        assert_eq!(intents[0].action, "custom_tool");
+        assert_eq!(
+            intents[0].resources,
+            ["miniapp:InitMiniApp:Release Notes".to_string()]
+        );
     }
 }

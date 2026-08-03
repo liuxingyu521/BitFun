@@ -21,6 +21,10 @@ static CONFIG_UPDATE_SENDER: OnceLock<tokio::sync::broadcast::Sender<ConfigUpdat
 /// Configuration update events.
 #[derive(Debug, Clone)]
 pub enum ConfigUpdateEvent {
+    /// AI model catalog, default slots, or agent-model defaults changed.
+    /// Consumers that materialize model bindings should rebuild future-use
+    /// projections without mutating already running sessions.
+    ModelConfigurationUpdated,
     /// AI model configuration updated.
     AIModelUpdated {
         model_id: String,
@@ -31,8 +35,8 @@ pub enum ConfigUpdateEvent {
         model_id: String,
         model_name: String,
     },
-    /// Theme configuration updated.
-    ThemeUpdated { theme_id: String },
+    /// Web UI appearance selection updated.
+    AppearanceUpdated { appearance_id: String },
     /// Editor configuration updated.
     EditorUpdated,
     /// Terminal configuration updated.
@@ -60,11 +64,11 @@ pub enum ConfigUpdateEvent {
         /// Whether logs may include prompts, payloads, and other sensitive diagnostics.
         include_sensitive_diagnostics: bool,
     },
-    /// AI models / default-model slots / agent-model mappings were reconciled
+    /// AI models / default-model slots / agent-model defaults were reconciled
     /// after a model became unavailable (disabled, deleted, or otherwise
     /// invalid). Emitted whenever the config layer had to silently rewrite
-    /// `ai.default_models`, `ai.agent_models`, or `ai.func_agent_models` so they
-    /// only reference enabled models.
+    /// `ai.default_models`, `ai.agent_model_defaults`, or `ai.func_agent_models`
+    /// so they only reference enabled models.
     ModelsReconciled {
         /// Model ids that just became unusable (disabled or deleted) and that
         /// any active session, default slot, or agent mapping was pointing at
@@ -72,9 +76,10 @@ pub enum ConfigUpdateEvent {
         invalidated_model_ids: Vec<String>,
         /// Whether `ai.default_models` was rewritten as part of the reconcile.
         default_models_changed: bool,
-        /// Whether `ai.agent_models` or `ai.func_agent_models` were rewritten
-        /// as part of the reconcile.
-        agent_models_changed: bool,
+        /// Whether `ai.func_agent_models` was rewritten as part of the reconcile.
+        func_agent_models_changed: bool,
+        /// Whether `ai.agent_model_defaults` was rewritten as part of the reconcile.
+        agent_model_defaults_changed: bool,
     },
 }
 
@@ -207,14 +212,16 @@ impl GlobalConfigManager {
         Ok(())
     }
 
-    /// Updates the theme configuration and broadcasts an event.
-    pub async fn update_theme(&self, theme_id: &str) -> BitFunResult<()> {
+    /// Updates the Web UI appearance selection and broadcasts an event.
+    pub async fn update_appearance(&self, appearance_id: &str) -> BitFunResult<()> {
         let service = Self::get_service().await?;
-        service.set_config("theme.id", theme_id).await?;
-        let stored_theme_id: String = service.get_config(Some("themes.current")).await?;
+        service
+            .set_config("appearance.selection", appearance_id)
+            .await?;
+        let stored_appearance_id: String = service.get_config(Some("appearance.selection")).await?;
 
-        Self::broadcast_update(ConfigUpdateEvent::ThemeUpdated {
-            theme_id: stored_theme_id,
+        Self::broadcast_update(ConfigUpdateEvent::AppearanceUpdated {
+            appearance_id: stored_appearance_id,
         })
         .await;
 

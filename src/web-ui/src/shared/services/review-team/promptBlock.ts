@@ -68,6 +68,8 @@ function compactExecutionPlan(workPackets: ReviewTeamWorkPacket[] = []): {
 
     return {
       packet_id: packet.packetId,
+      display_name: packet.displayName,
+      role: packet.roleName,
       phase: packet.phase,
       launch_batch: packet.launchBatch,
       subagent_type: packet.subagentId,
@@ -113,15 +115,18 @@ export function buildReviewTeamPromptBlockContent(
   manifest: ReviewTeamRunManifest,
 ): string {
   const executionPlan = compactExecutionPlan(manifest.workPackets);
-  const hasLegacyPackets = executionPlan.active_packets.length > 0;
-  const specialistPool = [
-    ...manifest.coreReviewers,
-    ...manifest.enabledExtraReviewers,
-  ].map((member) => ({
-    subagent_type: member.subagentId,
-    role: member.roleName,
-    model_id: member.model,
-  }));
+  const hasActivePackets = executionPlan.active_packets.length > 0;
+  const knownTargetFiles = manifest.target.files
+    .filter((file) => !file.excluded)
+    .map((file) => file.normalizedPath);
+  const plannedManagedFiles = new Set(
+    manifest.managedReviewPlan
+      ? (manifest.workPackets ?? []).flatMap((packet) => packet.assignedScope.files)
+      : [],
+  );
+  const deferredManagedFiles = manifest.managedReviewPlan
+    ? knownTargetFiles.filter((file) => !plannedManagedFiles.has(file))
+    : [];
   const compactManifest = {
     review_mode: manifest.reviewMode,
     selected_strategy: manifest.strategyLevel,
@@ -130,9 +135,7 @@ export function buildReviewTeamPromptBlockContent(
       resolution: manifest.target.resolution,
       tags: manifest.target.tags,
       file_count: manifest.changeStats?.fileCount ?? manifest.target.files.length,
-      files: manifest.target.files
-        .filter((file) => !file.excluded)
-        .map((file) => file.normalizedPath),
+      ...(manifest.managedReviewPlan ? {} : { files: knownTargetFiles }),
       changed_line_count: manifest.changeStats?.totalLinesChanged ?? null,
       changed_line_count_source: manifest.changeStats?.lineCountSource ?? 'unknown',
     },
@@ -146,19 +149,35 @@ export function buildReviewTeamPromptBlockContent(
       }
       : null,
     execution: {
-      ...(hasLegacyPackets
+      ...(hasActivePackets
         ? {
           max_parallel_instances: manifest.concurrencyPolicy.maxParallelInstances,
           max_retries_per_role: manifest.executionPolicy.maxRetriesPerRole,
         }
         : {
-          max_specialist_calls: manifest.executionPolicy.maxReviewerCalls ?? 1,
+          max_spawned_calls: manifest.executionPolicy.maxReviewerCalls ?? 1,
+          max_focused_questions: manifest.adaptiveReview?.maxFocusedCalls ?? 0,
           max_review_agent_executions: manifest.tokenBudget.maxReviewerCalls,
           specialist_timeout_seconds: manifest.executionPolicy.reviewerTimeoutSeconds,
           quality_inspector_timeout_seconds: manifest.executionPolicy.judgeTimeoutSeconds,
         }),
     },
-    specialist_pool: specialistPool,
+    managed_review_plan: manifest.managedReviewPlan
+      ? {
+        total_file_count: manifest.managedReviewPlan.totalFileCount,
+        planned_file_count: manifest.managedReviewPlan.plannedFileCount,
+        deferred_file_count: manifest.managedReviewPlan.deferredFileCount,
+        max_files_per_batch: manifest.managedReviewPlan.maxFilesPerBatch,
+        max_batches: manifest.managedReviewPlan.maxBatches,
+        max_parallel_instances: manifest.managedReviewPlan.maxParallelInstances,
+        worker_timeout_seconds: manifest.managedReviewPlan.workerTimeoutSeconds,
+        deferred_known_files: deferredManagedFiles,
+        deferred_unresolved_file_count: Math.max(
+          0,
+          manifest.managedReviewPlan.deferredFileCount - deferredManagedFiles.length,
+        ),
+      }
+      : null,
     quality_inspector: manifest.qualityGateReviewer
       ? {
         subagent_type: manifest.qualityGateReviewer.subagentId,
@@ -180,21 +199,26 @@ export function buildReviewTeamPromptBlockContent(
     '- Remain read-only. Do not launch ReviewFixer or start remediation without explicit user approval.',
   ];
 
-  if (hasLegacyPackets) {
+  if (hasActivePackets) {
     rules.push(
-      'Legacy packet compatibility:',
-      '- Launch only active_packets, in launch_batch order, and never exceed max_parallel_instances.',
+      'Prepared packet execution:',
+      '- Launch only active_packets and never exceed max_parallel_instances. launch_batch values are capacity groups, not runtime completion barriers; prefer their numeric order but do not claim a strict batch barrier.',
+      '- Use each packet display_name as the user-facing LaunchReviewAgent description. Do not expose packet ids, agent type names, or internal tool names in narrative output.',
       '- Build each reviewer prompt from its packet and referenced scope_group; stay within allowed_tools and the assigned scope.',
       '- Run a judge packet only after all reviewer packets finish.',
       '- Retry only when evidence is still missing and within max_retries_per_role; do not invent additional packets.',
       '- Every packet result must report packet_id and status; preserve missing or inferred packet state in coverage notes.',
-      '- Submit one structured final report after the historical packet plan completes.',
+      '- LaunchReviewAgent waits in the owning review turn. Never convert managed packets to background Task calls.',
+      '- At most two distinct concrete questions may be attached to existing packets. They do not create extra packets or extra launches.',
+      '- When managed_review_plan.deferred_file_count is non-zero, report partial coverage and list the deferred scope; do not present a clean approval as full coverage.',
+      '- Submit one structured final report after the prepared packet plan completes.',
     );
   } else {
     rules.push(
       '- Review the prepared target directly before considering delegation.',
-      '- Launch at most one specialist, and only for a concrete uncertainty where a fresh focused pass can materially improve the result.',
-      '- Do not use a specialist to repeat the primary review, divide files, or provide routine role coverage.',
+      '- Use spawned checks only for concrete unresolved questions with independent value, within max_spawned_calls and max_focused_questions.',
+      '- Choose from the concise capability catalog exposed by LaunchReviewAgent. Do not repeat the primary review, divide files, or provide routine role coverage.',
+      '- Do not retry a failed focused check; continue conservatively with the evidence already available.',
       '- Run the quality inspector only when a high-severity finding, conflicting evidence, or low-confidence conclusion needs independent validation.',
       '- If no specialist or quality inspector is needed, complete the report directly.',
       '- Submit one structured final report after review and any justified validation complete.',

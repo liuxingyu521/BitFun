@@ -17,6 +17,7 @@ export const ALL_NAMESPACES = [
   'scenes/agents',
   'scenes/capabilities',
   'scenes/miniapp',
+  'scenes/pages',
   'scenes/profile',
   'scenes/skills',
   'settings',
@@ -29,6 +30,8 @@ export const ALL_NAMESPACES = [
   'settings/debug',
   'settings/default-model',
   'settings/editor',
+  'settings/external-sources',
+  'settings/hooks',
   'settings/lsp',
   'settings/mcp',
   'settings/mcp-tools',
@@ -37,8 +40,10 @@ export const ALL_NAMESPACES = [
   'settings/review',
   'settings/session-config',
   'settings/skills',
+  'settings/voice-input',
   'shared',
   'tools',
+  'worktrees',
 ] as const;
 
 export const WEB_UI_BOOTSTRAP_NAMESPACES = [

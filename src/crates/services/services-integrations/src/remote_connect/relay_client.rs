@@ -25,19 +25,21 @@ use tokio_tungstenite::{tungstenite::client::IntoClientRequest, Connector};
 /// `install_default()` returns `Err` only when a provider is already installed,
 /// which is harmless — we silently ignore it.
 ///
-/// This is safe to call multiple times and from any thread.
-#[cfg(windows)]
+/// This is safe to call multiple times and from any thread. Required on all
+/// platforms: rustls 0.23 does not auto-select a provider when multiple TLS
+/// stacks are linked into the process.
 pub fn ensure_rustls_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
-/// No-op on non-Windows platforms: tokio-tungstenite's built-in TLS support
-/// handles CryptoProvider installation automatically.
-#[cfg(not(windows))]
-pub fn ensure_rustls_crypto_provider() {}
-
 type WsStream =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+const RELAY_DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// Heartbeats are sent every 30 seconds. Two missed acknowledgements plus
+/// scheduling/network slack indicates a half-open socket that should be
+/// replaced even when the OS has not surfaced a read error yet.
+const RELAY_INBOUND_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(75);
 
 /// Messages in the relay protocol (both directions).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,6 +59,19 @@ pub enum RelayMessage {
         nonce: String,
     },
     Heartbeat,
+    /// Account-authenticated connect (parallel to CreateRoom for device
+    /// routing). Validates the token and registers this device.
+    AuthConnect {
+        token: String,
+        device_name: String,
+    },
+    /// Route an encrypted payload to another device in the same account.
+    DeviceMessage {
+        target_device_id: String,
+        correlation_id: String,
+        encrypted_data: String,
+        nonce: String,
+    },
 
     // ── Inbound (relay → desktop) ───────────────────────────────────
     RoomCreated {
@@ -79,6 +94,31 @@ pub enum RelayMessage {
     Error {
         message: String,
     },
+    /// Account connect succeeded — relay validated the token.
+    AuthOk {
+        user_id: String,
+        device_id: String,
+    },
+    AuthError {
+        message: String,
+    },
+    /// A device-to-device message routed from another device in the account.
+    IncomingDeviceMessage {
+        source_device_id: String,
+        correlation_id: String,
+        encrypted_data: String,
+        nonce: String,
+    },
+    /// Current online devices in the account (presence broadcast).
+    DevicePresence {
+        devices: Vec<DevicePresenceEntry>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DevicePresenceEntry {
+    pub device_id: String,
+    pub device_name: String,
 }
 
 /// Events emitted by the relay client to the upper layers.
@@ -106,6 +146,25 @@ pub enum RelayEvent {
     Error {
         message: String,
     },
+    /// Account auth-connect succeeded.
+    AuthOk {
+        user_id: String,
+        device_id: String,
+    },
+    AuthError {
+        message: String,
+    },
+    /// Encrypted device-to-device message from another device in the account.
+    DeviceMessageReceived {
+        source_device_id: String,
+        correlation_id: String,
+        encrypted_data: String,
+        nonce: String,
+    },
+    /// Online device list for the account.
+    DevicePresence {
+        devices: Vec<DevicePresenceEntry>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,6 +181,10 @@ struct ReconnectCtx {
     device_id: String,
     room_id: String,
     public_key: String,
+    /// Account token for device-routing re-auth after reconnect.
+    token: String,
+    /// Device name for re-auth after reconnect.
+    device_name: String,
 }
 
 pub struct RelayClient {
@@ -195,7 +258,19 @@ impl RelayClient {
         let mut ws_read = ws_read;
         tokio::spawn(async move {
             'outer: loop {
-                while let Some(res) = ws_read.next().await {
+                loop {
+                    let res = match await_relay_inbound(ws_read.next()).await {
+                        Ok(Some(res)) => res,
+                        Ok(None) => break,
+                        Err(_) => {
+                            warn!(
+                                "Relay connection received no traffic for {} seconds; \
+                                 treating socket as stale",
+                                RELAY_INBOUND_IDLE_TIMEOUT.as_secs()
+                            );
+                            break;
+                        }
+                    };
                     match res {
                         Ok(Message::Text(text)) => {
                             match serde_json::from_str::<RelayMessage>(&text) {
@@ -272,6 +347,16 @@ impl RelayClient {
                                 };
                                 let _ = new_cmd_tx.send(recreate);
                                 info!("Room '{}' recreated after reconnect", &ctx.room_id);
+                            }
+
+                            // Re-authenticate device routing after reconnect.
+                            if !ctx.token.is_empty() {
+                                let reauth = RelayMessage::AuthConnect {
+                                    token: ctx.token.clone(),
+                                    device_name: ctx.device_name.clone(),
+                                };
+                                let _ = new_cmd_tx.send(reauth);
+                                info!("Re-sent AuthConnect after reconnect");
                             }
 
                             let _ = event_tx.send(RelayEvent::Reconnected);
@@ -354,6 +439,32 @@ impl RelayClient {
                 error!("Relay error: {message}");
                 let _ = event_tx.send(RelayEvent::Error { message });
             }
+            RelayMessage::AuthOk { user_id, device_id } => {
+                info!("Account auth-connect ok: user_id={user_id}");
+                let _ = event_tx.send(RelayEvent::AuthOk { user_id, device_id });
+            }
+            RelayMessage::AuthError { message } => {
+                warn!("Account auth-connect failed: {message}");
+                let _ = event_tx.send(RelayEvent::AuthError { message });
+            }
+            RelayMessage::IncomingDeviceMessage {
+                source_device_id,
+                correlation_id,
+                encrypted_data,
+                nonce,
+            } => {
+                debug!("DeviceMessage from {source_device_id} corr={correlation_id}");
+                let _ = event_tx.send(RelayEvent::DeviceMessageReceived {
+                    source_device_id,
+                    correlation_id,
+                    encrypted_data,
+                    nonce,
+                });
+            }
+            RelayMessage::DevicePresence { devices } => {
+                debug!("DevicePresence: {} online", devices.len());
+                let _ = event_tx.send(RelayEvent::DevicePresence { devices });
+            }
             _ => {}
         }
     }
@@ -404,6 +515,50 @@ impl RelayClient {
         .await
     }
 
+    /// Authenticate this connection with an account token (parallel to
+    /// `create_room` for the device-routing pathway). The relay validates the
+    /// token and registers the device; success arrives as `RelayEvent::AuthOk`.
+    pub async fn connect_authenticated(&self, token: &str, device_name: &str) -> Result<()> {
+        // Store credentials in reconnect context so the WS read task can
+        // re-send AuthConnect after a reconnect.
+        let mut guard = self.reconnect_ctx.write().await;
+        if let Some(ref mut ctx) = *guard {
+            ctx.token = token.to_string();
+            ctx.device_name = device_name.to_string();
+        } else {
+            *guard = Some(ReconnectCtx {
+                token: token.to_string(),
+                device_name: device_name.to_string(),
+                ..Default::default()
+            });
+        }
+        drop(guard);
+
+        self.send(RelayMessage::AuthConnect {
+            token: token.to_string(),
+            device_name: device_name.to_string(),
+        })
+        .await
+    }
+
+    /// Send an encrypted payload to another device in the same account. The
+    /// relay routes by `target_device_id` without decrypting.
+    pub async fn send_device_message(
+        &self,
+        target_device_id: &str,
+        correlation_id: &str,
+        encrypted_data: &str,
+        nonce: &str,
+    ) -> Result<()> {
+        self.send(RelayMessage::DeviceMessage {
+            target_device_id: target_device_id.to_string(),
+            correlation_id: correlation_id.to_string(),
+            encrypted_data: encrypted_data.to_string(),
+            nonce: nonce.to_string(),
+        })
+        .await
+    }
+
     pub async fn disconnect(&self) {
         *self.state.write().await = ConnectionState::Disconnected;
         *self.reconnect_ctx.write().await = None;
@@ -417,6 +572,11 @@ impl RelayClient {
 }
 
 async fn dial(ws_url: &str) -> Result<WsStream> {
+    // Ensure CryptoProvider is installed before any rustls TLS handshake.
+    // Startup already calls this; calling again is a no-op once installed and
+    // protects reconnect / late-init paths.
+    ensure_rustls_crypto_provider();
+
     let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
         .max_message_size(Some(64 * 1024 * 1024))
         .max_frame_size(Some(64 * 1024 * 1024))
@@ -424,38 +584,108 @@ async fn dial(ws_url: &str) -> Result<WsStream> {
 
     #[cfg(windows)]
     {
-        let request = ws_url
-            .into_client_request()
-            .map_err(|e| anyhow!("dial {ws_url}: build request failed: {e}"))?;
+        await_dial(ws_url, async move {
+            let request = ws_url
+                .into_client_request()
+                .map_err(|e| anyhow!("dial {ws_url}: build request failed: {e}"))?;
 
-        // Wrap TLS connector construction in catch_unwind so that a panic
-        // (e.g. duplicate CryptoProvider install) is converted to an error
-        // instead of unwinding the tokio task and potentially crashing the
-        // process.
-        let connector = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            build_windows_rustls_connector()
-        }))
-        .map_err(|_| anyhow!("dial {ws_url}: TLS connector construction panicked"))??;
+            // Wrap TLS connector construction in catch_unwind so that a panic
+            // (e.g. duplicate CryptoProvider install) is converted to an error
+            // instead of unwinding the tokio task and potentially crashing the
+            // process.
+            let connector = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                build_windows_rustls_connector()
+            }))
+            .map_err(|_| anyhow!("dial {ws_url}: TLS connector construction panicked"))??;
 
-        let (stream, _) = tokio_tungstenite::connect_async_tls_with_config(
-            request,
-            Some(config),
-            false,
-            Some(connector),
-        )
+            let (stream, _) = tokio_tungstenite::connect_async_tls_with_config(
+                request,
+                Some(config),
+                false,
+                Some(connector),
+            )
+            .await
+            .map_err(|e| anyhow!("dial {ws_url}: {e}"))?;
+            Ok(stream)
+        })
         .await
-        .map_err(|e| anyhow!("dial {ws_url}: {e}"))?;
-        Ok(stream)
     }
 
     #[cfg(not(windows))]
     {
-        // Non-Windows uses tokio-tungstenite's built-in rustls connector,
-        // which installs the CryptoProvider as needed.
-        let (stream, _) = tokio_tungstenite::connect_async_with_config(ws_url, Some(config), false)
-            .await
-            .map_err(|e| anyhow!("dial {ws_url}: {e}"))?;
-        Ok(stream)
+        // Non-Windows uses tokio-tungstenite's built-in rustls connector.
+        // CryptoProvider must already be installed (see ensure_rustls_crypto_provider).
+        await_dial(ws_url, async move {
+            let (stream, _) =
+                tokio_tungstenite::connect_async_with_config(ws_url, Some(config), false)
+                    .await
+                    .map_err(|e| anyhow!("dial {ws_url}: {e}"))?;
+            Ok(stream)
+        })
+        .await
+    }
+}
+
+async fn await_dial<T, F>(ws_url: &str, dial_future: F) -> Result<T>
+where
+    F: std::future::Future<Output = Result<T>>,
+{
+    tokio::time::timeout(RELAY_DIAL_TIMEOUT, dial_future)
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "dial {ws_url}: connection timed out after {} seconds",
+                RELAY_DIAL_TIMEOUT.as_secs()
+            )
+        })?
+}
+
+async fn await_relay_inbound<T, F>(inbound_future: F) -> std::result::Result<T, ()>
+where
+    F: std::future::Future<Output = T>,
+{
+    tokio::time::timeout(RELAY_INBOUND_IDLE_TIMEOUT, inbound_future)
+        .await
+        .map_err(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn dial_timeout_bounds_a_pending_connection_attempt() {
+        let result = await_dial(
+            "wss://relay.example.invalid/ws",
+            std::future::pending::<Result<()>>(),
+        )
+        .await;
+
+        let error = result.expect_err("pending dial must be bounded by the connection timeout");
+        assert_eq!(
+            error.to_string(),
+            "dial wss://relay.example.invalid/ws: connection timed out after 15 seconds"
+        );
+    }
+
+    #[tokio::test]
+    async fn dial_timeout_preserves_connection_errors() {
+        let result = await_dial::<(), _>(
+            "wss://relay.example.invalid/ws",
+            std::future::ready(Err(anyhow!("dial failed before timeout"))),
+        )
+        .await;
+
+        assert_eq!(
+            result.expect_err("dial error must be returned").to_string(),
+            "dial failed before timeout"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn inbound_idle_timeout_detects_a_half_open_socket() {
+        let result = await_relay_inbound(std::future::pending::<()>()).await;
+        assert!(result.is_err(), "an idle relay stream must time out");
     }
 }
 

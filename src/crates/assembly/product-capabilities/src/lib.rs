@@ -27,6 +27,7 @@ pub enum ProductCapabilityId {
     DeepResearch,
     MiniApp,
     Canvas,
+    VoiceInput,
 }
 
 impl ProductCapabilityId {
@@ -37,6 +38,7 @@ impl ProductCapabilityId {
             Self::DeepResearch => "deep-research",
             Self::MiniApp => "miniapp",
             Self::Canvas => "canvas",
+            Self::VoiceInput => "voice-input",
         }
     }
 }
@@ -257,7 +259,7 @@ const PRODUCT_DELIVERY_PROFILE_ENTRIES: &[ProductDeliveryProfileEntry] = &[
     ),
     ProductDeliveryProfileEntry::new(
         DeliveryProfile::Sdk,
-        ProductCoreDependencyMode::NoDirectCoreDependency,
+        ProductCoreDependencyMode::ProductFullCompatibility,
     ),
 ];
 
@@ -583,7 +585,7 @@ impl fmt::Display for ProductAssemblyError {
             } => {
                 write!(
                     f,
-                    "delivery profile {profile} does not support executable P0 plugin runtime host binding: {availability:?}"
+                    "delivery profile {profile} does not support an executable P0 plugin runtime client: {availability:?}"
                 )
             }
         }
@@ -633,7 +635,7 @@ impl ProductAssembler {
             });
         }
         if (is_plugin_client || plugin_runtime_availability.is_executable())
-            && !delivery_profile_supports_p0_plugin_host(input.profile)
+            && !delivery_profile_supports_executable_plugin_runtime(input.profile)
         {
             return Err(ProductAssemblyError::UnsupportedPluginRuntime {
                 profile: input.profile,
@@ -656,7 +658,7 @@ impl ProductAssembler {
     }
 }
 
-const fn delivery_profile_supports_p0_plugin_host(profile: DeliveryProfile) -> bool {
+const fn delivery_profile_supports_executable_plugin_runtime(profile: DeliveryProfile) -> bool {
     matches!(
         profile,
         DeliveryProfile::ProductFull | DeliveryProfile::Desktop | DeliveryProfile::Cli
@@ -944,7 +946,6 @@ const CODE_AGENT_SERVICES: &[RuntimeServiceCapability] = &[
     RuntimeServiceCapability::FileSystem,
     RuntimeServiceCapability::Workspace,
     RuntimeServiceCapability::SessionStore,
-    RuntimeServiceCapability::Permission,
     RuntimeServiceCapability::Events,
     RuntimeServiceCapability::Clock,
     RuntimeServiceCapability::Terminal,
@@ -952,19 +953,16 @@ const CODE_AGENT_SERVICES: &[RuntimeServiceCapability] = &[
 const DEEP_REVIEW_SERVICES: &[RuntimeServiceCapability] = &[
     RuntimeServiceCapability::Workspace,
     RuntimeServiceCapability::Git,
-    RuntimeServiceCapability::Permission,
     RuntimeServiceCapability::Events,
 ];
 const DEEP_RESEARCH_SERVICES: &[RuntimeServiceCapability] = &[
     RuntimeServiceCapability::Workspace,
     RuntimeServiceCapability::Network,
-    RuntimeServiceCapability::Permission,
     RuntimeServiceCapability::Events,
 ];
 const MINIAPP_SERVICES: &[RuntimeServiceCapability] = &[
     RuntimeServiceCapability::FileSystem,
     RuntimeServiceCapability::Workspace,
-    RuntimeServiceCapability::Permission,
     RuntimeServiceCapability::Events,
 ];
 const CANVAS_SERVICES: &[RuntimeServiceCapability] = &[
@@ -1020,37 +1018,57 @@ const DEEP_RESEARCH_HARNESS_PROVIDERS: &[HarnessProviderDescriptor] =
     &[DEEP_RESEARCH_HARNESS_PROVIDER];
 const MINIAPP_HARNESS_PROVIDERS: &[HarnessProviderDescriptor] = &[MINIAPP_HARNESS_PROVIDER];
 
+const CODE_AGENT_CAPABILITY_PACK: ProductCapabilityPack = ProductCapabilityPack::new(
+    ProductCapabilityId::CodeAgent,
+    CODE_AGENT_SERVICES,
+    CODE_AGENT_TOOL_GROUPS,
+    NO_HARNESS_PROVIDERS,
+);
+const DEEP_REVIEW_CAPABILITY_PACK: ProductCapabilityPack = ProductCapabilityPack::new(
+    ProductCapabilityId::DeepReview,
+    DEEP_REVIEW_SERVICES,
+    INTEGRATION_TOOL_GROUPS,
+    DEEP_REVIEW_HARNESS_PROVIDERS,
+);
+const DEEP_RESEARCH_CAPABILITY_PACK: ProductCapabilityPack = ProductCapabilityPack::new(
+    ProductCapabilityId::DeepResearch,
+    DEEP_RESEARCH_SERVICES,
+    INTEGRATION_TOOL_GROUPS,
+    DEEP_RESEARCH_HARNESS_PROVIDERS,
+);
+const MINIAPP_CAPABILITY_PACK: ProductCapabilityPack = ProductCapabilityPack::new(
+    ProductCapabilityId::MiniApp,
+    MINIAPP_SERVICES,
+    INTEGRATION_TOOL_GROUPS,
+    MINIAPP_HARNESS_PROVIDERS,
+);
+const CANVAS_CAPABILITY_PACK: ProductCapabilityPack = ProductCapabilityPack::new(
+    ProductCapabilityId::Canvas,
+    CANVAS_SERVICES,
+    CANVAS_TOOL_GROUPS,
+    NO_HARNESS_PROVIDERS,
+);
+const VOICE_INPUT_CAPABILITY_PACK: ProductCapabilityPack = ProductCapabilityPack::new(
+    ProductCapabilityId::VoiceInput,
+    &[],
+    &[],
+    NO_HARNESS_PROVIDERS,
+);
+
+const CORE_COMPATIBILITY_CAPABILITY_PACKS: &[ProductCapabilityPack] = &[
+    CODE_AGENT_CAPABILITY_PACK,
+    DEEP_REVIEW_CAPABILITY_PACK,
+    DEEP_RESEARCH_CAPABILITY_PACK,
+    MINIAPP_CAPABILITY_PACK,
+    CANVAS_CAPABILITY_PACK,
+];
 const DEFAULT_PRODUCT_CAPABILITY_PACKS: &[ProductCapabilityPack] = &[
-    ProductCapabilityPack::new(
-        ProductCapabilityId::CodeAgent,
-        CODE_AGENT_SERVICES,
-        CODE_AGENT_TOOL_GROUPS,
-        NO_HARNESS_PROVIDERS,
-    ),
-    ProductCapabilityPack::new(
-        ProductCapabilityId::DeepReview,
-        DEEP_REVIEW_SERVICES,
-        INTEGRATION_TOOL_GROUPS,
-        DEEP_REVIEW_HARNESS_PROVIDERS,
-    ),
-    ProductCapabilityPack::new(
-        ProductCapabilityId::DeepResearch,
-        DEEP_RESEARCH_SERVICES,
-        INTEGRATION_TOOL_GROUPS,
-        DEEP_RESEARCH_HARNESS_PROVIDERS,
-    ),
-    ProductCapabilityPack::new(
-        ProductCapabilityId::MiniApp,
-        MINIAPP_SERVICES,
-        INTEGRATION_TOOL_GROUPS,
-        MINIAPP_HARNESS_PROVIDERS,
-    ),
-    ProductCapabilityPack::new(
-        ProductCapabilityId::Canvas,
-        CANVAS_SERVICES,
-        CANVAS_TOOL_GROUPS,
-        NO_HARNESS_PROVIDERS,
-    ),
+    CODE_AGENT_CAPABILITY_PACK,
+    DEEP_REVIEW_CAPABILITY_PACK,
+    DEEP_RESEARCH_CAPABILITY_PACK,
+    MINIAPP_CAPABILITY_PACK,
+    CANVAS_CAPABILITY_PACK,
+    VOICE_INPUT_CAPABILITY_PACK,
 ];
 const EMPTY_PRODUCT_CAPABILITY_PACKS: &[ProductCapabilityPack] = &[];
 
@@ -1082,14 +1100,17 @@ pub fn default_product_harness_registry() -> Result<HarnessRegistry, HarnessRegi
 
 fn product_capability_registry_for_profile(profile: DeliveryProfile) -> ProductCapabilityRegistry {
     match profile {
-        DeliveryProfile::ProductFull
-        | DeliveryProfile::Desktop
-        | DeliveryProfile::Cli
-        | DeliveryProfile::Acp => default_product_capability_registry(),
+        DeliveryProfile::ProductFull | DeliveryProfile::Desktop => {
+            default_product_capability_registry()
+        }
+        DeliveryProfile::Cli | DeliveryProfile::Acp | DeliveryProfile::Sdk => {
+            ProductCapabilityRegistry::new(CORE_COMPATIBILITY_CAPABILITY_PACKS)
+        }
         DeliveryProfile::Server
         | DeliveryProfile::Remote
         | DeliveryProfile::Web
-        | DeliveryProfile::MobileWeb
-        | DeliveryProfile::Sdk => ProductCapabilityRegistry::new(EMPTY_PRODUCT_CAPABILITY_PACKS),
+        | DeliveryProfile::MobileWeb => {
+            ProductCapabilityRegistry::new(EMPTY_PRODUCT_CAPABILITY_PACKS)
+        }
     }
 }

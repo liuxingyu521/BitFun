@@ -108,22 +108,15 @@ impl Default for FileTreeOptions {
     fn default() -> Self {
         Self {
             max_depth: Some(50),
-            include_hidden: false,
+            include_hidden: true,
             include_git_info: false,
             include_mime_types: false,
             skip_patterns: vec![
-                "node_modules".to_string(),
-                "target".to_string(),
                 ".git".to_string(),
-                "dist".to_string(),
-                "build".to_string(),
-                ".next".to_string(),
-                ".nuxt".to_string(),
-                ".cache".to_string(),
-                "coverage".to_string(),
-                "__pycache__".to_string(),
-                ".vscode".to_string(),
-                ".idea".to_string(),
+                ".svn".to_string(),
+                ".hg".to_string(),
+                ".DS_Store".to_string(),
+                "Thumbs.db".to_string(),
             ],
             max_file_size_mb: Some(100),
             follow_symlinks: false,
@@ -439,49 +432,64 @@ impl FileTreeService {
                 }
             }
 
-            // Prevent cycles
-            let canonical_path = match path.canonicalize() {
-                Ok(p) => p,
-                Err(_) => path.clone(),
-            };
+            // Prevent cycles. canonicalize is blocking IO, so keep it off the
+            // async worker threads.
+            let canonical_path = Self::canonicalize_off_thread(path).await;
 
             if visited.contains(&canonical_path) {
                 return Ok(vec![]);
             }
             visited.insert(canonical_path);
 
-            let mut nodes = Vec::new();
-
             let mut read_dir = fs::read_dir(path)
                 .await
                 .map_err(|e| format!("Failed to read directory: {}", e))?;
 
-            let mut entries = Vec::new();
+            // Land (entry, file_type, metadata) in one pass so the sort
+            // comparator and per-entry processing make zero extra syscalls.
+            let mut entries: Vec<(fs::DirEntry, std::fs::FileType, Option<std::fs::Metadata>)> =
+                Vec::new();
             while let Some(entry) = read_dir
                 .next_entry()
                 .await
                 .map_err(|e| format!("Failed to read directory entry: {}", e))?
             {
-                entries.push(entry);
-            }
-
-            entries.sort_by(|a, b| {
-                let a_is_dir = a.path().is_dir();
-                let b_is_dir = b.path().is_dir();
-                match (a_is_dir, b_is_dir) {
-                    (true, false) => std::cmp::Ordering::Less,
-                    (false, true) => std::cmp::Ordering::Greater,
-                    _ => a.file_name().cmp(&b.file_name()),
-                }
-            });
-
-            for entry in entries {
                 let file_name = entry.file_name();
                 let file_name_str = file_name.to_string_lossy();
 
                 if self.should_skip_file(&file_name_str) {
                     continue;
                 }
+
+                let (file_type, metadata) = match entry.file_type().await {
+                    Ok(ft) => (ft, entry.metadata().await.ok()),
+                    Err(_) => match std::fs::symlink_metadata(entry.path()) {
+                        Ok(metadata) => (metadata.file_type(), Some(metadata)),
+                        Err(e) => {
+                            warn!(
+                                "Failed to get file type, skipping: {} ({})",
+                                entry.path().display(),
+                                e
+                            );
+                            continue;
+                        }
+                    },
+                };
+
+                entries.push((entry, file_type, metadata));
+            }
+
+            entries.sort_by(|a, b| match (a.1.is_dir(), b.1.is_dir()) {
+                (true, false) => std::cmp::Ordering::Less,
+                (false, true) => std::cmp::Ordering::Greater,
+                _ => a.0.file_name().cmp(&b.0.file_name()),
+            });
+
+            let mut nodes = Vec::with_capacity(entries.len());
+
+            for (entry, file_type, metadata) in entries {
+                let file_name = entry.file_name();
+                let file_name_str = file_name.to_string_lossy();
 
                 let entry_path = entry.path();
                 let relative_path = entry_path
@@ -490,25 +498,9 @@ impl FileTreeService {
                     .to_string_lossy()
                     .to_string();
 
-                let file_type = match entry.file_type().await {
-                    Ok(ft) => ft,
-                    Err(_) => match std::fs::symlink_metadata(&entry_path) {
-                        Ok(metadata) => metadata.file_type(),
-                        Err(e) => {
-                            warn!(
-                                "Failed to get file type, skipping: {} ({})",
-                                entry_path.display(),
-                                e
-                            );
-                            continue;
-                        }
-                    },
-                };
-
                 let is_directory = file_type.is_dir();
                 let is_symlink = file_type.is_symlink();
 
-                let metadata = entry.metadata().await.ok();
                 let size = if is_directory {
                     None
                 } else {
@@ -521,7 +513,7 @@ impl FileTreeService {
                     }
                 }
 
-                let last_modified = metadata.and_then(|m| {
+                let last_modified = metadata.as_ref().and_then(|m| {
                     m.modified().ok().map(|t| {
                         let datetime: chrono::DateTime<chrono::Utc> = t.into();
                         datetime.format("%Y-%m-%d %H:%M:%S").to_string()
@@ -542,7 +534,9 @@ impl FileTreeService {
                     None
                 };
 
-                let permissions = self.get_permissions_string(&entry_path).await;
+                let permissions = metadata
+                    .as_ref()
+                    .map(Self::permissions_string_from_metadata);
 
                 let mut node = FileTreeNode::new(
                     relative_path,
@@ -597,43 +591,28 @@ impl FileTreeService {
                 }
             }
 
-            // Prevent cycles
-            let canonical_path = match path.canonicalize() {
-                Ok(p) => p,
-                Err(_) => path.clone(),
-            };
+            // Prevent cycles. canonicalize is blocking IO, so keep it off the
+            // async worker threads.
+            let canonical_path = Self::canonicalize_off_thread(path).await;
 
             if visited.contains(&canonical_path) {
                 return Ok(vec![]);
             }
             visited.insert(canonical_path);
 
-            let mut nodes = Vec::new();
-
             let mut read_dir = fs::read_dir(path)
                 .await
                 .map_err(|e| format!("Failed to read directory: {}", e))?;
 
-            let mut entries = Vec::new();
+            // Land (entry, file_type, metadata) in one pass so the sort
+            // comparator and per-entry processing make zero extra syscalls.
+            let mut entries: Vec<(fs::DirEntry, std::fs::FileType, Option<std::fs::Metadata>)> =
+                Vec::new();
             while let Some(entry) = read_dir
                 .next_entry()
                 .await
                 .map_err(|e| format!("Failed to read directory entry: {}", e))?
             {
-                entries.push(entry);
-            }
-
-            entries.sort_by(|a, b| {
-                let a_is_dir = a.path().is_dir();
-                let b_is_dir = b.path().is_dir();
-                match (a_is_dir, b_is_dir) {
-                    (true, false) => std::cmp::Ordering::Less,
-                    (false, true) => std::cmp::Ordering::Greater,
-                    _ => a.file_name().cmp(&b.file_name()),
-                }
-            });
-
-            for entry in entries {
                 let file_name = entry.file_name();
                 let file_name_str = file_name.to_string_lossy();
 
@@ -645,27 +624,42 @@ impl FileTreeService {
                     continue;
                 }
 
-                let entry_path = entry.path();
-                let relative_path = entry_path
-                    .strip_prefix(root_path)
-                    .unwrap_or(&entry_path)
-                    .to_string_lossy()
-                    .to_string();
-
-                let file_type = match entry.file_type().await {
-                    Ok(ft) => ft,
-                    Err(_) => match std::fs::symlink_metadata(&entry_path) {
-                        Ok(metadata) => metadata.file_type(),
+                let (file_type, metadata) = match entry.file_type().await {
+                    Ok(ft) => (ft, entry.metadata().await.ok()),
+                    Err(_) => match std::fs::symlink_metadata(entry.path()) {
+                        Ok(metadata) => (metadata.file_type(), Some(metadata)),
                         Err(e) => {
                             warn!(
                                 "Failed to get file type, skipping: {} ({})",
-                                entry_path.display(),
+                                entry.path().display(),
                                 e
                             );
                             continue;
                         }
                     },
                 };
+
+                entries.push((entry, file_type, metadata));
+            }
+
+            entries.sort_by(|a, b| match (a.1.is_dir(), b.1.is_dir()) {
+                (true, false) => std::cmp::Ordering::Less,
+                (false, true) => std::cmp::Ordering::Greater,
+                _ => a.0.file_name().cmp(&b.0.file_name()),
+            });
+
+            let mut nodes = Vec::with_capacity(entries.len());
+
+            for (entry, file_type, metadata) in entries {
+                let file_name = entry.file_name();
+                let file_name_str = file_name.to_string_lossy();
+
+                let entry_path = entry.path();
+                let relative_path = entry_path
+                    .strip_prefix(root_path)
+                    .unwrap_or(&entry_path)
+                    .to_string_lossy()
+                    .to_string();
 
                 let is_directory = file_type.is_dir();
                 let is_symlink = file_type.is_symlink();
@@ -680,7 +674,6 @@ impl FileTreeService {
                     stats.symlinks_count += 1;
                 }
 
-                let metadata = entry.metadata().await.ok();
                 let size = if is_directory {
                     None
                 } else {
@@ -714,7 +707,7 @@ impl FileTreeService {
                     }
                 }
 
-                let last_modified = metadata.and_then(|m| {
+                let last_modified = metadata.as_ref().and_then(|m| {
                     m.modified().ok().map(|t| {
                         let datetime: chrono::DateTime<chrono::Utc> = t.into();
                         datetime.format("%Y-%m-%d %H:%M:%S").to_string()
@@ -735,7 +728,9 @@ impl FileTreeService {
                     None
                 };
 
-                let permissions = self.get_permissions_string(&entry_path).await;
+                let permissions = metadata
+                    .as_ref()
+                    .map(Self::permissions_string_from_metadata);
 
                 let mut node = FileTreeNode::new(
                     relative_path,
@@ -776,8 +771,7 @@ impl FileTreeService {
     }
 
     fn should_skip_file(&self, file_name: &str) -> bool {
-        // Skip hidden files and directories (unless explicitly included)
-        // But .gitignore and .bitfun are always shown
+        // Skip hidden files and directories unless explicitly included.
         if !self.options.include_hidden
             && file_name.starts_with('.')
             && file_name != ".gitignore"
@@ -901,43 +895,51 @@ impl FileTreeService {
         }
     }
 
-    async fn get_permissions_string(&self, path: &Path) -> Option<String> {
-        if let Ok(metadata) = fs::metadata(path).await {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let perms = metadata.permissions();
-                let mode = perms.mode();
+    /// Resolves a canonical path on the blocking pool; falls back to the
+    /// original path on error.
+    async fn canonicalize_off_thread(path: &Path) -> PathBuf {
+        let owned = path.to_path_buf();
+        let fallback = owned.clone();
+        match tokio::task::spawn_blocking(move || owned.canonicalize()).await {
+            Ok(Ok(canonical)) => canonical,
+            _ => fallback,
+        }
+    }
 
-                let user = format!(
-                    "{}{}{}",
-                    if mode & 0o400 != 0 { "r" } else { "-" },
-                    if mode & 0o200 != 0 { "w" } else { "-" },
-                    if mode & 0o100 != 0 { "x" } else { "-" }
-                );
-                let group = format!(
-                    "{}{}{}",
-                    if mode & 0o040 != 0 { "r" } else { "-" },
-                    if mode & 0o020 != 0 { "w" } else { "-" },
-                    if mode & 0o010 != 0 { "x" } else { "-" }
-                );
-                let other = format!(
-                    "{}{}{}",
-                    if mode & 0o004 != 0 { "r" } else { "-" },
-                    if mode & 0o002 != 0 { "w" } else { "-" },
-                    if mode & 0o001 != 0 { "x" } else { "-" }
-                );
+    /// Formats a permissions string from already-fetched metadata, avoiding an
+    /// extra stat per entry.
+    fn permissions_string_from_metadata(metadata: &std::fs::Metadata) -> String {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = metadata.permissions().mode();
 
-                Some(format!("{}{}{}", user, group, other))
-            }
+            let user = format!(
+                "{}{}{}",
+                if mode & 0o400 != 0 { "r" } else { "-" },
+                if mode & 0o200 != 0 { "w" } else { "-" },
+                if mode & 0o100 != 0 { "x" } else { "-" }
+            );
+            let group = format!(
+                "{}{}{}",
+                if mode & 0o040 != 0 { "r" } else { "-" },
+                if mode & 0o020 != 0 { "w" } else { "-" },
+                if mode & 0o010 != 0 { "x" } else { "-" }
+            );
+            let other = format!(
+                "{}{}{}",
+                if mode & 0o004 != 0 { "r" } else { "-" },
+                if mode & 0o002 != 0 { "w" } else { "-" },
+                if mode & 0o001 != 0 { "x" } else { "-" }
+            );
 
-            #[cfg(windows)]
-            {
-                let readonly = metadata.permissions().readonly();
-                Some(if readonly { "r--" } else { "rw-" }.to_string())
-            }
-        } else {
-            None
+            format!("{}{}{}", user, group, other)
+        }
+
+        #[cfg(windows)]
+        {
+            let readonly = metadata.permissions().readonly();
+            (if readonly { "r--" } else { "rw-" }).to_string()
         }
     }
 
@@ -1145,7 +1147,7 @@ impl FileTreeService {
             progress_sink.flush();
         }
 
-        let final_results = lock_search_results(&results).clone();
+        let final_results = std::mem::take(&mut *lock_search_results(&results));
         Ok(FileSearchOutcome {
             results: final_results,
             truncated: limit_reached.load(Ordering::Relaxed),
@@ -1280,7 +1282,7 @@ impl FileTreeService {
             progress_sink.flush();
         }
 
-        let final_results = lock_search_results(&results).clone();
+        let final_results = std::mem::take(&mut *lock_search_results(&results));
         Ok(FileSearchOutcome {
             results: final_results,
             truncated: limit_reached.load(Ordering::Relaxed),
@@ -1490,16 +1492,17 @@ impl FileTreeService {
             let line_bytes = line_result.map_err(|error| {
                 FileSystemError::service(format!("Failed to read file: {}", error))
             })?;
-            let line = String::from_utf8_lossy(&line_bytes)
-                .trim_end_matches('\r')
-                .to_string();
+            // Match on the borrowed Cow first; only allocate for hit lines.
+            let line_cow = String::from_utf8_lossy(&line_bytes);
+            let line = line_cow.trim_end_matches('\r');
 
-            if !matcher.is_match(&line) {
+            if !matcher.is_match(line) {
                 continue;
             }
 
             let (preview_before, preview_inside, preview_after) =
-                Self::build_content_match_preview(&line, matcher);
+                Self::build_content_match_preview(line, matcher);
+            let line = line.to_string();
 
             matched_results.push(FileSearchResult {
                 path: path.to_string_lossy().to_string(),
@@ -1595,6 +1598,30 @@ pub enum SearchMatchType {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_tree_visibility_matches_vscode_baseline() {
+        let service = FileTreeService::default();
+
+        for name in [".git", ".svn", ".hg", ".DS_Store", "Thumbs.db"] {
+            assert!(service.should_skip_file(name), "{name} should be excluded");
+        }
+
+        for name in [
+            ".env",
+            ".github",
+            ".vscode",
+            "node_modules",
+            "target",
+            "dist",
+            "build",
+        ] {
+            assert!(
+                !service.should_skip_file(name),
+                "{name} should be visible by default"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn content_search_preserves_matching_lines_and_preview_ranges() {

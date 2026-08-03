@@ -5,11 +5,12 @@
 //! decoration. Concrete tools and `ToolUseContext` stay in core so this owner
 //! remains an equivalent structural boundary rather than a behavior migration.
 
+mod call_deferred_tool;
 mod catalog;
 mod get_tool_spec_tool;
+mod loaded_spec_state;
 mod materialization;
 mod snapshot;
-mod unlock_state;
 
 use crate::agentic::tools::registry::{ProductToolDecoratorRef, ToolRegistry};
 use bitfun_agent_tools::SnapshotToolDecorator;
@@ -20,6 +21,7 @@ use materialization::create_product_tool_registry_from_plan;
 use snapshot::ProductSnapshotToolWrapper;
 use std::sync::Arc;
 
+pub use call_deferred_tool::CallDeferredTool;
 pub(crate) use catalog::{
     product_get_tool_spec_runtime, resolve_product_get_tool_spec_results,
     resolve_product_readonly_enabled_tools, resolve_product_resolved_tool_manifest,
@@ -27,7 +29,7 @@ pub(crate) use catalog::{
 };
 pub use catalog::{ResolvedToolManifest, ResolvedVisibleTools};
 pub use get_tool_spec_tool::GetToolSpecTool;
-pub(crate) use unlock_state::collect_product_unlocked_collapsed_tools;
+pub(crate) use loaded_spec_state::collect_product_loaded_deferred_tool_specs;
 
 #[derive(Clone)]
 pub(crate) struct ProductToolRuntime {
@@ -101,9 +103,9 @@ mod tests {
             "product tool runtime owner must preserve legacy registry output"
         );
         assert_eq!(
-            owner_registry.get_collapsed_tool_names(),
-            compatibility_registry.get_collapsed_tool_names(),
-            "product tool runtime owner must preserve collapsed-tool exposure"
+            owner_registry.get_deferred_tool_names(),
+            compatibility_registry.get_deferred_tool_names(),
+            "product tool runtime owner must preserve deferred-tool exposure"
         );
     }
 
@@ -133,9 +135,18 @@ mod tests {
             compatibility_registry.get_tool_names()
         );
         assert_eq!(
-            owner_registry.get_collapsed_tool_names(),
-            compatibility_registry.get_collapsed_tool_names()
+            owner_registry.get_deferred_tool_names(),
+            compatibility_registry.get_deferred_tool_names()
         );
+    }
+
+    #[test]
+    fn sdk_and_cli_profiles_current_tool_plan_ceilings_match_without_sharing_identity() {
+        let sdk = ProductToolRuntime::for_profile(DeliveryProfile::Sdk).create_registry();
+        let cli = ProductToolRuntime::for_profile(DeliveryProfile::Cli).create_registry();
+
+        assert_eq!(sdk.get_tool_names(), cli.get_tool_names());
+        assert_eq!(sdk.get_deferred_tool_names(), cli.get_deferred_tool_names());
     }
 
     #[test]
@@ -145,7 +156,6 @@ mod tests {
             DeliveryProfile::Remote,
             DeliveryProfile::Web,
             DeliveryProfile::MobileWeb,
-            DeliveryProfile::Sdk,
         ] {
             let runtime = ProductToolRuntime::for_profile(profile);
             let registry = runtime.create_registry();
@@ -155,8 +165,8 @@ mod tests {
                 "{profile} must not expose product-full tools"
             );
             assert!(
-                registry.get_collapsed_tool_names().is_empty(),
-                "{profile} must not expose collapsed product-full tools"
+                registry.get_deferred_tool_names().is_empty(),
+                "{profile} must not expose deferred product-full tools"
             );
         }
     }

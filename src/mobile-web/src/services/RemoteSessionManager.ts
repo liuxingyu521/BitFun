@@ -8,7 +8,36 @@
  *   - On tab activation: immediate poll to catch up on missed changes
  */
 
-import { RelayHttpClient } from './RelayHttpClient';
+import {
+  RelayHttpClient,
+  type ControlTargetSnapshot,
+} from './RelayHttpClient';
+
+export class RemoteControlTargetChangedError extends Error {
+  constructor() {
+    super('Remote control target changed');
+    this.name = 'RemoteControlTargetChangedError';
+  }
+}
+
+export function isRemoteControlTargetChangedError(
+  value: unknown,
+): value is RemoteControlTargetChangedError {
+  return value instanceof RemoteControlTargetChangedError;
+}
+
+const RETRYABLE_REMOTE_READ_COMMANDS = new Set([
+  'get_workspace_info',
+  'list_recent_workspaces',
+  'list_assistants',
+  'list_sessions',
+  'get_session_messages',
+  'get_model_catalog',
+  'poll_session',
+  'ping',
+  'get_file_info',
+  'read_file_chunk',
+]);
 
 export interface WorkspaceInfo {
   has_workspace: boolean;
@@ -18,6 +47,14 @@ export interface WorkspaceInfo {
   /** Mirrors desktop `WorkspaceKind`: normal project, Claw assistant workspace, or remote SSH. */
   workspace_kind?: 'normal' | 'assistant' | 'remote';
   assistant_id?: string;
+  /** Required to disambiguate multiple SSH hosts that share the same POSIX path. */
+  remote_connection_id?: string;
+  remote_ssh_host?: string;
+}
+
+export interface RemoteWorkspaceIdentity {
+  remoteConnectionId?: string;
+  remoteSshHost?: string;
 }
 
 export interface RecentWorkspaceEntry {
@@ -25,6 +62,8 @@ export interface RecentWorkspaceEntry {
   name: string;
   last_opened: string;
   workspace_kind?: 'normal' | 'assistant' | 'remote';
+  remote_connection_id?: string;
+  remote_ssh_host?: string;
 }
 
 export interface AssistantEntry {
@@ -134,6 +173,8 @@ export interface InitialSyncData {
   git_branch?: string;
   workspace_kind?: 'normal' | 'assistant' | 'remote';
   assistant_id?: string;
+  remote_connection_id?: string;
+  remote_ssh_host?: string;
   sessions: SessionInfo[];
   has_more_sessions: boolean;
   authenticated_user_id?: string;
@@ -146,15 +187,64 @@ export class RemoteSessionManager {
     this.client = client;
   }
 
-  private async request<T>(cmd: object): Promise<T> {
+  get controlTargetEpoch(): number {
+    return this.client.controlTargetEpoch;
+  }
+
+  onControlTargetChange(listener: () => void): () => void {
+    return this.client.onControlTargetChange(listener);
+  }
+
+  private ensureControlTargetCurrent(snapshot: ControlTargetSnapshot): void {
+    if (!this.client.isControlTargetCurrent(snapshot)) {
+      throw new RemoteControlTargetChangedError();
+    }
+  }
+
+  private async request<T>(
+    cmd: object,
+    target: ControlTargetSnapshot = this.client.getControlTargetSnapshot(),
+  ): Promise<T> {
+    // A caller may bind several transport requests into one logical operation
+    // (for example, a chunked file download). Fence before any transport call
+    // so a stale operation cannot send its next step to the replacement target.
+    this.ensureControlTargetCurrent(target);
     const requestId = `req_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     const cmdWithId = { ...cmd, _request_id: requestId };
-    const resp = await this.client.sendCommand<T>(cmdWithId);
-    const respAny = resp as any;
-    if (respAny.resp === 'error') {
-      throw new Error(respAny.message || 'Unknown error');
+    const commandName = (cmd as { cmd?: unknown }).cmd;
+    const retryable = typeof commandName === 'string'
+      && RETRYABLE_REMOTE_READ_COMMANDS.has(commandName);
+    // The QR-paired desktop keeps the proven room channel. Only a switched
+    // control target (another same-account device) is reached through the
+    // relay device RPC API using the delegated identity.
+    const targetDeviceId = target.deviceId;
+    const isRemoteTarget =
+      !!targetDeviceId
+      && targetDeviceId !== target.homeDeviceId;
+    try {
+      let resp: T;
+      if (isRemoteTarget && targetDeviceId) {
+        resp = await this.client.sendDeviceRpc<T>(
+          targetDeviceId,
+          cmdWithId,
+          { retryable },
+        );
+      } else {
+        resp = await this.client.sendCommand<T>(cmdWithId, { retryable });
+      }
+      this.ensureControlTargetCurrent(target);
+      const respAny = resp as any;
+      if (respAny.resp === 'error') {
+        throw new Error(respAny.message || 'Unknown error');
+      }
+      return resp;
+    } catch (error: unknown) {
+      // Suppress both successful and failed completions after a target switch.
+      // The epoch check (rather than device id alone) also closes A -> B -> A
+      // ABA races.
+      this.ensureControlTargetCurrent(target);
+      throw error;
     }
-    return resp;
   }
 
   async getWorkspaceInfo(): Promise<WorkspaceInfo> {
@@ -168,6 +258,8 @@ export class RemoteSessionManager {
       git_branch: resp.git_branch,
       workspace_kind: resp.workspace_kind,
       assistant_id: resp.assistant_id,
+      remote_connection_id: resp.remote_connection_id,
+      remote_ssh_host: resp.remote_ssh_host,
     };
   }
 
@@ -181,13 +273,24 @@ export class RemoteSessionManager {
 
   async setWorkspace(
     path: string,
+    options?: {
+      remoteConnectionId?: string;
+      remoteSshHost?: string;
+    },
   ): Promise<{
     success: boolean;
     path?: string;
     project_name?: string;
+    remote_connection_id?: string;
+    remote_ssh_host?: string;
     error?: string;
   }> {
-    return this.request({ cmd: 'set_workspace', path });
+    return this.request({
+      cmd: 'set_workspace',
+      path,
+      remote_connection_id: options?.remoteConnectionId,
+      remote_ssh_host: options?.remoteSshHost,
+    });
   }
 
   async listAssistants(): Promise<AssistantEntry[]> {
@@ -214,6 +317,7 @@ export class RemoteSessionManager {
     limit = 30,
     offset = 0,
     query?: string,
+    identity?: RemoteWorkspaceIdentity,
   ): Promise<{ sessions: SessionInfo[]; has_more: boolean }> {
     const resp = await this.request<{
       resp: string;
@@ -222,6 +326,8 @@ export class RemoteSessionManager {
     }>({
       cmd: 'list_sessions',
       workspace_path: workspacePath ?? null,
+      remote_connection_id: identity?.remoteConnectionId,
+      remote_ssh_host: identity?.remoteSshHost,
       limit,
       offset,
       query: query?.trim() || null,
@@ -236,12 +342,15 @@ export class RemoteSessionManager {
     agentType?: string,
     sessionName?: string,
     workspacePath?: string,
+    identity?: RemoteWorkspaceIdentity,
   ): Promise<string> {
     const resp = await this.request<{ resp: string; session_id: string }>({
       cmd: 'create_session',
       agent_type: agentType || undefined,
       session_name: sessionName || undefined,
       workspace_path: workspacePath ?? null,
+      remote_connection_id: identity?.remoteConnectionId,
+      remote_ssh_host: identity?.remoteSshHost,
     });
     return resp.session_id;
   }
@@ -412,6 +521,7 @@ export class RemoteSessionManager {
     let fileName = '';
     let mimeType = '';
     let totalSize = 0;
+    const target = this.client.getControlTargetSnapshot();
 
     // eslint-disable-next-line no-constant-condition
     while (true) {
@@ -429,7 +539,8 @@ export class RemoteSessionManager {
         session_id: sessionId ?? undefined,
         offset,
         limit: CHUNK_SIZE,
-      });
+      }, target);
+      this.ensureControlTargetCurrent(target);
 
       chunks.push(resp.chunk_base64);
       fileName = resp.name;
@@ -441,6 +552,8 @@ export class RemoteSessionManager {
 
       if (offset >= totalSize || resp.chunk_size === 0) break;
     }
+
+    this.ensureControlTargetCurrent(target);
 
     return {
       name: fileName,

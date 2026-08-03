@@ -93,7 +93,10 @@ const ReviewConfig: React.FC = () => {
   if (loading) {
     return (
       <ConfigPageLayout>
-        <ConfigPageLoading text={t('loading')} />
+        <ConfigPageHeader title={t('title')} subtitle={t('subtitle')} />
+        <ConfigPageContent>
+          <ConfigPageLoading text={t('loading')} />
+        </ConfigPageContent>
       </ConfigPageLayout>
     );
   }
@@ -131,7 +134,7 @@ const ReviewConfig: React.FC = () => {
               value={team.concurrencyPolicy.maxParallelInstances}
               onChange={(value) => void handleConcurrencyPolicyChange('maxParallelInstances', value)}
               min={1}
-              max={16}
+              max={2}
               step={1}
               size="small"
               disabled={savingConcurrencyKey !== null}

@@ -1,4 +1,5 @@
 import { WorkspaceKind, isRemoteWorkspace, type WorkspaceInfo } from '@/shared/types';
+import { workspaceManager } from '@/infrastructure/services/business/workspaceManager';
 
 /**
  * Always create a new session instead of reusing an existing empty one.
@@ -24,11 +25,48 @@ export function pickWorkspaceForProjectChatSession(
   return normalWorkspacesList[0] ?? null;
 }
 
+/**
+ * The primary assistant workspace is the built-in assistant without an
+ * assistant id. Named assistants must never receive sessions created from the
+ * global "Assistant Sessions" action.
+ */
+export function pickPrimaryAssistantWorkspace(
+  assistantWorkspacesList: WorkspaceInfo[]
+): WorkspaceInfo | null {
+  return assistantWorkspacesList.find(
+    workspace =>
+      workspace.workspaceKind === WorkspaceKind.Assistant &&
+      !workspace.assistantId
+  ) ?? null;
+}
+
+/**
+ * Build create_session config from the live workspace. After Peer Device Mode
+ * switch, callers must pass this (not `{}`) so the peer host never sees a
+ * stale controller path. See `infrastructure/peer-device/README.md`.
+ */
 export function flowChatSessionConfigForWorkspace(workspace: WorkspaceInfo) {
   return {
     workspacePath: workspace.rootPath,
     ...(isRemoteWorkspace(workspace) && workspace.connectionId
       ? { remoteConnectionId: workspace.connectionId }
       : {}),
+    ...(isRemoteWorkspace(workspace) && workspace.sshHost
+      ? { remoteSshHost: workspace.sshHost }
+      : {}),
   };
+}
+
+/**
+ * Prefer the live workspaceManager workspace for create_session. Returns `{}`
+ * only when no workspace is open yet (caller / SessionModule must still resolve).
+ */
+export function flowChatSessionConfigForCurrentWorkspace(
+  workspace?: WorkspaceInfo | null,
+) {
+  const live = workspace ?? workspaceManager.getState().currentWorkspace;
+  if (!live) {
+    return {};
+  }
+  return flowChatSessionConfigForWorkspace(live);
 }

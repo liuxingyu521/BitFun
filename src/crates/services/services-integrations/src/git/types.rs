@@ -2,6 +2,7 @@
  * Git-related type definitions
  */
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GitRepository {
@@ -253,6 +254,36 @@ pub struct GitWorktreeInfo {
     pub is_locked: bool,
     /// Whether the worktree is prunable
     pub is_prunable: bool,
+}
+
+/// Local changes that can be copied into a freshly-created detached worktree.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitLocalChangeSummary {
+    pub staged: Vec<String>,
+    pub unstaged: Vec<String>,
+    pub untracked: Vec<String>,
+    pub included_ignored: Vec<String>,
+}
+
+impl GitLocalChangeSummary {
+    pub fn is_empty(&self) -> bool {
+        self.staged.is_empty()
+            && self.unstaged.is_empty()
+            && self.untracked.is_empty()
+            && self.included_ignored.is_empty()
+    }
+}
+
+/// Repository identity used to share worktree topology across linked checkouts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitWorktreeRepositoryInfo {
+    /// A working directory suitable for running `git worktree list`.
+    pub query_path: PathBuf,
+    /// The common Git directory shared by the main and linked worktrees.
+    pub common_git_dir: PathBuf,
+    /// The current worktree's `.git` marker. Linked worktrees use a file here.
+    pub worktree_git_marker: PathBuf,
 }
 
 /// Git graph node.

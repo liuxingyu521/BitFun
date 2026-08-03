@@ -1,20 +1,29 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { DialogTurn, FlowTextItem, ModelRound } from '../../types/flow-chat';
+import type { DialogTurn, ModelRound } from '../../types/flow-chat';
 import {
   convertDialogTurnToBackendFormat,
+  debouncedSaveDialogTurn,
   immediateSaveDialogTurn,
   saveDialogTurnToDisk,
 } from './PersistenceModule';
 
-const saveSessionTurn = vi.fn();
-const saveSessionMetadata = vi.fn();
-const loadSessionMetadata = vi.fn();
+// Vitest hoists `vi.mock` factories above ordinary module-scope declarations,
+// so a plain `const` referenced inside the factory is still in its temporal
+// dead zone when the factory runs. `vi.hoisted` hoists the value itself to
+// the same point, ahead of `vi.mock`, so the factory can see it.
+const { mockSaveSessionTurn, mockSaveSessionMetadata, mockLoadSessionMetadata } = vi.hoisted(
+  () => ({
+    mockSaveSessionTurn: vi.fn(),
+    mockSaveSessionMetadata: vi.fn(),
+    mockLoadSessionMetadata: vi.fn(),
+  })
+);
 
 vi.mock('@/infrastructure/api/service-api/SessionAPI', () => ({
   sessionAPI: {
-    saveSessionTurn,
-    saveSessionMetadata,
-    loadSessionMetadata,
+    saveSessionTurn: mockSaveSessionTurn,
+    saveSessionMetadata: mockSaveSessionMetadata,
+    loadSessionMetadata: mockLoadSessionMetadata,
   },
 }));
 
@@ -83,45 +92,14 @@ async function flushMicrotasks(): Promise<void> {
 describe('PersistenceModule', () => {
   beforeEach(() => {
     vi.useFakeTimers();
-    saveSessionTurn.mockResolvedValue(undefined);
-    saveSessionMetadata.mockResolvedValue(undefined);
-    loadSessionMetadata.mockResolvedValue(null);
+    mockSaveSessionTurn.mockResolvedValue(undefined);
+    mockSaveSessionMetadata.mockResolvedValue(undefined);
+    mockLoadSessionMetadata.mockResolvedValue(null);
   });
 
   afterEach(() => {
     vi.useRealTimers();
     vi.clearAllMocks();
-  });
-
-  it('filters transient runtime status items from persisted text items', () => {
-    const runtimeItem: FlowTextItem = {
-      id: 'runtime-status',
-      type: 'text',
-      content: '\u200B',
-      timestamp: 1001,
-      status: 'streaming',
-      isStreaming: true,
-      isMarkdown: false,
-      runtimeStatus: {
-        phase: 'waiting_model',
-        scope: 'main',
-      },
-    };
-    const realItem: FlowTextItem = {
-      id: 'real-text',
-      type: 'text',
-      content: 'Visible answer',
-      timestamp: 1002,
-      status: 'completed',
-      isStreaming: false,
-      isMarkdown: true,
-    };
-    const turn = createDialogTurn('processing');
-    turn.modelRounds[0].items = [runtimeItem, realItem];
-
-    const persisted = convertDialogTurnToBackendFormat(turn, 0);
-
-    expect(persisted.modelRounds[0].textItems.map((item: any) => item.id)).toEqual(['real-text']);
   });
 
   it('persists dialog turn token usage metadata when available', () => {
@@ -152,6 +130,28 @@ describe('PersistenceModule', () => {
 
     expect(persisted.finishReason).toBe('max_rounds');
     expect(persisted.hasFinalResponse).toBe(false);
+  });
+
+  it('persists terminal error diagnostics for failed turns', () => {
+    const turn = createDialogTurn('error');
+    turn.error = 'OpenAI Streaming API failed after 10 attempts: connection refused';
+    turn.errorDetail = {
+      category: 'network',
+      provider: 'openai',
+      requestId: 'req-1',
+    };
+
+    const persisted = convertDialogTurnToBackendFormat(turn, 0);
+
+    expect(persisted).toMatchObject({
+      error: 'OpenAI Streaming API failed after 10 attempts: connection refused',
+      errorDetail: {
+        category: 'network',
+        provider: 'openai',
+        requestId: 'req-1',
+      },
+      status: 'error',
+    });
   });
 
   it('persists ACP permission metadata for pending confirmation tools', () => {
@@ -218,6 +218,61 @@ describe('PersistenceModule', () => {
     });
   });
 
+  it('persists only the original deferred wire invocation', () => {
+    const turn = createDialogTurn('completed');
+    turn.modelRounds[0].items = [{
+      id: 'tool-1',
+      type: 'tool',
+      toolName: 'CallDeferredTool',
+      toolCall: {
+        id: 'tool-1',
+        input: {
+          tool_name: 'WebFetch',
+          args: { url: 'https://example.test' },
+        },
+      },
+      status: 'completed',
+      timestamp: 1001,
+      startTime: 1001,
+    }];
+
+    const persisted = convertDialogTurnToBackendFormat(turn, 0);
+    const [toolItem] = persisted.modelRounds[0].toolItems;
+
+    expect(toolItem).toMatchObject({
+      toolName: 'CallDeferredTool',
+      toolCall: {
+        id: 'tool-1',
+        input: {
+          tool_name: 'WebFetch',
+          args: { url: 'https://example.test' },
+        },
+      },
+    });
+    expect(toolItem).not.toHaveProperty('effectiveToolName');
+    expect(toolItem).not.toHaveProperty('effectiveToolInput');
+  });
+
+  it('refuses to overwrite persistence with a completed mixed deferred identity', () => {
+    const turn = createDialogTurn('completed');
+    turn.modelRounds[0].items = [{
+      id: 'tool-broken',
+      type: 'tool',
+      toolName: 'CallDeferredTool',
+      toolCall: {
+        id: 'tool-broken',
+        input: { name: 'Plan', overview: 'Overview', plan: '# Plan' },
+      },
+      status: 'completed',
+      timestamp: 1001,
+      startTime: 1001,
+    }];
+
+    expect(() => convertDialogTurnToBackendFormat(turn, 0)).toThrow(
+      'Completed deferred tool is missing its wire invocation: tool-broken',
+    );
+  });
+
   it('coalesces non-terminal immediate saves into a short latest-state window', async () => {
     const turn = createDialogTurn('processing');
     const context = createContext(turn);
@@ -226,14 +281,34 @@ describe('PersistenceModule', () => {
     immediateSaveDialogTurn(context, SESSION_ID, TURN_ID);
 
     await flushMicrotasks();
-    expect(saveSessionTurn).not.toHaveBeenCalled();
+    expect(mockSaveSessionTurn).not.toHaveBeenCalled();
 
     await vi.advanceTimersByTimeAsync(499);
-    expect(saveSessionTurn).not.toHaveBeenCalled();
+    expect(mockSaveSessionTurn).not.toHaveBeenCalled();
 
     await vi.advanceTimersByTimeAsync(1);
     await flushMicrotasks();
-    expect(saveSessionTurn).toHaveBeenCalledTimes(1);
+    expect(mockSaveSessionTurn).toHaveBeenCalledTimes(1);
+  });
+
+  it('checkpoints continuous streamed output without waiting for a quiet period', async () => {
+    const turn = createDialogTurn('processing');
+    const context = createContext(turn);
+
+    debouncedSaveDialogTurn(context, SESSION_ID, TURN_ID, 2000);
+    await vi.advanceTimersByTimeAsync(1000);
+    debouncedSaveDialogTurn(context, SESSION_ID, TURN_ID, 2000);
+    await vi.advanceTimersByTimeAsync(999);
+    expect(mockSaveSessionTurn).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(1);
+    await flushMicrotasks();
+    expect(mockSaveSessionTurn).toHaveBeenCalledTimes(1);
+
+    debouncedSaveDialogTurn(context, SESSION_ID, TURN_ID, 2000);
+    await vi.advanceTimersByTimeAsync(2000);
+    await flushMicrotasks();
+    expect(mockSaveSessionTurn).toHaveBeenCalledTimes(2);
   });
 
   it('flushes terminal turn saves immediately', async () => {
@@ -244,7 +319,7 @@ describe('PersistenceModule', () => {
     await vi.advanceTimersByTimeAsync(0);
     await flushMicrotasks();
 
-    expect(saveSessionTurn).toHaveBeenCalledTimes(1);
+    expect(mockSaveSessionTurn).toHaveBeenCalledTimes(1);
     expect(context.saveDebouncers.size).toBe(0);
   });
 
@@ -258,11 +333,11 @@ describe('PersistenceModule', () => {
     await saveDialogTurnToDisk(context, SESSION_ID, TURN_ID);
     await flushMicrotasks();
 
-    expect(saveSessionTurn).toHaveBeenCalledTimes(1);
+    expect(mockSaveSessionTurn).toHaveBeenCalledTimes(1);
     expect(context.saveDebouncers.size).toBe(0);
 
     await vi.advanceTimersByTimeAsync(500);
     await flushMicrotasks();
-    expect(saveSessionTurn).toHaveBeenCalledTimes(1);
+    expect(mockSaveSessionTurn).toHaveBeenCalledTimes(1);
   });
 });

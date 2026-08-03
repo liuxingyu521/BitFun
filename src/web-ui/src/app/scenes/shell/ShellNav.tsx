@@ -244,10 +244,10 @@ const ShellNav: React.FC = () => {
   }, [deleteEntry, t]);
 
   return (
-    <div className="bitfun-shell-nav" data-testid="shell-panel">
-      <div className="bitfun-shell-nav__header">
+    <div data-bf-component="shell-nav" data-bf-part="root" className="bitfun-shell-nav" data-testid="shell-panel">
+      <div data-bf-component="shell-nav" data-bf-part="header" className="bitfun-shell-nav__header">
         <div className="bitfun-shell-nav__title-group">
-          <span className="bitfun-shell-nav__title" data-testid="shell-panel-title">{t('nav.shell.title')}</span>
+          <span data-bf-component="shell-nav" data-bf-part="title" className="bitfun-shell-nav__title" data-testid="shell-panel-title">{t('nav.shell.title')}</span>
           <ShellNavWorkspaceSwitcher
             workspaceName={workspaceName}
             hasMultipleWorkspaces={hasMultipleWorkspaces}
@@ -262,8 +262,8 @@ const ShellNav: React.FC = () => {
             onSelectWorkspace={handleSelectWorkspace}
           />
         </div>
-        <div className="bitfun-shell-nav__header-actions" ref={menuRef}>
-          <div className={`bitfun-shell-nav__split-button${menuOpen ? ' is-active' : ''}`}>
+        <div data-bf-component="shell-nav" data-bf-part="headerActions" className="bitfun-shell-nav__header-actions" ref={menuRef}>
+          <div data-bf-component="shell-nav" data-bf-part="splitButton" data-bf-state={menuOpen ? 'active' : undefined} className={`bitfun-shell-nav__split-button${menuOpen ? ' is-active' : ''}`}>
             <Tooltip content={t('nav.shell.actions.newTerminal')} placement="bottom">
               <button
                 type="button"
@@ -287,9 +287,11 @@ const ShellNav: React.FC = () => {
           </div>
 
           {menuOpen ? (
-            <div className="bitfun-shell-nav__dropdown-menu" role="menu">
+            <div data-bf-component="shell-nav" data-bf-part="menu" className="bitfun-shell-nav__dropdown-menu" role="menu">
               {shellMenuItems.map((shell) => (
                 <button
+                  data-bf-component="shell-nav"
+                  data-bf-part="menuItem"
                   key={shell.key}
                   type="button"
                   className="bitfun-shell-nav__dropdown-item"
@@ -301,7 +303,7 @@ const ShellNav: React.FC = () => {
                 </button>
               ))}
               {shellMenuItems.length > 0 ? <div className="bitfun-shell-nav__dropdown-separator" /> : null}
-              <button type="button" className="bitfun-shell-nav__dropdown-item" role="menuitem" onClick={() => { setMenuOpen(false); void handleRefresh(); }}>
+              <button type="button" data-bf-component="shell-nav" data-bf-part="menuItem" className="bitfun-shell-nav__dropdown-item" role="menuitem" onClick={() => { setMenuOpen(false); void handleRefresh(); }}>
                 <RefreshCw size={14} />
                 <span>{t('nav.shell.actions.refresh')}</span>
               </button>
@@ -311,10 +313,12 @@ const ShellNav: React.FC = () => {
       </div>
 
       <div
+        data-bf-component="shell-nav"
+        data-bf-part="content"
         className={`bitfun-shell-nav__sections${!hasVisibleContent ? ' bitfun-shell-nav__sections--empty' : ''}`}
       >
         {hasVisibleContent ? (
-          <div className="bitfun-shell-nav__terminal-list" data-testid="shell-command-list">
+          <div data-bf-component="shell-nav" data-bf-part="list" className="bitfun-shell-nav__terminal-list" data-testid="shell-command-list">
             {entries.map((entry) => (
               <ShellNavEntryItem
                 key={entry.sessionId}
@@ -331,7 +335,7 @@ const ShellNav: React.FC = () => {
             ))}
           </div>
         ) : (
-          <div className="bitfun-shell-nav__empty">
+          <div data-bf-component="shell-nav" data-bf-part="empty" className="bitfun-shell-nav__empty">
             <p className="bitfun-shell-nav__empty-message">
               {t('nav.shell.empty.all')}
             </p>

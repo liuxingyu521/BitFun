@@ -141,8 +141,7 @@
 | 工作区创建 ACP 会话 | `nav-workspace-menu-create-acp-session` | 重复项。配合 `data-acp-client-id` 使用。 |
 | 工作区创建 Init 会话 | `nav-workspace-menu-create-init-session` | 启动 AGENTS.md/init 会话。 |
 | 工作区相关路径 | `nav-workspace-menu-related-paths` | 打开相关路径对话框。 |
-| 工作区新建 worktree | `nav-workspace-menu-new-worktree` | 打开 worktree 创建对话框。 |
-| 工作区删除 worktree | `nav-workspace-menu-delete-worktree` | 删除关联 worktree 工作区。 |
+| 会话 worktree 开关 | `chat-input-worktree-toggle` | 会话输入框状态条，切换当前会话的 worktree 隔离。配合 `data-worktree-enabled` 使用。 |
 | 工作区复制路径 | `nav-workspace-menu-copy-path` | 复制工作区路径。 |
 | 工作区 reveal | `nav-workspace-menu-reveal` | 在文件管理器中显示工作区。 |
 | 工作区关闭 | `nav-workspace-menu-close` | 关闭工作区。 |
@@ -265,7 +264,7 @@
 | Appearance 语言选择器 | `appearance-language-select` | Appearance 中 language Select 的真实触发节点。 |
 | Appearance 语言选项 | `appearance-language-option` | 重复的语言下拉选项。包含 `data-locale-id`，并带有 Select 组件提供的 `data-selected`。 |
 | Appearance 主题选择器 | `appearance-theme-select` | Appearance 中 theme Select 的真实触发节点。 |
-| Appearance 主题选项 | `appearance-theme-option` | 重复的主题下拉选项。包含 `data-theme-id`，并带有 Select 组件提供的 `data-selected`。 |
+| Appearance 外观选项 | `appearance-palette-option` | 重复的外观下拉选项。包含 `data-appearance-id`，并带有 Select 组件提供的 `data-selected`。 |
 | Appearance UI 字号分组 | `appearance-ui-font-level-group` | UI font size 预置级别按钮组根节点。 |
 | Appearance UI 字号按钮 | `appearance-ui-font-level-btn` | 重复的 UI font size 预置级别按钮。包含 `data-font-level` 和 `data-selected`。 |
 | Appearance UI 自定义字号控制区 | `appearance-ui-font-custom-controls` | custom UI 字号控制区根节点，仅在 custom 激活时渲染。 |

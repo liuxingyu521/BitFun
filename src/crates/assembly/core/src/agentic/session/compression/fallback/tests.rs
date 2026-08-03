@@ -33,12 +33,15 @@ fn clears_tool_results_from_compressed_history() {
             }),
             raw_arguments: None,
             is_error: false,
+            parse_error: None,
             recovered_from_truncation: false,
+            repair_kind: Default::default(),
         }],
     );
     let tool_result = Message::tool_result(ToolResult {
         tool_id: "tool_1".to_string(),
         tool_name: "Read".to_string(),
+        effective_tool_name: None,
         result: json!({"content": "ignored"}),
         result_for_assistant: Some("Read succeeded with file preview".to_string()),
         is_error: false,
@@ -164,7 +167,9 @@ fn groups_consecutive_assistant_messages_under_single_role_header() {
                     }),
                     raw_arguments: None,
                     is_error: false,
+                    parse_error: None,
                     recovered_from_truncation: false,
+                    repair_kind: Default::default(),
                 }],
             ),
             Message::assistant_with_tools(
@@ -179,7 +184,9 @@ fn groups_consecutive_assistant_messages_under_single_role_header() {
                     }),
                     raw_arguments: None,
                     is_error: false,
+                    parse_error: None,
                     recovered_from_truncation: false,
+                    repair_kind: Default::default(),
                 }],
             ),
             Message::assistant("Updated the styling changes.".to_string()),
@@ -225,6 +232,7 @@ fn renders_contract_facts_even_when_tool_results_are_cleared() {
         vec![vec![Message::tool_result(ToolResult {
             tool_id: "tool_1".to_string(),
             tool_name: "Read".to_string(),
+            effective_tool_name: None,
             result: json!({"content": "large output omitted"}),
             result_for_assistant: Some("large output omitted".to_string()),
             is_error: false,

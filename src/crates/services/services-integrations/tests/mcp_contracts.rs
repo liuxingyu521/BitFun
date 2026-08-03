@@ -1,8 +1,12 @@
 #![cfg(feature = "mcp")]
 
 use async_trait::async_trait;
+use bitfun_services_integrations::mcp::auth::rmcp_compat::{
+    AuthorizationManager, CredentialStore, StoredCredentials,
+};
 use bitfun_services_integrations::mcp::auth::{
-    MCPRemoteOAuthCredentialVault, MCPRemoteOAuthSessionSnapshot, MCPRemoteOAuthStatus,
+    MCPRemoteOAuthCredentialStore, MCPRemoteOAuthCredentialVault, MCPRemoteOAuthSessionSnapshot,
+    MCPRemoteOAuthStatus,
 };
 use bitfun_services_integrations::mcp::config::ConfigLocation;
 use bitfun_services_integrations::mcp::config::{
@@ -10,7 +14,7 @@ use bitfun_services_integrations::mcp::config::{
     get_mcp_remote_authorization_value, has_mcp_remote_authorization, has_mcp_remote_oauth,
     has_mcp_remote_xaa, merge_mcp_server_config_sources, normalize_mcp_authorization_value,
     parse_cursor_format, remove_mcp_authorization_keys, validate_mcp_json_config, MCPConfigService,
-    MCPConfigStore,
+    MCPConfigStore, MCPImportError, MCPImportServer, MCPImportTransport,
 };
 use bitfun_services_integrations::mcp::protocol::{
     create_initialize_request, create_mcp_client_info, create_ping_request,
@@ -25,8 +29,9 @@ use bitfun_services_integrations::mcp::server::{
     compute_mcp_backoff_delay, detect_mcp_list_changed_kind, is_mcp_auth_error_message,
     mcp_reconnect_runtime_decision, mcp_server_is_running, mcp_should_start_after_config_update,
     merge_mcp_remote_headers, MCPCatalogCache, MCPConnectionPool, MCPListChangedKind,
-    MCPReconnectRuntimeDecision, MCPRuntimeErrorKind, MCPRuntimeResult, MCPServerConfig,
-    MCPServerProcess, MCPServerRuntimeState, MCPServerStatus, MCPServerTransport, MCPServerType,
+    MCPProcessStartContext, MCPReconnectRuntimeDecision, MCPRuntimeErrorKind, MCPRuntimeResult,
+    MCPServerConfig, MCPServerRuntimeState, MCPServerStatus, MCPServerTimeouts, MCPServerTransport,
+    MCPServerType,
 };
 use bitfun_services_integrations::mcp::{
     build_mcp_tool_descriptor, build_mcp_tool_name, normalize_name_for_mcp,
@@ -35,7 +40,6 @@ use bitfun_services_integrations::mcp::{
     PromptAdapter, ResourceAdapter, MCP_TOOL_DELIMITER, MCP_TOOL_PREFIX,
 };
 use rmcp::model::{AnnotateAble, Annotations, Content, Icon, Meta, RawResource, ResourceContents};
-use rmcp::transport::auth::StoredCredentials;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -55,6 +59,8 @@ fn make_mcp_config(
         command: command.map(str::to_string),
         args: Vec::new(),
         env: HashMap::new(),
+        working_directory: None,
+        inherit_parent_environment: None,
         headers: HashMap::new(),
         url: url.map(str::to_string),
         auto_start: true,
@@ -63,7 +69,9 @@ fn make_mcp_config(
         capabilities: Vec::new(),
         settings: Default::default(),
         oauth: None,
+        oauth_enabled: None,
         xaa: None,
+        timeouts: MCPServerTimeouts::default(),
     }
 }
 
@@ -96,6 +104,20 @@ impl MCPConfigStore for InMemoryMCPConfigStore {
         self.values.lock().await.insert(key.to_string(), value);
         Ok(())
     }
+
+    async fn compare_and_set_config_value(
+        &self,
+        key: &str,
+        expected: Option<serde_json::Value>,
+        replacement: serde_json::Value,
+    ) -> MCPRuntimeResult<bool> {
+        let mut values = self.values.lock().await;
+        if values.get(key).cloned() != expected {
+            return Ok(false);
+        }
+        values.insert(key.to_string(), replacement);
+        Ok(true)
+    }
 }
 
 struct FailingMCPConfigStore;
@@ -111,6 +133,19 @@ impl MCPConfigStore for FailingMCPConfigStore {
     }
 
     async fn set_config_value(&self, key: &str, _value: serde_json::Value) -> MCPRuntimeResult<()> {
+        Err(
+            bitfun_services_integrations::mcp::MCPRuntimeError::configuration(format!(
+                "backend unavailable for {key}"
+            )),
+        )
+    }
+
+    async fn compare_and_set_config_value(
+        &self,
+        key: &str,
+        _expected: Option<serde_json::Value>,
+        _replacement: serde_json::Value,
+    ) -> MCPRuntimeResult<bool> {
         Err(
             bitfun_services_integrations::mcp::MCPRuntimeError::configuration(format!(
                 "backend unavailable for {key}"
@@ -180,6 +215,42 @@ fn mcp_protocol_capability_contract_matches_existing_default() {
             }
         })
     );
+}
+
+#[test]
+fn mcp_server_timeout_config_is_optional_positive_milliseconds() {
+    let timeouts = MCPServerTimeouts {
+        startup_ms: Some(250),
+        catalog_ms: Some(1_000),
+        execution_ms: Some(30_000),
+    };
+    timeouts.validate().expect("positive timeouts are valid");
+    assert_eq!(
+        serde_json::to_value(&timeouts).unwrap(),
+        serde_json::json!({
+            "startupMs": 250,
+            "catalogMs": 1_000,
+            "executionMs": 30_000,
+        })
+    );
+    assert!(MCPServerTimeouts {
+        execution_ms: Some(0),
+        ..Default::default()
+    }
+    .validate()
+    .is_err());
+    assert!(MCPServerTimeouts {
+        execution_ms: Some(9_007_199_254_740_991),
+        ..Default::default()
+    }
+    .validate()
+    .is_ok());
+    assert!(MCPServerTimeouts {
+        execution_ms: Some(9_007_199_254_740_992),
+        ..Default::default()
+    }
+    .validate()
+    .is_err());
 }
 
 #[test]
@@ -1003,6 +1074,110 @@ async fn mcp_config_service_orchestration_preserves_load_save_delete_contract() 
 }
 
 #[tokio::test]
+async fn external_mcp_import_is_atomic_disabled_and_idempotence_visible() {
+    let store = Arc::new(InMemoryMCPConfigStore::default());
+    let service = MCPConfigService::new(store.clone());
+    let snapshot = service.user_import_snapshot().await.unwrap();
+    service
+        .apply_user_import(
+            &snapshot.fingerprint,
+            vec![MCPImportServer {
+                native_id: "docs".to_string(),
+                candidate_id: "opencode:mcp:docs".to_string(),
+                behavior_version: "sha256:behavior-v1".to_string(),
+                display_name: "Docs".to_string(),
+                transport: MCPImportTransport::Local {
+                    command: "docs-mcp".to_string(),
+                    args: vec!["--stdio".to_string()],
+                },
+            }],
+        )
+        .await
+        .unwrap();
+
+    let stored = store.values.lock().await["mcp_servers"].clone();
+    assert_eq!(stored["mcpServers"]["docs"]["enabled"], false);
+    assert_eq!(stored["mcpServers"]["docs"]["autoStart"], false);
+    assert_eq!(
+        stored["mcpServers"]["docs"]["_bitfunImport"]["sourceCandidateId"],
+        "opencode:mcp:docs"
+    );
+    assert!(stored.get("_bitfunImportJournal").is_none());
+
+    let refreshed = service.user_import_snapshot().await.unwrap();
+    assert_eq!(refreshed.imports.len(), 1);
+    assert_eq!(refreshed.imports[0].native_id, "docs");
+    let stale = service
+        .apply_user_import(
+            &snapshot.fingerprint,
+            vec![MCPImportServer {
+                native_id: "other".to_string(),
+                candidate_id: "opencode:mcp:other".to_string(),
+                behavior_version: "sha256:behavior-v1".to_string(),
+                display_name: "Other".to_string(),
+                transport: MCPImportTransport::Remote {
+                    url: "https://example.com/mcp".to_string(),
+                },
+            }],
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(stale, MCPImportError::StaleConfiguration));
+}
+
+#[tokio::test]
+async fn stale_full_json_save_cannot_overwrite_a_concurrent_import() {
+    let store = Arc::new(InMemoryMCPConfigStore::default());
+    let service = MCPConfigService::new(store.clone());
+    let editor_snapshot = service.user_json_config_snapshot().await.unwrap();
+    let import_snapshot = service.user_import_snapshot().await.unwrap();
+
+    service
+        .apply_user_import(
+            &import_snapshot.fingerprint,
+            vec![MCPImportServer {
+                native_id: "docs".to_string(),
+                candidate_id: "opencode:mcp:docs".to_string(),
+                behavior_version: "sha256:behavior-v1".to_string(),
+                display_name: "Docs".to_string(),
+                transport: MCPImportTransport::Local {
+                    command: "private-command".to_string(),
+                    args: vec!["private-argument".to_string()],
+                },
+            }],
+        )
+        .await
+        .unwrap();
+
+    let replacement = serde_json::from_str(&editor_snapshot.json_config).unwrap();
+    let error = service
+        .replace_user_json_config(&editor_snapshot.fingerprint, replacement)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, MCPImportError::StaleConfiguration));
+    assert!(store.values.lock().await["mcp_servers"]["mcpServers"]["docs"].is_object());
+}
+
+#[test]
+fn import_debug_output_redacts_private_transport_values() {
+    let import = MCPImportServer {
+        native_id: "docs".to_string(),
+        candidate_id: "opencode:mcp:docs".to_string(),
+        behavior_version: "sha256:behavior-v1".to_string(),
+        display_name: "Docs".to_string(),
+        transport: MCPImportTransport::Local {
+            command: "private-command".to_string(),
+            args: vec!["private-argument".to_string()],
+        },
+    };
+
+    let rendered = format!("{import:?}");
+    assert!(!rendered.contains("private-command"));
+    assert!(!rendered.contains("private-argument"));
+    assert!(rendered.contains("argument_count"));
+}
+
+#[tokio::test]
 async fn mcp_config_service_keeps_load_failures_as_empty_baseline() {
     let service = MCPConfigService::new(Arc::new(FailingMCPConfigStore));
 
@@ -1149,7 +1324,7 @@ async fn mcp_dynamic_tool_provider_preserves_manifest_order_and_metadata_snapsho
 }
 
 #[tokio::test]
-async fn mcp_server_process_owner_preserves_unsupported_remote_transport_contract() {
+async fn mcp_runtime_state_owner_preserves_unsupported_remote_transport_contract() {
     let mut config = make_mcp_config(
         "remote-sse",
         ConfigLocation::User,
@@ -1159,23 +1334,37 @@ async fn mcp_server_process_owner_preserves_unsupported_remote_transport_contrac
     );
     config.transport = Some(MCPServerTransport::Sse);
 
-    let mut process = MCPServerProcess::new(
-        "remote-sse".to_string(),
-        "Remote SSE".to_string(),
-        MCPServerType::Remote,
+    let runtime = MCPServerRuntimeState::new();
+    runtime.register(&config).await.expect("register process");
+    assert_eq!(
+        runtime
+            .process_status("remote-sse")
+            .await
+            .expect("registered process status"),
+        MCPServerStatus::Uninitialized
     );
-    assert_eq!(process.status().await, MCPServerStatus::Uninitialized);
-    assert_eq!(process.server_type(), MCPServerType::Remote);
 
-    let error = process
-        .start_remote(std::env::temp_dir(), &config)
+    let error = runtime
+        .start_process(
+            &config,
+            MCPProcessStartContext::Remote {
+                data_dir: std::env::temp_dir(),
+            },
+        )
         .await
         .unwrap_err();
     assert_eq!(error.kind(), MCPRuntimeErrorKind::NotImplemented);
     assert!(error
         .to_string()
         .contains("Remote MCP transport 'sse' is not yet supported"));
-    assert_eq!(process.status().await, MCPServerStatus::Uninitialized);
+    assert_eq!(
+        runtime
+            .process_status("remote-sse")
+            .await
+            .expect("registered process status"),
+        MCPServerStatus::Uninitialized
+    );
+    assert!(runtime.process_connection("remote-sse").await.is_none());
 
     let pool = MCPConnectionPool::new();
     assert!(pool.get_all_server_ids().await.is_empty());
@@ -1412,6 +1601,20 @@ async fn mcp_runtime_state_owns_registry_runtime_config_and_reconnect_state() {
     config.auto_start = false;
 
     assert!(runtime.is_empty().await);
+    let error = runtime
+        .start_process(
+            &config,
+            MCPProcessStartContext::Remote {
+                data_dir: std::env::temp_dir(),
+            },
+        )
+        .await
+        .expect_err("local config must reject remote start context");
+    assert_eq!(error.kind(), MCPRuntimeErrorKind::Configuration);
+    assert!(error
+        .to_string()
+        .contains("does not match server type 'local'"));
+    assert!(runtime.is_empty().await);
 
     runtime
         .insert_runtime_config(config.clone())
@@ -1424,7 +1627,14 @@ async fn mcp_runtime_state_owns_registry_runtime_config_and_reconnect_state() {
 
     assert!(runtime.contains("runtime-only").await);
     assert_eq!(runtime.get_all_server_ids().await, vec!["runtime-only"]);
-    assert!(runtime.get_process("runtime-only").await.is_some());
+    assert_eq!(
+        runtime
+            .process_status("runtime-only")
+            .await
+            .expect("registered process status"),
+        MCPServerStatus::Uninitialized
+    );
+    assert!(runtime.process_connection("runtime-only").await.is_none());
     assert_eq!(
         runtime.get_all_statuses().await,
         vec![("runtime-only".to_string(), MCPServerStatus::Uninitialized)]
@@ -1571,6 +1781,8 @@ fn mcp_server_config_preserves_transport_defaults_and_validation_contract() {
         command: Some("npx".to_string()),
         args: vec!["server".to_string()],
         env: Default::default(),
+        working_directory: None,
+        inherit_parent_environment: None,
         headers: Default::default(),
         url: None,
         auto_start: true,
@@ -1579,7 +1791,9 @@ fn mcp_server_config_preserves_transport_defaults_and_validation_contract() {
         capabilities: Vec::new(),
         settings: Default::default(),
         oauth: None,
+        oauth_enabled: None,
         xaa: None,
+        timeouts: MCPServerTimeouts::default(),
     };
     assert_eq!(local.resolved_transport(), MCPServerTransport::Stdio);
     local.validate().expect("local stdio config is valid");
@@ -1606,6 +1820,86 @@ fn mcp_server_config_preserves_transport_defaults_and_validation_contract() {
 }
 
 #[test]
+fn mcp_server_config_preserves_an_optional_local_working_directory() {
+    let config: MCPServerConfig = serde_json::from_value(serde_json::json!({
+        "id": "external-local",
+        "name": "External local",
+        "type": "local",
+        "command": "node",
+        "args": ["server.js"],
+        "workingDirectory": "C:/workspace/project",
+        "autoStart": true,
+        "enabled": true,
+        "location": "built-in",
+        "capabilities": [],
+        "settings": {}
+    }))
+    .unwrap();
+
+    assert_eq!(
+        config.working_directory.as_deref(),
+        Some("C:/workspace/project")
+    );
+    assert_eq!(
+        serde_json::to_value(config).unwrap()["workingDirectory"],
+        "C:/workspace/project"
+    );
+}
+
+#[test]
+fn remote_mcp_oauth_can_be_explicitly_disabled_without_changing_legacy_default() {
+    let disabled: MCPServerConfig = serde_json::from_value(serde_json::json!({
+        "id": "remote-static-auth",
+        "name": "Remote static auth",
+        "type": "remote",
+        "transport": "streamable-http",
+        "url": "https://example.test/mcp",
+        "oauthEnabled": false,
+        "location": "built-in"
+    }))
+    .unwrap();
+    assert!(!disabled.remote_oauth_enabled());
+
+    let legacy: MCPServerConfig = serde_json::from_value(serde_json::json!({
+        "id": "remote-legacy",
+        "name": "Remote legacy",
+        "type": "remote",
+        "transport": "streamable-http",
+        "url": "https://example.test/mcp",
+        "location": "user"
+    }))
+    .unwrap();
+    assert!(legacy.remote_oauth_enabled());
+}
+
+#[test]
+fn local_mcp_can_disable_parent_environment_inheritance_without_changing_legacy_default() {
+    let restricted: MCPServerConfig = serde_json::from_value(serde_json::json!({
+        "id": "external-local",
+        "name": "External local",
+        "type": "local",
+        "command": "node",
+        "args": [],
+        "env": {"ALLOWED_TOKEN": "explicit"},
+        "inheritParentEnvironment": false,
+        "autoStart": true,
+        "enabled": true,
+        "location": "built-in"
+    }))
+    .unwrap();
+    assert!(!restricted.inherits_parent_environment());
+
+    let legacy = make_mcp_config(
+        "legacy-local",
+        ConfigLocation::User,
+        MCPServerType::Local,
+        Some("node"),
+        None,
+    );
+    assert!(legacy.inherits_parent_environment());
+}
+
+#[test]
 fn mcp_oauth_session_snapshot_preserves_camel_case_status_contract() {
     let snapshot = MCPRemoteOAuthSessionSnapshot::new(
         "remote-server",
@@ -1624,6 +1918,15 @@ fn mcp_oauth_session_snapshot_preserves_camel_case_status_contract() {
             "redirectUri": "http://127.0.0.1:49152/oauth/callback"
         })
     );
+}
+
+#[test]
+fn mcp_oauth_owner_exports_the_auth_primitives_needed_by_compatibility_facades() {
+    fn assert_credential_store<T: CredentialStore>() {}
+
+    assert_credential_store::<MCPRemoteOAuthCredentialStore>();
+    let _: Option<AuthorizationManager> = None;
+    let _: Option<StoredCredentials> = None;
 }
 
 #[tokio::test]
@@ -1677,6 +1980,8 @@ fn mcp_cursor_format_helpers_preserve_cursor_compatibility_contract() {
         command: None,
         args: Vec::new(),
         env: Default::default(),
+        working_directory: None,
+        inherit_parent_environment: None,
         headers: std::collections::HashMap::from([(
             "Authorization".to_string(),
             "Bearer token".to_string(),
@@ -1688,7 +1993,9 @@ fn mcp_cursor_format_helpers_preserve_cursor_compatibility_contract() {
         capabilities: Vec::new(),
         settings: Default::default(),
         oauth: None,
+        oauth_enabled: None,
         xaa: None,
+        timeouts: MCPServerTimeouts::default(),
     };
 
     assert_eq!(

@@ -5,6 +5,8 @@
  */
 
 import type { ReviewTargetEvidence, ReviewTeamRunManifest } from '@/shared/services/reviewTeamService';
+import type { AiErrorDetail } from '@/shared/ai-errors/aiErrorPresenter';
+import type { SessionExecutionTarget } from '@/infrastructure/api/service-api/WorktreeAPI';
 
 export type SessionKind = 'normal' | 'btw' | 'review' | 'deep_review' | 'miniapp' | 'subagent';
 export type PersistedSessionKind = 'standard' | 'subagent';
@@ -33,6 +35,7 @@ export interface SessionCustomMetadata extends Record<string, unknown> {
     sessionId?: string | null;
     turnId?: string | null;
     turnIndex?: number | null;
+    baseTitle?: string | null;
   } | null;
   lastFinishedAt?: number | null;
   titleSource?: SessionTitleSource | null;
@@ -75,6 +78,8 @@ export interface SessionMetadata {
   relationship?: SessionRelationship;
   todos?: any[];
   workspacePath?: string;
+  projectWorkspacePath?: string;
+  executionTarget?: SessionExecutionTarget;
   remoteConnectionId?: string;
   remoteSshHost?: string;
   /** Backend unified workspace identity field: localhost for local, SSH host for remote. */
@@ -148,6 +153,23 @@ export interface SessionList {
   version: string;
 }
 
+export interface SessionTurnCatalogEntry {
+  ordinal: number;
+  storageTurnIndex: number;
+  turnId?: string;
+  preview?: string;
+  previewTruncated: boolean;
+}
+
+export interface SessionTurnCatalog {
+  schemaVersion: number;
+  sessionId: string;
+  revision: string;
+  totalTurnCount: number;
+  complete: boolean;
+  entries: SessionTurnCatalogEntry[];
+}
+
 export interface DialogTurnData {
   turnId: string;
   turnIndex: number;
@@ -168,6 +190,8 @@ export interface DialogTurnData {
   status: TurnStatus;
   finishReason?: string;
   hasFinalResponse?: boolean;
+  error?: string;
+  errorDetail?: AiErrorDetail;
 }
 
 export interface DialogTurnTokenUsageData {
@@ -198,15 +222,31 @@ export interface ModelRoundData {
   endTime?: number;
   durationMs?: number;
   providerId?: string;
-  modelId?: string;
-  modelAlias?: string;
+  modelConfigId?: string;
+  effectiveModelName?: string;
   firstChunkMs?: number;
   firstVisibleOutputMs?: number;
   streamDurationMs?: number;
   attemptCount?: number;
+  attemptDiagnostics?: ModelRoundAttemptDiagnostic[];
   failureCategory?: string;
   tokenDetails?: unknown;
   status: string;
+}
+
+export interface ModelRoundAttemptDiagnostic {
+  attemptId: string;
+  attemptIndex: number;
+  category: string;
+  rawError?: string;
+  toolCalls?: ModelRoundAttemptToolDiagnostic[];
+}
+
+export interface ModelRoundAttemptToolDiagnostic {
+  toolId?: string;
+  toolName?: string;
+  rawArguments?: string;
+  validationError?: string;
 }
 
 export interface ModelRoundRenderHints {
@@ -270,6 +310,10 @@ export interface ToolResultData {
   result: any;
   success: boolean;
   resultForAssistant?: string;
+  imageAttachments?: Array<{
+    mime_type: string;
+    data_base64: string;
+  }>;
   error?: string;
   durationMs?: number;
 }

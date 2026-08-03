@@ -14,7 +14,9 @@ use crate::agentic::session;
 use crate::agentic::tools;
 use crate::infrastructure::ai::AIClientFactory;
 use crate::infrastructure::try_get_path_manager_arc;
+use crate::runtime_ownership::CoreRuntimeOwnership;
 use crate::service::token_usage::{TokenUsageService, TokenUsageSubscriber};
+use bitfun_product_capabilities::DeliveryProfile;
 
 /// Agentic runtime state shared by host adapters.
 #[derive(Clone)]
@@ -26,7 +28,43 @@ pub struct AgenticSystem {
 
 /// Initialize the agentic runtime and register the global coordinator.
 pub async fn init_agentic_system() -> Result<AgenticSystem> {
-    info!("Initializing agentic system");
+    init_agentic_system_for_profile(DeliveryProfile::ProductFull).await
+}
+
+/// Select the process-wide Agent delivery profile before any service reads the
+/// global tool registry.
+///
+/// Product composition roots call this before configuration canonicalization;
+/// later initialization verifies the same profile and rejects replacement.
+pub fn select_agentic_system_profile(delivery_profile: DeliveryProfile) -> Result<()> {
+    tools::registry::initialize_global_tool_registry_for_profile(delivery_profile)
+        .map(|_| ())
+        .map_err(anyhow::Error::msg)
+}
+
+/// Initialize the single process-wide agentic runtime for one product profile.
+pub async fn init_agentic_system_for_profile(
+    delivery_profile: DeliveryProfile,
+) -> Result<AgenticSystem> {
+    let path_manager = try_get_path_manager_arc()?;
+    let runtime_ownership = Arc::new(CoreRuntimeOwnership::embedded(
+        path_manager.as_ref(),
+        "embedded-host",
+    ));
+    init_agentic_system_for_profile_with_runtime_ownership(delivery_profile, runtime_ownership)
+        .await
+}
+
+/// Initializes one product runtime with an explicitly selected ownership
+/// deployment. First-party fixed-workspace hosts use this before protocol/UI
+/// readiness; public Agent Runtime contracts remain unchanged.
+pub async fn init_agentic_system_for_profile_with_runtime_ownership(
+    delivery_profile: DeliveryProfile,
+    runtime_ownership: Arc<CoreRuntimeOwnership>,
+) -> Result<AgenticSystem> {
+    info!("Initializing agentic system for profile {delivery_profile}");
+
+    select_agentic_system_profile(delivery_profile)?;
 
     let _ai_client_factory = AIClientFactory::get_global().await?;
 
@@ -54,11 +92,12 @@ pub async fn init_agentic_system() -> Result<AgenticSystem> {
 
     let tool_registry = tools::registry::get_global_tool_registry();
     let tool_state_manager = Arc::new(tools::pipeline::ToolStateManager::new(event_queue.clone()));
-    let tool_pipeline = Arc::new(tools::pipeline::ToolPipeline::new(
-        tool_registry,
-        tool_state_manager,
-        None,
-    ));
+    let permission_request_manager =
+        crate::product_runtime::core_permission_request_manager().map_err(anyhow::Error::msg)?;
+    let tool_pipeline = Arc::new(
+        tools::pipeline::ToolPipeline::new(tool_registry, tool_state_manager, None)
+            .with_permission_request_manager(permission_request_manager),
+    );
 
     let stream_processor = Arc::new(execution::StreamProcessor::new(event_queue.clone()));
     let round_executor = Arc::new(execution::RoundExecutor::new(
@@ -81,6 +120,7 @@ pub async fn init_agentic_system() -> Result<AgenticSystem> {
         tool_pipeline,
         event_queue.clone(),
         event_router.clone(),
+        runtime_ownership,
     ));
 
     coordination::ConversationCoordinator::set_global(coordinator.clone());

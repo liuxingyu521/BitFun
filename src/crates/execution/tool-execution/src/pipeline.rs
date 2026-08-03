@@ -1,6 +1,6 @@
 //! Provider-neutral tool pipeline planning helpers.
 
-use bitfun_events::ToolEventData;
+use bitfun_events::{ToolEventData, ToolEventIdentity, ToolImageAttachment};
 use dashmap::DashMap;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -38,7 +38,6 @@ pub enum ToolTaskStateKind {
     Waiting,
     Running,
     Streaming,
-    AwaitingConfirmation,
     Completed,
     Failed,
     Rejected,
@@ -54,10 +53,7 @@ impl ToolTaskStateKind {
     }
 
     pub fn is_cancellable(self) -> bool {
-        matches!(
-            self,
-            Self::Queued | Self::Waiting | Self::Running | Self::AwaitingConfirmation
-        )
+        matches!(self, Self::Queued | Self::Waiting | Self::Running)
     }
 
     pub fn starts_execution_timer(self) -> bool {
@@ -76,7 +72,6 @@ pub struct ToolStateCounts {
     pub waiting: usize,
     pub running: usize,
     pub streaming: usize,
-    pub awaiting_confirmation: usize,
     pub completed: usize,
     pub failed: usize,
     pub rejected: usize,
@@ -85,8 +80,7 @@ pub struct ToolStateCounts {
 
 #[derive(Debug, Clone)]
 pub struct ToolStateEventFacts {
-    pub tool_id: String,
-    pub tool_name: String,
+    pub identity: ToolEventIdentity,
     pub state: ToolStateEventKind,
 }
 
@@ -105,13 +99,10 @@ pub enum ToolStateEventKind {
     Streaming {
         chunks_received: usize,
     },
-    AwaitingConfirmation {
-        params: serde_json::Value,
-        timeout_at: Option<u64>,
-    },
     Completed {
         result: serde_json::Value,
         result_for_assistant: Option<String>,
+        image_attachments: Option<Vec<ToolImageAttachment>>,
         duration_ms: u64,
         queue_wait_ms: Option<u64>,
         preflight_ms: Option<u64>,
@@ -258,7 +249,6 @@ pub fn count_tool_states(states: impl IntoIterator<Item = ToolTaskStateKind>) ->
             ToolTaskStateKind::Waiting => counts.waiting += 1,
             ToolTaskStateKind::Running => counts.running += 1,
             ToolTaskStateKind::Streaming => counts.streaming += 1,
-            ToolTaskStateKind::AwaitingConfirmation => counts.awaiting_confirmation += 1,
             ToolTaskStateKind::Completed => counts.completed += 1,
             ToolTaskStateKind::Failed => counts.failed += 1,
             ToolTaskStateKind::Rejected => counts.rejected += 1,
@@ -276,58 +266,40 @@ pub fn sanitize_tool_result_for_event(result: &serde_json::Value) -> serde_json:
 }
 
 pub fn tool_state_event_data(facts: ToolStateEventFacts) -> ToolEventData {
-    let ToolStateEventFacts {
-        tool_id,
-        tool_name,
-        state,
-    } = facts;
+    let ToolStateEventFacts { identity, state } = facts;
 
     match state {
-        ToolStateEventKind::Queued { position } => ToolEventData::Queued {
-            tool_id,
-            tool_name,
-            position,
-        },
+        ToolStateEventKind::Queued { position } => ToolEventData::Queued { identity, position },
         ToolStateEventKind::Waiting { dependencies } => ToolEventData::Waiting {
-            tool_id,
-            tool_name,
+            identity,
             dependencies,
         },
         ToolStateEventKind::Running {
             params,
             timeout_seconds,
         } => ToolEventData::Started {
-            tool_id,
-            tool_name,
+            identity,
             params,
             timeout_seconds,
         },
         ToolStateEventKind::Streaming { chunks_received } => ToolEventData::Streaming {
-            tool_id,
-            tool_name,
+            identity,
             chunks_received,
         },
-        ToolStateEventKind::AwaitingConfirmation { params, timeout_at } => {
-            ToolEventData::ConfirmationNeeded {
-                tool_id,
-                tool_name,
-                params,
-                timeout_at,
-            }
-        }
         ToolStateEventKind::Completed {
             result,
             result_for_assistant,
+            image_attachments,
             duration_ms,
             queue_wait_ms,
             preflight_ms,
             confirmation_wait_ms,
             execution_ms,
         } => ToolEventData::Completed {
-            tool_id,
-            tool_name,
+            identity,
             result: sanitize_tool_result_for_event(&result),
             result_for_assistant,
+            image_attachments,
             duration_ms,
             queue_wait_ms,
             preflight_ms,
@@ -342,8 +314,7 @@ pub fn tool_state_event_data(facts: ToolStateEventFacts) -> ToolEventData {
             confirmation_wait_ms,
             execution_ms,
         } => ToolEventData::Failed {
-            tool_id,
-            tool_name,
+            identity,
             error,
             duration_ms,
             queue_wait_ms,
@@ -351,7 +322,7 @@ pub fn tool_state_event_data(facts: ToolStateEventFacts) -> ToolEventData {
             confirmation_wait_ms,
             execution_ms,
         },
-        ToolStateEventKind::Rejected => ToolEventData::Rejected { tool_id, tool_name },
+        ToolStateEventKind::Rejected => ToolEventData::Rejected { identity },
         ToolStateEventKind::Cancelled {
             reason,
             duration_ms,
@@ -360,8 +331,7 @@ pub fn tool_state_event_data(facts: ToolStateEventFacts) -> ToolEventData {
             confirmation_wait_ms,
             execution_ms,
         } => ToolEventData::Cancelled {
-            tool_id,
-            tool_name,
+            identity,
             reason,
             duration_ms,
             queue_wait_ms,
@@ -396,20 +366,50 @@ fn redact_data_url_in_json(value: &mut serde_json::Value) {
 mod tests {
     use super::ToolStateEventKind;
     use super::{sanitize_tool_result_for_event, tool_state_event_data, ToolStateEventFacts};
-    use bitfun_events::ToolEventData;
+    use bitfun_events::{ToolEventData, ToolEventIdentity};
     use serde_json::json;
+
+    #[test]
+    fn completed_event_preserves_image_attachments() {
+        let data = tool_state_event_data(ToolStateEventFacts {
+            identity: ToolEventIdentity::direct("tool-image-1", "view_image"),
+            state: ToolStateEventKind::Completed {
+                result: json!({ "path": "preview.png" }),
+                result_for_assistant: Some("Image attached".to_string()),
+                image_attachments: Some(vec![bitfun_events::ToolImageAttachment {
+                    mime_type: "image/png".to_string(),
+                    data_base64: "AAAA".to_string(),
+                }]),
+                duration_ms: 10,
+                queue_wait_ms: None,
+                preflight_ms: None,
+                confirmation_wait_ms: None,
+                execution_ms: Some(10),
+            },
+        });
+
+        let ToolEventData::Completed {
+            image_attachments, ..
+        } = data
+        else {
+            panic!("expected completed event");
+        };
+        let attachments = image_attachments.expect("image attachments");
+        assert_eq!(attachments[0].mime_type, "image/png");
+        assert_eq!(attachments[0].data_base64, "AAAA");
+    }
 
     #[test]
     fn completed_event_redacts_data_urls_recursively() {
         let data = tool_state_event_data(ToolStateEventFacts {
-            tool_id: "tool-1".to_string(),
-            tool_name: "Screenshot".to_string(),
+            identity: ToolEventIdentity::direct("tool-1", "Screenshot"),
             state: ToolStateEventKind::Completed {
                 result: json!({
                     "data_url": "data:image/png;base64,AAAA",
                     "nested": [{ "data_url": "data:image/png;base64,BBBB" }]
                 }),
                 result_for_assistant: Some("done".to_string()),
+                image_attachments: None,
                 duration_ms: 10,
                 queue_wait_ms: Some(1),
                 preflight_ms: None,
@@ -430,17 +430,16 @@ mod tests {
     #[test]
     fn rejected_state_maps_to_rejected_event() {
         let data = tool_state_event_data(ToolStateEventFacts {
-            tool_id: "tool-1".to_string(),
-            tool_name: "ExecCommand".to_string(),
+            identity: ToolEventIdentity::direct("tool-1", "ExecCommand"),
             state: ToolStateEventKind::Rejected,
         });
 
-        let ToolEventData::Rejected { tool_id, tool_name } = data else {
+        let ToolEventData::Rejected { identity } = data else {
             panic!("expected rejected event");
         };
 
-        assert_eq!(tool_id, "tool-1");
-        assert_eq!(tool_name, "ExecCommand");
+        assert_eq!(identity.tool_id, "tool-1");
+        assert_eq!(identity.tool_name, "ExecCommand");
     }
 
     #[test]

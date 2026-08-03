@@ -5,9 +5,11 @@ use bitfun_core::agentic::agents::{
     AgentInfo, CustomSubagent, CustomSubagentDetail, CustomSubagentKind, SubAgentSource,
     SubagentListScope, SubagentQueryContext,
 };
+use bitfun_core::service::config::SubagentModelSelection;
+use bitfun_core::service::remote_ssh::workspace_state::is_remote_path;
 use log::warn;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use tauri::State;
 
@@ -38,19 +40,48 @@ fn workspace_root_from_request(workspace_path: Option<&str>) -> Option<PathBuf> 
         .map(PathBuf::from)
 }
 
+async fn supports_local_external_sources(workspace_path: Option<&str>) -> bool {
+    match workspace_path {
+        Some(path) if !path.is_empty() => !is_remote_path(path).await,
+        _ => true,
+    }
+}
+
+fn reject_external_subagent_mutation(
+    state: &AppState,
+    subagent_id: &str,
+    workspace: Option<&std::path::Path>,
+) -> Result<(), String> {
+    if state
+        .agent_registry
+        .is_external_subagent_route(subagent_id, workspace)
+    {
+        return Err(
+            "external_subagent_read_only: manage external agents in External AI Apps".to_string(),
+        );
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn list_subagents(
     state: State<'_, AppState>,
     request: ListSubagentsRequest,
 ) -> Result<Vec<AgentInfo>, String> {
+    let external_sources_supported =
+        supports_local_external_sources(request.workspace_path.as_deref()).await;
     let workspace = workspace_root_from_request(request.workspace_path.as_deref());
+    let query_workspace = external_sources_supported
+        .then_some(workspace.as_deref())
+        .flatten();
     let list = state
         .agent_registry
         .get_subagents_for_query(&SubagentQueryContext {
             parent_agent_type: None,
-            workspace_root: workspace.as_deref(),
+            workspace_root: query_workspace,
             list_scope: SubagentListScope::RegistryManagement,
             include_disabled: true,
+            external_sources_supported,
         })
         .await;
 
@@ -70,14 +101,20 @@ pub async fn list_visible_subagents(
     state: State<'_, AppState>,
     request: ListVisibleSubagentsRequest,
 ) -> Result<Vec<AgentInfo>, String> {
+    let external_sources_supported =
+        supports_local_external_sources(request.workspace_path.as_deref()).await;
     let workspace = workspace_root_from_request(request.workspace_path.as_deref());
+    let query_workspace = external_sources_supported
+        .then_some(workspace.as_deref())
+        .flatten();
     Ok(state
         .agent_registry
         .get_subagents_for_query(&SubagentQueryContext {
             parent_agent_type: Some(request.parent_agent_type.as_str()),
-            workspace_root: workspace.as_deref(),
+            workspace_root: query_workspace,
             list_scope: SubagentListScope::TaskVisible,
             include_disabled: false,
+            external_sources_supported,
         })
         .await)
 }
@@ -87,14 +124,20 @@ pub async fn list_manageable_subagents(
     state: State<'_, AppState>,
     request: ListManageableSubagentsRequest,
 ) -> Result<Vec<AgentInfo>, String> {
+    let external_sources_supported =
+        supports_local_external_sources(request.workspace_path.as_deref()).await;
     let workspace = workspace_root_from_request(request.workspace_path.as_deref());
+    let query_workspace = external_sources_supported
+        .then_some(workspace.as_deref())
+        .flatten();
     Ok(state
         .agent_registry
         .get_subagents_for_query(&SubagentQueryContext {
             parent_agent_type: Some(request.parent_agent_type.as_str()),
-            workspace_root: workspace.as_deref(),
+            workspace_root: query_workspace,
             list_scope: SubagentListScope::RegistryManagement,
             include_disabled: true,
+            external_sources_supported,
         })
         .await)
 }
@@ -112,6 +155,7 @@ pub async fn get_subagent_detail(
     request: GetSubagentDetailRequest,
 ) -> Result<CustomSubagentDetail, String> {
     let workspace = workspace_root_from_request(request.workspace_path.as_deref());
+    reject_external_subagent_mutation(&state, &request.subagent_id, workspace.as_deref())?;
     state
         .agent_registry
         .get_custom_subagent_detail(&request.subagent_id, workspace.as_deref())
@@ -123,6 +167,7 @@ pub async fn get_subagent_detail(
 #[serde(rename_all = "camelCase")]
 pub struct DeleteSubagentRequest {
     pub subagent_id: String,
+    pub workspace_path: Option<String>,
 }
 
 #[tauri::command]
@@ -131,6 +176,8 @@ pub async fn delete_subagent(
     request: DeleteSubagentRequest,
 ) -> Result<(), String> {
     let subagent_id = request.subagent_id;
+    let workspace = workspace_root_from_request(request.workspace_path.as_deref());
+    reject_external_subagent_mutation(&state, &subagent_id, workspace.as_deref())?;
 
     let file_path = state
         .agent_registry
@@ -141,22 +188,6 @@ pub async fn delete_subagent(
         if let Err(e) = std::fs::remove_file(path) {
             warn!("Failed to delete subagent file: path={}, error={}", path, e);
         }
-    }
-
-    let config_service = &state.config_service;
-    let mut agent_models: HashMap<String, String> = config_service
-        .get_config(Some("ai.agent_models"))
-        .await
-        .unwrap_or_default();
-    agent_models.remove(&subagent_id);
-    if let Err(e) = config_service
-        .set_config("ai.agent_models", &agent_models)
-        .await
-    {
-        warn!(
-            "Failed to clean up ai.agent_models: subagent_id={}, error={}",
-            subagent_id, e
-        );
     }
 
     if let Err(e) = bitfun_core::service::config::reload_global_config().await {
@@ -193,6 +224,7 @@ pub async fn update_subagent(
         return Err("Prompt cannot be empty".to_string());
     }
     let workspace = workspace_root_from_request(request.workspace_path.as_deref());
+    reject_external_subagent_mutation(&state, &request.subagent_id, workspace.as_deref())?;
     state
         .agent_registry
         .update_custom_subagent_definition(
@@ -402,6 +434,8 @@ pub struct UpdateSubagentConfigRequest {
     pub parent_agent_type: Option<String>,
     pub enabled: Option<bool>,
     pub model: Option<String>,
+    #[serde(default)]
+    pub clear_model_override: bool,
     pub workspace_path: Option<String>,
 }
 
@@ -419,12 +453,17 @@ pub async fn update_subagent_config(
 ) -> Result<UpdateSubagentConfigResponse, String> {
     let subagent_id = &request.subagent_id;
     let workspace = workspace_root_from_request(request.workspace_path.as_deref());
+    reject_external_subagent_mutation(&state, subagent_id, workspace.as_deref())?;
     if let Some(workspace) = workspace.as_deref() {
         state.agent_registry.load_custom_subagents(workspace).await;
     }
 
     let mut availability_updated = false;
     let mut model_updated = false;
+
+    if request.model.is_some() && request.clear_model_override {
+        return Err("model and clearModelOverride cannot be provided together".to_string());
+    }
 
     if let Some(enabled) = request.enabled {
         let parent_agent_type = request.parent_agent_type.as_deref().ok_or_else(|| {
@@ -448,12 +487,13 @@ pub async fn update_subagent_config(
         .get_custom_subagent_config(subagent_id, workspace.as_deref())
         .is_some()
     {
-        if request.model.is_some() {
+        if request.model.is_some() || request.clear_model_override {
             state
                 .agent_registry
                 .update_and_save_custom_subagent_config(
                     subagent_id,
                     request.model,
+                    request.clear_model_override,
                     workspace.as_deref(),
                 )
                 .map_err(|e| format!("Failed to update configuration: {}", e))?;
@@ -484,14 +524,29 @@ pub async fn update_subagent_config(
 
         let config_service = &state.config_service;
 
-        if let Some(model) = request.model {
-            let mut agent_models: HashMap<String, String> = config_service
-                .get_config(Some("ai.agent_models"))
-                .await
-                .unwrap_or_default();
-            agent_models.insert(subagent_id.clone(), model);
+        if request.clear_model_override || request.model.is_some() {
+            let mut builtin_models: std::collections::HashMap<String, SubagentModelSelection> =
+                config_service
+                    .get_config(Some("ai.agent_model_defaults.subagents.builtin"))
+                    .await
+                    .unwrap_or_default();
+            if request.clear_model_override {
+                builtin_models.remove(subagent_id);
+            } else {
+                let model = request
+                    .model
+                    .as_deref()
+                    .expect("model checked above")
+                    .trim();
+                let selection = if model == "inherit" {
+                    SubagentModelSelection::Inherit
+                } else {
+                    SubagentModelSelection::fixed(model)
+                };
+                builtin_models.insert(subagent_id.clone(), selection);
+            }
             config_service
-                .set_config("ai.agent_models", &agent_models)
+                .set_config("ai.agent_model_defaults.subagents.builtin", &builtin_models)
                 .await
                 .map_err(|e| format!("Failed to update model configuration: {}", e))?;
             model_updated = true;

@@ -1,6 +1,6 @@
 ---
 name: ppt-design
-description: 使用 HTML 设计与生成高质量演讲幻灯片（PPT/Deck）。当用户希望生成、设计、修改幻灯片、deck、slides、presentation、汇报、提案、pitch、课件时触发。主干：960×540pt 可编辑 HTML 幻灯片（4 条 OOXML 硬约束）+ 可选 1920×1080 高保真演讲版 + 数据/信息可视化意识 + 5 种设计哲学 + 反 AI slop + 单页自包含 `slide-XX.html`。不生图；缺图用版式/SVG/占位并标注建议补图。
+description: 使用 HTML 设计与生成高质量演讲幻灯片（PPT/Deck）。当用户希望生成、设计、修改幻灯片、deck、slides、presentation、汇报、提案、pitch、课件时触发。主干：1280×720px 可编辑 HTML 幻灯片 + 唯一 editable HTML→EditableSlideScene→OOXML 管线 + 数据/信息可视化意识 + 5 种设计哲学 + 反 AI slop + 单页自包含 `slide-XX.html`。不生图；缺图用可编辑原语或占位并标注建议补图。
 license: MIT
 ---
 
@@ -12,11 +12,11 @@ license: MIT
 
 ## 项目约定
 
-`{{ppt_project_dir}}` 为当前 deck 根目录，**只在此目录读写**。
+Agent 启动时的**当前工作区根目录就是当前 deck 根目录**，不是待替换的模板变量，也不是工作区下另建的同名子目录。所有交付路径都相对当前工作区根目录，且**只在此工作区读写**。
 
 - **页文件**：`slides/slide-01.html` …（两位数编号，与 `outline[].slide_id` 对应）
-- **大纲**：`project.json` → `outline[]`：`{ id, title, bullets[], slide_id }`
-- **品牌图**：`brand/`
+- **大纲**：`project.json` → `outline[]`：`{ id, title, bullets[], slide_id }`；规划时 `status: "planning"`，仅在全部引用页面完整写入后改为 `status: "complete"`
+- **品牌图输入**：可放 `brand/` 供读取，但写入 slide 时必须转为允许的内联 base64 raster；HTML 不得引用该目录路径
 
 ## 核心原则（严格遵守）
 
@@ -47,24 +47,47 @@ license: MIT
 
 - 每页 **一个核心结论**；标题用 **断言句**（✗「Q3 营收」 ✓「Q3 营收增长 23%」）
 - 正文 ≤3 层；字号：标题 36–48pt、副 18–24pt、正文 14–18pt、注解 10–12pt
-- **留白优先**，宁可拆页
+- **留白优先**，宁可拆页；正常主题不要为“显得丰富”而堆满屏元素（会显著拖慢生成）
+- 只有用户明确要求高密度 / 压力测试 / 故意溢出时，才提高元素密度
 
 ### 5. 缺图（不生图）
 
-1. 文字+留白完成信息 → 2. SVG/Unicode 几何 → 3. outline 标注 `[建议补图：…]`，图进 `brand/`
+1. 文字+留白完成信息 → 2. preset shape/line/Unicode 等可编辑原语 → 3. outline 标注 `[建议补图：…]`。不得用外部图片、SVG 整图或截图补位。
 
 ## 画布与交付目标
 
-**默认（可编辑 PPTX + 本仓库 PPT 生成）**：`body { width: 960pt; height: 540pt; }`，全程遵守 `references/editable-pptx.md` 四条硬约束。
+**默认（PPT Live + 可编辑 PPTX）**：画布严格为 **1280px × 720px**，写作 `body { width: 1280px; height: 720px; }`。不得使用其他画布尺寸、响应式画布或缩放替代。
 
-| 用户目标 | HTML 怎么写 |
-|----------|----------------|
-| 要在 PowerPoint 里改字 | 960×540pt + 四条硬约束；写时遵守 editable-pptx 规则 |
-| 只要演讲/视觉自由、不改 pptx | 可用 1920×1080px；复杂 CSS/渐变可保留 |
-| 既要复杂视觉又要可改字 pptx | **不可兼得**——说明限制；保留 1920 演讲版或另做简化 960 版 |
+### Authoring subset（生成规则）
+
+- 唯一导出链路是 **editable HTML → EditableSlideScene → OOXML**。每页严格为 **1280px × 720px**，不得建议或设计第二条导出链路。
+- 只使用 solid color；不得生成 CSS gradient 或 `background-image`。背景、border、圆角只放在 `div` 等几何容器，文字标签不得承载 background、border 或 shadow。
+- `box-shadow` 只支持单层 outer、非 inset、zero spread 的原生映射；多层 shadow 只取首个可用层，负 spread 按 0 近似，inset 等其余不支持形态导出时自动移除，不得依赖。`text-shadow` 任何非 `none` 形态在导出时一律自动移除，不得依赖其呈现层次。
+- HTML 文字只可放在 `<p>`、`<h1>`–`<h6>`、`<li>` 中；`span` 只作这些标签内的文本 run，不得生成 `div` 裸文字。
+- 禁止 CSS `filter`、`mask`、generated content、animation、外部资源和复杂/filled SVG path；禁止任意顶点/非严格对称 polygon，仅允许严格对称 triangle/diamond。
+- 线与曲线优先直接生成 `line` 或 `polyline`；只有确有必要时才写兼容边界所列的 path 子集。
+- Authoring 流程箭头只由 editable line + CSS border triangle，或 SVG line + strict symmetric triangle polygon 构成。
+- 表格必须是真实 `<table>` 并导出为 native `a:tbl`；图表、流程箭头、虚线和曲线必须使用支持的可编辑原语。
+- intentional 图片只允许内联 base64 PNG、JPEG、WebP，且不得承载文字、图表或几何；禁止 GIF，因为无法证明其为静态内容。
+- 禁止任何正向 rasterize、screenshot 或 fallback 建议；无法表示时停止生成并报告具体元素。
+
+### Converter legacy rewrite boundary（兼容边界，不是生成建议）
+
+- 本边界只用于兼容既有输入，不是生成许可；authoring agent 仍必须遵守上面的更严格 subset。
+- SVG `text` 是 converter 支持的 SVG 原语；`div` 裸文字仅属 repair 兼容，authoring 不应生成。
+- path 仅支持 `M/L/H/V/C/S/Q/T/Z`，必须 `fill:none`；`Z` 可以闭合 path，但拒绝 `A` 和任何 path/ancestor `transform`。
+- `C/S/Q/T` 曲线由 converter 采样为多段 editable line，不是 PowerPoint curve；authoring 优先 `line`/`polyline`，确需 path 时才使用上述子集。
+- SVG polygon 只识别严格对称的 triangle 和 diamond；任意顶点或非严格对称 polygon 都会被拒绝。
+- legacy CSS 仅兼容受限 `linear-gradient`：角度接受 `deg`、`turn`、`rad`、`grad` 与方向关键字；位置只接受 percentage stop，缺省 stop 均匀分配。
+- converter 拒绝 `radial-gradient`、px/em stop、double-position stop、color hint、不支持颜色和非法 alpha；合法 gradient 被采样为 editable solid strips，这不是生成建议。
+- legacy 单层 hard ring `box-shadow`（`0 0 0 Npx`、非 inset、blur=0）会被重写为同心可编辑 shape；authoring 仍应优先 zero-spread outer shadow，不得依赖 ring rewrite。
+
+<!-- End editable contract -->
+
+`references/editable-pptx.md` 是完整约束；其他 references 与 style presets 只提供视觉意图，冲突时本 authoring contract 优先。
 
 ```
-{{ppt_project_dir}}/
+当前工作区根目录/
 ├── project.json      # outline[], slide_order[], style, assumptions
 ├── brand/
 ├── slides/slide-XX.html
@@ -72,15 +95,15 @@ license: MIT
 └── versions/         # 系统快照
 ```
 
-架构选型（多文件 vs 单文件 deck-stage）、聚合 `index.html`、grammar showcase → `references/slide-decks.md`。
+架构选型（多文件 vs 单文件 deck-stage）、聚合 `index.html`、grammar showcase → `references/slide-decks.md`；其中可编辑交付同样强制 1280×720 editable-only 契约。
 
 ## 防溢出预算（写前心算，一次写对）
 
-溢出 = 渲染后内容超出 960×540pt 画布，是最常见的硬伤。写每页 HTML 前先做**垂直预算心算**，一次写对：
+溢出 = 渲染后内容超出 1280×720px 画布，是最常见的硬伤。写每页 HTML 前先做**垂直预算心算**，一次写对：
 
-- 可用高度恒等式：`540pt = 标题区 + 正文区 + 底部脚注 + 安全边距`。标题区按 70–95pt、脚注行按 20–25pt、**底部安全边距 ≥ 36pt（0.5in，PPTX 导出校验线）** 预留，正文区实际只有约 **390–420pt**。
+- 可用高度恒等式：`720px = 标题区 + 正文区 + 底部脚注 + 安全边距`。标题区按 93–127px、脚注行按 27–33px、**底部安全边距 ≥ 48px（0.5in，PPTX 导出校验线）** 预留，正文区实际只有约 **520–560px**。
 - 预算估算法：正文每行 ≈ `font-size × line-height`（如 12px × 1.5 ≈ 13.5pt/行）；表格每行 ≈ 字号 + 上下 padding；卡片 = 内容行数 × 行高 + padding × 2 + 间距。**所有块的预算之和必须 ≤ 正文区高度**，估不下就删行、合栏或拆页，禁止靠缩字号硬塞。
-- 兜底结构：`body { overflow: hidden; }`，根容器 `display: flex; flex-direction: column; height: 540pt;`，可伸缩区给 `flex: 1; min-height: 0; overflow: hidden;`——即使估错也只在容器内裁切，不撑破画布。
+- 兜底结构：`body { overflow: hidden; }`，根容器 `display: flex; flex-direction: column; height: 720px;`，可伸缩区给 `flex: 1; min-height: 0; overflow: hidden;`——即使估错也只在容器内裁切，不撑破画布。
 - 高风险元素单独检查：满版表格（行数 × 行高先算再写）、多行卡片网格、长 bullet 列表、流程图标注。一个元素预算超了就整体减行，而不是指望浏览器挤一挤。
 - 任何文本框（>12px 字号）的底边必须离画布底部 ≥ 0.5in，否则 PPTX 导出会判为越界。
 
@@ -121,8 +144,8 @@ license: MIT
 - 一个主视觉通常更利于聚焦，但对仪表盘、对照分析、教学拆解等页面可使用多个协调视图。
 - 数据图应说明单位、时间、口径、来源或「估算」；没有可靠数字时不得编造。
 - 用强调色引导结论，但保持全 deck 的对象颜色与视觉语义一致。
-- 3D 图、表盘、雷达图、图标阵列等并非绝对禁用；只有在它们确实改善理解且不扭曲数据时使用。
-- 可编辑 PPTX 的 CSS gradient 等限制是技术硬约束；复杂图形无法稳定转译时，可简化、换表达，或仅用于 1920 HTML 演讲版。
+- 只选择能由受支持的 editable shape、line、table 和文本组成的图表；表现形式不得以 3D、复杂 path、图片化图表或其他不可映射视觉为前提。
+- 可编辑 PPTX 的表示范围是技术硬约束；复杂图形必须改写为受支持的 shape、line、table 和文本组合，无法表示时停止生成并报告具体元素，不得转图片或建议 fallback。
 - 更多选择思路、信息图模式和实现提示 → `references/data-information-visualization.md`；把它当作设计词汇库，不是逐条执行清单。
 
 ## 5 种风格
@@ -141,8 +164,8 @@ DNA 与样例 → `references/design-styles.md`。
 
 当输入里出现 `style.stylePreset`（或用户点名某个预设名）时，按以下流程套用预设：
 
-1. `Read references/style-presets/<stylePreset>.md`（路径相对本 skill 目录）。文件定义该预设的视觉系统、配色、排版、推荐版式、CSS 实现要点与禁忌，**必须逐条落实到每页 HTML**。
-2. 预设只接管「视觉身份」：配色、字体气质、装饰语言、版式偏好。本 skill 的核心原则全部继续生效——断言式标题、单页一结论、信息密度、反 AI slop、960×540pt 画布、可编辑 PPTX 四条硬约束、不许溢出。
+1. **优先用已给样式，不要默认 Read**：若输入已含 `style.palette`（或 MiniApp/宿主已写入完整 style），**禁止**再 `Read references/style-presets/*`；直接用 palette + 下表「一句话 DNA」落地视觉身份。只有输入没有可用 palette、且用户明确点名预设、你确实需要完整视觉细则时，才允许一次 `Read references/style-presets/<stylePreset>.md`。
+2. 预设只接管「视觉身份」：配色、字体气质、装饰语言、版式偏好。本 skill 的核心原则全部继续生效——断言式标题、单页一结论、信息密度、反 AI slop、1280×720px 画布、可编辑 authoring contract、不许溢出（用户明确要求压力测试/故意溢出时除外）。
 3. 从上面 5 种设计哲学中选最接近的一种作为版式骨架（structural grammar），预设负责皮肤；两者冲突时以信息传达优先、弱化装饰。
 4. 预设文件缺失或 key 未知时，回退到 5 种哲学中最接近的一种，并沿用输入提供的 palette。
 
@@ -161,15 +184,17 @@ DNA 与样例 → `references/design-styles.md`。
 
 ## 工作流
 
-1. **假设 + 纲**：更新 `project.json` 的 `outline[]` / `slide_order`；顺带识别可能受益于图表、图示或更强视觉表达的页面，先不批量写 HTML。**若主题涉及技术方案/工程/系统/项目分析，必须在 outline 阶段就识别出哪些页是「系统组成」「处理流程」「多角色协作」「根因分析」，并标注用架构图/流程图/泳道图/因果链**（参考上方「技术方案类内容的特别触发」）。
-2. **≥5 页先打样**：做 2 页视觉差异最大的 showcase，定 grammar 再批量（见 slide-decks.md）。
-3. **逐页 HTML**：封面 `slide-01`（标题/副标题/作者或日期）→ 按 outline 生成其余页；根据内容与风格自由选择图表、图示、文字、图片或混合构图，每页完整内联 CSS。**写每页时一次写对**：写之前先做垂直预算心算（见「防溢出预算」），写的时候同时遵守四条 OOXML 硬约束（文字用 p/h\* 包裹、纯色无渐变、背景/边框只在 DIV、不用 background-image），写完即止。
-4. **禁止事后审计**：所有页面写完后**不得**再回头逐页 Read → Edit 返工，也不得用 Grep 批量检查约束。约束在写时遵守，不事后补救。写完最后一页后直接输出完成总结即可。
+**速度优先**：模型回合很贵。Skill 返回后**下一轮工具必须是 Write `project.json`**（完整 outline）；禁止先 Read seed/`project.json`、禁止先读 style-presets（见上）、禁止长篇规划思考。不要为审计 Read/Grep/Glob 已写页面。
+
+1. **立刻落盘大纲（优先于研究）**：Skill 后马上 Write `project.json`（`status: "planning"` + 完整 `outline[]` / `slide_order`），再研究或写页。UI 依赖大纲显示进度。**若主题涉及技术方案/工程/系统/项目分析，必须在 outline 阶段就识别出哪些页是「系统组成」「处理流程」「多角色协作」「根因分析」，并标注用架构图/流程图/泳道图/因果链**（参考上方「技术方案类内容的特别触发」）。
+2. **按需研究**：仅当用户提供 URL、明确要求事实核验，或主题依赖外部时效数据时才 WebSearch / WebFetch；否则跳过研究，直接写页。不要为“显得认真”而默认检索。
+3. **直接按 outline 写页（不要额外 showcase 轮）**：封面 `slide-01` → 其余页。每轮并行 Write **2 页** HTML（单页过大时降到 1 页）。**不要**先做「2 页打样再批量」的额外回合。正常主题保持一页一结论与可编辑原语；只有用户明确要求高密度/压力测试/故意溢出时才拉满元素。**写每页时一次写对**：写之前先做垂直预算心算（见「防溢出预算」），写完即止。
+4. **同轮收尾**：写完最后一批页面时，**同一轮工具调用里**再 Write/Edit `project.json` 把 `status` 设为 `"complete"` 并结束。禁止单独开一轮只做 Glob/LS/Edit。缺文件只补缺失页，不做逐页内容审计。
 5. **改稿范围**（输入里若有 `scope`）：
    - `deck`：可改 outline 与任意 `slides/*.html`
    - `current_slide` / `slide_index`：**只改指定页**，不动其他 slide 文件
 
-## 单页模板（960×540pt · Pentagram）
+## 单页模板（1280×720px · Pentagram）
 
 ```html
 <!DOCTYPE html>
@@ -178,7 +203,7 @@ DNA 与样例 → `references/design-styles.md`。
 <style>
   *,*::before,*::after { margin:0; padding:0; box-sizing:border-box; }
   body {
-    width: 960pt; height: 540pt;
+    width: 1280px; height: 720px;
     font-family: system-ui, -apple-system, "PingFang SC", "Source Han Sans SC", sans-serif;
     background: #FAFAF7; color: #1A1A1A;
     overflow: hidden; position: relative;
@@ -202,7 +227,7 @@ DNA 与样例 → `references/design-styles.md`。
 </body></html>
 ```
 
-可编辑 PPTX 四条、合并文本框 `data-pptx-merge`、常见错误 → `references/editable-pptx.md`。
+可编辑 PPTX 完整 authoring contract、合并文本框 `data-pptx-merge`、常见错误 → `references/editable-pptx.md`。
 
 ## 多轮编辑
 

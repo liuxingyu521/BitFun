@@ -1,15 +1,16 @@
 import { agentAPI, btwAPI } from '@/infrastructure/api';
 import { notificationService } from '@/shared/notification-system';
 import { flowChatStore } from '../store/FlowChatStore';
-import { SessionExecutionEvent, stateMachineManager } from '../state-machine';
+import { stateMachineManager } from '../state-machine';
 import { flowChatManager } from './FlowChatManager';
-import type { DialogTurn, Session } from '../types/flow-chat';
+import type { Session } from '../types/flow-chat';
 import type { SessionKind, SessionRelationship } from '@/shared/types/session-history';
 import type {
   ReviewTargetEvidence,
   ReviewTeamRunManifest,
 } from '@/shared/services/reviewTeamService';
 import type { ImagePayload } from '../utils/imagePayload';
+import { absoluteSessionTurnIndexForId } from '../utils/flowChatTurnOrdinal';
 
 export function createBtwRequestId(prefix = 'btw'): string {
   try {
@@ -49,8 +50,10 @@ function getParentInterruptionContext(parentSessionId: string): { parentDialogTu
   const parentDialogTurnId = machineTurnId || session.dialogTurns[session.dialogTurns.length - 1]?.id;
   if (!parentDialogTurnId) return { parentDialogTurnId: undefined, parentTurnIndex: undefined };
 
-  const idx = session.dialogTurns.findIndex(t => t.id === parentDialogTurnId);
-  return { parentDialogTurnId, parentTurnIndex: idx >= 0 ? idx + 1 : undefined };
+  return {
+    parentDialogTurnId,
+    parentTurnIndex: absoluteSessionTurnIndexForId(session, parentDialogTurnId),
+  };
 }
 
 function requireSession(sessionId: string): Session {
@@ -59,51 +62,6 @@ function requireSession(sessionId: string): Session {
     throw new Error(`Session not found: ${sessionId}`);
   }
   return session;
-}
-
-function createPendingBtwTurn(params: {
-  childSessionId: string;
-  requestId: string;
-  question: string;
-  imagePayload?: ImagePayload;
-}): string {
-  const dialogTurnId = `btw-turn-${params.requestId.trim()}`;
-  const existingSession = flowChatStore.getState().sessions.get(params.childSessionId);
-  if (existingSession?.dialogTurns?.some(turn => turn.id === dialogTurnId)) {
-    return dialogTurnId;
-  }
-
-  const hasImages = (params.imagePayload?.imageContexts.length ?? 0) > 0;
-  const dialogTurn: DialogTurn = {
-    id: dialogTurnId,
-    sessionId: params.childSessionId,
-    kind: 'user_dialog',
-    userMessage: {
-      id: `user_btw_${Date.now()}`,
-      content: params.question,
-      timestamp: Date.now(),
-      hasImages,
-      images: params.imagePayload?.imageDisplayData,
-      metadata: {
-        kind: 'btw',
-        requestId: params.requestId,
-      },
-    },
-    modelRounds: [],
-    status: 'pending',
-    startTime: Date.now(),
-  };
-
-  flowChatStore.addDialogTurn(params.childSessionId, dialogTurn);
-  void stateMachineManager.transition(params.childSessionId, SessionExecutionEvent.START, {
-    taskId: params.childSessionId,
-    dialogTurnId,
-  });
-  return dialogTurnId;
-}
-
-export function isTransientBtwSession(session: Session | undefined): boolean {
-  return session?.isTransient === true && session.sessionKind === 'btw' && session.agentBackedTransient !== true;
 }
 
 export async function createBtwChildSession(params: {
@@ -148,6 +106,11 @@ export async function createBtwChildSession(params: {
   const childSessionName = params.childSessionName.trim() || 'Side thread';
   const remoteConnectionId = parentSession?.remoteConnectionId;
   const remoteSshHost = parentSession?.remoteSshHost;
+  const projectWorkspacePath =
+    parentSession?.projectWorkspacePath
+    || parentSession?.config.projectWorkspacePath
+    || workspacePath;
+  const inheritedExecutionTarget = parentSession?.config.executionTarget;
   const relationship: SessionRelationship | undefined =
     childSessionKind === 'btw'
       ? undefined
@@ -158,13 +121,19 @@ export async function createBtwChildSession(params: {
           parentDialogTurnId,
           parentTurnIndex,
         };
-  const childSessionId = shouldPersistStandaloneSession
-    ? (
-        await agentAPI.createSession({
+  const createdSession = shouldPersistStandaloneSession
+    ? await agentAPI.createSession({
           sessionId: buildPersistentReviewSessionId(requestId),
           sessionName: childSessionName,
           agentType,
           workspacePath,
+          projectWorkspacePath,
+          executionTarget: inheritedExecutionTarget?.worktreeId
+            ? {
+                kind: 'existingWorktree',
+                worktreeId: inheritedExecutionTarget.worktreeId,
+              }
+            : { kind: 'local' },
           workspaceId: parentSession?.workspaceId,
           remoteConnectionId,
           remoteSshHost,
@@ -181,13 +150,14 @@ export async function createBtwChildSession(params: {
             remoteSshHost,
           },
         })
-      ).sessionId
-    : createBtwRequestId('btw_session');
+    : null;
+  const childSessionId = createdSession?.sessionId ?? createBtwRequestId('btw_session');
+  const childWorkspacePath = createdSession?.workspacePath || workspacePath;
   flowChatStore.addExternalSession(
     childSessionId,
     childSessionName,
     agentType,
-    workspacePath,
+    childWorkspacePath,
     {
       parentSessionId,
       sessionKind: childSessionKind,
@@ -200,6 +170,11 @@ export async function createBtwChildSession(params: {
       deepReviewRunManifest: params.deepReviewRunManifest,
       reviewTargetEvidence: params.reviewTargetEvidence,
       reviewTargetFilePaths: params.reviewTargetFilePaths,
+      projectWorkspacePath:
+        createdSession?.projectWorkspacePath || projectWorkspacePath,
+      executionTarget:
+        createdSession?.executionTarget || inheritedExecutionTarget,
+      workspaceId: createdSession?.workspaceId || parentSession?.workspaceId,
       isTransient: params.isTransient ?? false,
       agentBackedTransient: params.isTransient ?? false,
     },
@@ -237,11 +212,11 @@ export async function createBtwChildSession(params: {
   };
 }
 
-export function createTransientBtwSession(params: {
+export function createBtwSessionPlaceholder(params: {
   parentSessionId: string;
   workspacePath?: string;
   childSessionName: string;
-}): { childSessionId: string } {
+}): { childSessionId: string; parentDialogTurnId?: string; parentTurnIndex?: number } {
   const parentSession = requireSession(params.parentSessionId);
   const workspacePath = params.workspacePath || parentSession.workspacePath;
   if (!workspacePath) {
@@ -250,6 +225,7 @@ export function createTransientBtwSession(params: {
 
   const childSessionId = createBtwRequestId('btw_session');
   const childSessionName = params.childSessionName.trim() || 'Side thread';
+  const { parentDialogTurnId, parentTurnIndex } = getParentInterruptionContext(params.parentSessionId);
 
   flowChatStore.addExternalSession(
     childSessionId,
@@ -261,24 +237,39 @@ export function createTransientBtwSession(params: {
       sessionKind: 'btw',
       btwOrigin: {
         parentSessionId: params.parentSessionId,
+        parentDialogTurnId,
+        parentTurnIndex,
       },
-      isTransient: true,
+      isTransient: false,
       agentBackedTransient: false,
+      projectWorkspacePath:
+        parentSession.projectWorkspacePath
+        || parentSession.config.projectWorkspacePath
+        || workspacePath,
+      executionTarget: parentSession.config.executionTarget,
+      workspaceId: parentSession.workspaceId,
     },
     parentSession.remoteConnectionId,
     parentSession.remoteSshHost
   );
 
-  return { childSessionId };
+  flowChatStore.updateSessionRelationship(childSessionId, {
+    parentSessionId: params.parentSessionId,
+    sessionKind: 'btw',
+  });
+
+  return { childSessionId, parentDialogTurnId, parentTurnIndex };
 }
 
-export async function sendMessageToTransientBtwSession(params: {
+export async function sendMessageToBtwSession(params: {
   parentSessionId: string;
   childSessionId: string;
   question: string;
   childSessionName?: string;
   modelId?: string;
   imagePayload?: ImagePayload;
+  parentDialogTurnId?: string;
+  parentTurnIndex?: number;
 }): Promise<{ requestId: string }> {
   const question = params.question.trim();
   if (!question) {
@@ -287,8 +278,8 @@ export async function sendMessageToTransientBtwSession(params: {
   }
 
   const childSession = requireSession(params.childSessionId);
-  if (!isTransientBtwSession(childSession)) {
-    throw new Error(`Session is not a transient /btw session: ${params.childSessionId}`);
+  if (childSession.sessionKind !== 'btw' || childSession.isTransient) {
+    throw new Error(`Session is not a persistent /btw session: ${params.childSessionId}`);
   }
 
   const requestId = createBtwRequestId('btw');
@@ -296,49 +287,26 @@ export async function sendMessageToTransientBtwSession(params: {
     ...(childSession.btwOrigin || {}),
     requestId,
     parentSessionId: params.parentSessionId,
+    parentDialogTurnId: params.parentDialogTurnId ?? childSession.btwOrigin?.parentDialogTurnId,
+    parentTurnIndex: params.parentTurnIndex ?? childSession.btwOrigin?.parentTurnIndex,
   }, 'btw');
-  const localTurnId = createPendingBtwTurn({
-    childSessionId: params.childSessionId,
-    requestId,
-    question,
-    imagePayload: params.imagePayload,
-  });
   const modelId = params.modelId?.trim();
-  try {
-    await btwAPI.askStream({
-      requestId,
-      sessionId: params.parentSessionId,
-      childSessionId: params.childSessionId,
-      childSessionName: params.childSessionName || childSession.title || 'Side thread',
-      question,
-      ...(modelId ? { modelId } : {}),
-      imageContexts: params.imagePayload?.imageContexts,
-    });
-  } catch (error) {
-    flowChatStore.deleteDialogTurn(params.childSessionId, localTurnId);
-    await stateMachineManager.transition(params.childSessionId, SessionExecutionEvent.FINISHING_SETTLED);
-    throw error;
-  }
+  await btwAPI.askStream({
+    requestId,
+    sessionId: params.parentSessionId,
+    childSessionId: params.childSessionId,
+    childSessionName: params.childSessionName || childSession.title || 'Side thread',
+    question,
+    ...(modelId ? { modelId } : {}),
+    parentDialogTurnId: params.parentDialogTurnId ?? childSession.btwOrigin?.parentDialogTurnId,
+    parentTurnIndex: params.parentTurnIndex ?? childSession.btwOrigin?.parentTurnIndex,
+    imageContexts: params.imagePayload?.imageContexts,
+  });
   if (modelId) {
     flowChatStore.updateSessionModelName(params.childSessionId, modelId);
   }
 
   return { requestId };
-}
-
-export async function cancelTransientBtwSession(sessionId: string): Promise<boolean> {
-  const session = flowChatStore.getState().sessions.get(sessionId);
-  if (!session || !isTransientBtwSession(session)) {
-    return false;
-  }
-
-  const requestId = session.btwOrigin?.requestId?.trim();
-  if (!requestId) {
-    return false;
-  }
-
-  await btwAPI.cancel({ requestId });
-  return true;
 }
 
 export async function startBtwThread(params: {
@@ -354,21 +322,24 @@ export async function startBtwThread(params: {
     throw new Error('Empty /btw question');
   }
 
+  await flowChatManager.ensureBackendSession(params.parentSessionId);
   const childSessionName = buildChildSessionName(question);
-  const { childSessionId } = createTransientBtwSession({
+  const { childSessionId, parentDialogTurnId, parentTurnIndex } = createBtwSessionPlaceholder({
     parentSessionId: params.parentSessionId,
     workspacePath: params.workspacePath,
     childSessionName,
   });
 
   try {
-    const { requestId } = await sendMessageToTransientBtwSession({
+    const { requestId } = await sendMessageToBtwSession({
       parentSessionId: params.parentSessionId,
       childSessionId,
       question,
       childSessionName,
       modelId: params.modelId,
       imagePayload: params.imagePayload,
+      parentDialogTurnId,
+      parentTurnIndex,
     });
     return { requestId, childSessionId };
   } catch (error) {

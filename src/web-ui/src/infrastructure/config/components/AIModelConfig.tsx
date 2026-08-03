@@ -10,16 +10,24 @@ import {
 } from '../types';
 import { configManager } from '../services/ConfigManager';
 import { getCapabilitiesByCategory, resolveModelCategory } from '../services/modelCategory';
-import { PROVIDER_TEMPLATES, getModelDisplayName, getProviderDisplayName, getProviderTemplateId } from '../services/modelConfigs';
+import { allocateModelConfigId, PROVIDER_TEMPLATES, getModelDisplayName, getProviderDisplayName, getProviderTemplateId } from '../services/modelConfigs';
 import { DEFAULT_REASONING_MODE, getEffectiveReasoningMode, supportsAnthropicAdaptive, supportsAnthropicReasoning, supportsAnthropicThinkingBudget, supportsDeepSeekReasoningEffort, supportsResponsesReasoning } from '../utils/reasoning';
 import { aiApi, systemAPI } from '@/infrastructure/api';
-import type { DiscoveredCliCredential } from '@/infrastructure/api/service-api/AIApi';
+import type { SubscriptionAccount } from '@/infrastructure/api/service-api/AIApi';
+import type { SubscriptionProvider } from '../types';
 import { useNotification } from '@/shared/notification-system';
 import { ConfigPageHeader, ConfigPageLayout, ConfigPageContent, ConfigPageSection, ConfigPageRow, ConfigCollectionItem } from './common';
 import DefaultModelConfig from './DefaultModelConfig';
+import SubagentModelConfig from './SubagentModelConfig';
+import SessionTitleConfig from './SessionTitleConfig';
 import { createLogger } from '@/shared/utils/logger';
 import { translateConnectionTestMessage } from '@/shared/utils/aiConnectionTestMessages';
 import { i18nService } from '@/infrastructure/i18n';
+import {
+  settleSubscriptionLoginStart,
+  SubscriptionLoginCoordinator,
+  type SubscriptionLoginOperation,
+} from './subscriptionLoginCoordinator';
 import './AIModelConfig.scss';
 
 const log = createLogger('AIModelConfig');
@@ -35,7 +43,7 @@ interface SelectedModelDraft {
   modelName: string;
   category: ModelCategory;
   contextWindow: number;
-  maxTokens: number;
+  maxTokens?: number;
   reasoningMode: ReasoningMode;
   reasoningEffort?: string;
   thinkingBudgetTokens?: number;
@@ -46,6 +54,29 @@ interface ProviderGroup {
   providerName: string;
   providerId?: string;
   models: AIModelConfigType[];
+}
+
+interface SubscriptionLoginPanelState {
+  provider: SubscriptionProvider;
+  authorizationUrl: string;
+  userCode?: string | null;
+  deadlineMs?: number;
+  status: 'starting' | 'pending' | 'cancelling' | 'failed';
+  error?: string;
+}
+
+interface SubscriptionLogoutRequest {
+  account: SubscriptionAccount;
+  affectedModels: AIModelConfigType[];
+}
+
+const SUBSCRIPTION_LOGIN_TIMEOUT_MS = 5 * 60 * 1000;
+const SUBSCRIPTION_MIGRATION_NOTICE_KEY = 'bitfun.subscription-auth.secure-store-notice.v1';
+
+function subscriptionLoginCancelledError(): Error {
+  const error = new Error('Login cancelled');
+  error.name = 'SubscriptionLoginCancelled';
+  return error;
 }
 
 function isResponsesProvider(provider?: string): boolean {
@@ -65,7 +96,7 @@ function createModelDraft(
     modelName: trimmedModelName,
     category: overrides?.category ?? baseConfig?.category ?? 'general_chat',
     contextWindow: overrides?.contextWindow ?? baseConfig?.context_window ?? 200000,
-    maxTokens: overrides?.maxTokens ?? baseConfig?.max_tokens ?? 32000,
+    maxTokens: overrides?.maxTokens ?? baseConfig?.max_tokens,
     reasoningMode: overrides?.reasoningMode ?? getEffectiveReasoningMode(baseConfig),
     reasoningEffort: overrides?.reasoningEffort ?? baseConfig?.reasoning_effort,
     thinkingBudgetTokens: overrides?.thinkingBudgetTokens ?? baseConfig?.thinking_budget_tokens,
@@ -158,6 +189,24 @@ function formatTokenCountShort(n: number): string {
     return `${s}K`;
   }
   return String(n);
+}
+
+function automaticMaxOutputTokens(contextWindow: number): number {
+  const quarterContext = Math.floor(contextWindow / 4);
+  return [64000, 32000, 24000, 16000, 8000].find(tier => tier <= quarterContext) ?? quarterContext;
+}
+
+function effectiveMaxOutputTokens(draft: SelectedModelDraft): number {
+  const configuredMaxTokens = draft.maxTokens;
+  if (
+    configuredMaxTokens != null
+    && configuredMaxTokens > 0
+    && configuredMaxTokens * 100 <= draft.contextWindow * 40
+  ) {
+    return configuredMaxTokens;
+  }
+
+  return automaticMaxOutputTokens(draft.contextWindow);
 }
 
 function parseOptionalPositiveIntegerInput(value: string): number | null | undefined {
@@ -388,6 +437,8 @@ const AIModelConfig: React.FC = () => {
   const [streamIdleTimeoutInput, setStreamIdleTimeoutInput] = useState('');
   const [streamTtftTimeoutInput, setStreamTtftTimeoutInput] = useState('');
   const [isStreamTimeoutSaving, setIsStreamTimeoutSaving] = useState(false);
+  const [allowNormalToolJsonRepair, setAllowNormalToolJsonRepair] = useState(true);
+  const [isToolJsonRepairSaving, setIsToolJsonRepairSaving] = useState(false);
   const [isProxySaving, setIsProxySaving] = useState(false);
   const [remoteModelOptions, setRemoteModelOptions] = useState<RemoteModelOption[]>([]);
   const [isFetchingRemoteModels, setIsFetchingRemoteModels] = useState(false);
@@ -397,8 +448,20 @@ const AIModelConfig: React.FC = () => {
   const [editingProviderModelIds, setEditingProviderModelIds] = useState<Set<string>>(new Set());
   const [manualModelInput, setManualModelInput] = useState('');
   const [expandedModelCards, setExpandedModelCards] = useState<Set<string>>(new Set());
-  const [discoveredCli, setDiscoveredCli] = useState<DiscoveredCliCredential[]>([]);
-  const [isDiscoveringCli, setIsDiscoveringCli] = useState(false);
+  const [subscriptionAccounts, setSubscriptionAccounts] = useState<SubscriptionAccount[]>([]);
+  const [isLoadingSubscriptions, setIsLoadingSubscriptions] = useState(false);
+  const [loggingInProvider, setLoggingInProvider] = useState<SubscriptionProvider | null>(null);
+  const [subscriptionLoginPanel, setSubscriptionLoginPanel] = useState<SubscriptionLoginPanelState | null>(null);
+  const [subscriptionLoginClock, setSubscriptionLoginClock] = useState(() => Date.now());
+  const [subscriptionLogoutRequest, setSubscriptionLogoutRequest] = useState<SubscriptionLogoutRequest | null>(null);
+  const [showSubscriptionMigrationNotice, setShowSubscriptionMigrationNotice] = useState(() => {
+    if (typeof window === 'undefined') return false;
+    try {
+      return window.localStorage.getItem(SUBSCRIPTION_MIGRATION_NOTICE_KEY) !== 'dismissed';
+    } catch {
+      return true;
+    }
+  });
   const lastRemoteFetchSignatureRef = React.useRef<string | null>(null);
   const activeRemoteFetchSignatureRef = React.useRef<string | null>(null);
 
@@ -479,6 +542,7 @@ const AIModelConfig: React.FC = () => {
     () => [
       { label: t('category.general_chat'), value: 'general_chat' },
       { label: t('category.multimodal'), value: 'multimodal' },
+      { label: t('category.speech_recognition'), value: 'speech_recognition' },
     ],
     [t]
   );
@@ -487,6 +551,7 @@ const AIModelConfig: React.FC = () => {
     () => ({
       general_chat: t('categoryIcons.general_chat'),
       multimodal: t('categoryIcons.multimodal'),
+      speech_recognition: t('categoryIcons.speech_recognition'),
     }),
     [t]
   );
@@ -525,11 +590,12 @@ const AIModelConfig: React.FC = () => {
   
   const loadConfig = useCallback(async () => {
     try {
-      const [models, proxy, streamIdleTimeoutSecs, streamTtftTimeoutSecs] = await Promise.all([
+      const [models, proxy, streamIdleTimeoutSecs, streamTtftTimeoutSecs, allowJsonRepair] = await Promise.all([
         configManager.getConfig<AIModelConfigType[]>('ai.models'),
         configManager.getConfig<ProxyConfig>('ai.proxy'),
         configManager.getConfig<number | null>('ai.stream_idle_timeout_secs'),
         configManager.getConfig<number | null>('ai.stream_ttft_timeout_secs'),
+        configManager.getConfig<boolean>('ai.allow_tool_json_repair'),
       ]);
       setAiModels(models);
       if (proxy) {
@@ -541,6 +607,7 @@ const AIModelConfig: React.FC = () => {
       setStreamTtftTimeoutInput(
         streamTtftTimeoutSecs != null ? String(streamTtftTimeoutSecs) : ''
       );
+      setAllowNormalToolJsonRepair(allowJsonRepair !== false);
     } catch (error) {
       log.error('Failed to load AI config', error);
     }
@@ -550,21 +617,28 @@ const AIModelConfig: React.FC = () => {
     loadConfig();
   }, [loadConfig]);
 
-  const refreshDiscoveredCli = useCallback(async () => {
-    setIsDiscoveringCli(true);
+  const refreshSubscriptionAccounts = useCallback(async () => {
+    setIsLoadingSubscriptions(true);
     try {
-      const items = await aiApi.discoverCliCredentials();
-      setDiscoveredCli(items);
+      const items = await aiApi.listSubscriptionAccounts();
+      setSubscriptionAccounts(items);
     } catch (e) {
-      log.warn('discover_cli_credentials failed', { error: String(e) });
+      log.warn('list_subscription_accounts failed', { error: String(e) });
     } finally {
-      setIsDiscoveringCli(false);
+      setIsLoadingSubscriptions(false);
     }
   }, []);
 
   useEffect(() => {
-    refreshDiscoveredCli();
-  }, [refreshDiscoveredCli]);
+    refreshSubscriptionAccounts();
+  }, [refreshSubscriptionAccounts]);
+
+  useEffect(() => {
+    if (!subscriptionLoginPanel || subscriptionLoginPanel.status !== 'pending') return;
+    setSubscriptionLoginClock(Date.now());
+    const timer = window.setInterval(() => setSubscriptionLoginClock(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [subscriptionLoginPanel]);
   
   // Provider options with translations (must be at top level, before any conditional returns)
   const providerOrder = useMemo(
@@ -607,7 +681,7 @@ const AIModelConfig: React.FC = () => {
     configs.map(config => createModelDraft(config.model_name, config, {
       configId: config.id,
       contextWindow: config.context_window || 200000,
-      maxTokens: config.max_tokens || 32000,
+      maxTokens: config.max_tokens,
       reasoningMode: getEffectiveReasoningMode(config),
       reasoningEffort: config.reasoning_effort,
       thinkingBudgetTokens: config.thinking_budget_tokens,
@@ -658,7 +732,11 @@ const AIModelConfig: React.FC = () => {
           }, reasoningProviderConfig);
         }
 
-        return normalizeDraftReasoningForProvider(createModelDraft(modelName, baseConfig, {
+        const draftBaseConfig = baseConfig
+          ? { ...baseConfig, max_tokens: undefined }
+          : undefined;
+
+        return normalizeDraftReasoningForProvider(createModelDraft(modelName, draftBaseConfig, {
           configId: pinnedRowId,
         }), reasoningProviderConfig);
       })
@@ -780,7 +858,7 @@ const AIModelConfig: React.FC = () => {
       request_url: config.request_url || resolveRequestUrl(resolvedBaseUrl, resolvedProvider, resolvedModelName),
       model_name: resolvedModelName,
       context_window: config.context_window || 200000,
-      max_tokens: config.max_tokens || 32000,
+      max_tokens: config.max_tokens,
       temperature: config.temperature,
       top_p: config.top_p,
       enabled: config.enabled ?? true,
@@ -886,30 +964,28 @@ const AIModelConfig: React.FC = () => {
     setCreationMode('selection');
   };
 
-  const handleImportFromCli = useCallback((cred: DiscoveredCliCredential) => {
+  const handleImportFromSubscription = useCallback((account: SubscriptionAccount) => {
     resetRemoteModelDiscovery();
     setManualModelInput('');
     setShowApiKey(false);
     setSelectedProviderId(null);
-    const authType: 'codex_cli' | 'gemini_cli' = cred.kind === 'codex' ? 'codex_cli' : 'gemini_cli';
     setEditingConfig({
-      name: cred.display_label,
-      provider: cred.suggested_format,
-      base_url: cred.suggested_base_url,
+      name: account.display_label,
+      provider: account.suggested_format,
+      base_url: account.suggested_base_url,
       // Leave request_url + model_name empty so the user must pick a model
-      // from the live CLI list. We never inject a hard-coded default slug.
+      // from the live list. We never inject a hard-coded default slug.
       request_url: '',
       api_key: '',
       model_name: '',
       enabled: true,
       context_window: 200000,
-      max_tokens: 32000,
       category: 'general_chat',
       capabilities: ['text_chat', 'function_calling'],
       recommended_for: [],
       metadata: {},
       inline_think_in_text: true,
-      auth: { type: authType },
+      auth: { type: 'subscription', provider: account.provider },
     });
     setSelectedModelDrafts([]);
     setEditingProviderModelIds(new Set());
@@ -918,15 +994,315 @@ const AIModelConfig: React.FC = () => {
     setIsEditing(true);
   }, [resetRemoteModelDiscovery]);
 
-  const handleRefreshCli = useCallback(async (kind: 'codex' | 'gemini') => {
-    try {
-      await aiApi.refreshCliCredential(kind);
-      await refreshDiscoveredCli();
-      notification.success(t('cliAuth.refreshSuccess'));
-    } catch (e) {
-      notification.error(t('cliAuth.refreshFailed', { error: String(e) }));
+  const loginCoordinatorRef = React.useRef(new SubscriptionLoginCoordinator());
+  const subscriptionLoginMountedRef = React.useRef(true);
+
+  const pollSubscriptionLogin = useCallback(async (
+    operation: SubscriptionLoginOperation,
+    deadline: number,
+  ) => {
+    while (Date.now() < deadline) {
+      if (!loginCoordinatorRef.current.isCurrent(operation)) {
+        throw subscriptionLoginCancelledError();
+      }
+      const snapshot = await aiApi.getSubscriptionLoginStatus(
+        operation.provider,
+        operation.sessionId,
+      );
+      if (snapshot.session_id !== operation.sessionId) {
+        throw new Error('Subscription login status returned a mismatched session');
+      }
+      if (snapshot.status === 'authorized') {
+        return snapshot;
+      }
+      if (snapshot.status === 'failed' || snapshot.status === 'cancelled') {
+        throw new Error(snapshot.error || `Login ${snapshot.status}`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1500));
     }
-  }, [refreshDiscoveredCli, notification, t]);
+    throw new Error('Login timed out');
+  }, []);
+
+  // Cancel any in-flight subscription login when the page unmounts so the
+  // backend loopback server / device poll does not linger.
+  useEffect(() => {
+    const coordinator = loginCoordinatorRef.current;
+    subscriptionLoginMountedRef.current = true;
+    return () => {
+      subscriptionLoginMountedRef.current = false;
+      const pending = coordinator.current();
+      if (pending && !pending.cancelled) {
+        coordinator.requestCancel(pending.provider);
+        // Cancel immediately when the backend placeholder already exists;
+        // `settleSubscriptionLoginStart` retries after start returns to cover
+        // the opposite command-order race.
+        void aiApi.cancelSubscriptionLogin(pending.provider, pending.sessionId).catch(() => {});
+      }
+    };
+  }, []);
+
+  const handleSubscriptionLogin = useCallback(async (provider: SubscriptionProvider) => {
+    // The settings surface intentionally permits one authorization flow at a
+    // time. This prevents a stale provider poll/finally block from clearing a
+    // newer provider's state or leaving an undiscoverable backend session.
+    const operation = loginCoordinatorRef.current.begin(provider);
+    if (!operation) return;
+    setLoggingInProvider(provider);
+    setSubscriptionLoginPanel({
+      provider,
+      authorizationUrl: '',
+      status: 'starting',
+    });
+    try {
+      const started = await aiApi.startSubscriptionLogin(provider, operation.sessionId);
+      const settlement = await settleSubscriptionLoginStart(
+        loginCoordinatorRef.current,
+        operation,
+        () => aiApi.cancelSubscriptionLogin(provider, operation.sessionId),
+      );
+      if (settlement.cleanupError) {
+        log.warn('Failed to cancel subscription login after start settled', {
+          provider,
+          error: String(settlement.cleanupError),
+        });
+      }
+      if (!settlement.shouldContinue) {
+        throw subscriptionLoginCancelledError();
+      }
+      if (started.session_id !== operation.sessionId) {
+        throw new Error('Subscription login start returned a mismatched session');
+      }
+      // Authorization time starts after the provider has returned its URL or
+      // device code; callback binding/device-code acquisition does not consume
+      // the user's five-minute completion window.
+      const deadlineMs = Date.now() + SUBSCRIPTION_LOGIN_TIMEOUT_MS;
+      setSubscriptionLoginPanel({
+        provider,
+        authorizationUrl: started.authorization_url,
+        userCode: started.user_code,
+        deadlineMs,
+        status: 'pending',
+      });
+      if (started.authorization_url) {
+        try {
+          await systemAPI.openExternal(started.authorization_url);
+        } catch (openError) {
+          // Keep polling: the backend login session is already running. Surface
+          // the URL so the user can open it manually (relative URLs / opener
+          // policy failures must not abort an otherwise valid login).
+          log.warn('Failed to open subscription authorization URL', {
+            provider,
+            url: started.authorization_url,
+            error: String(openError),
+          });
+          notification.info(
+            t('subscriptionAuth.openUrlManually', { url: started.authorization_url }),
+          );
+        }
+      }
+      if (!loginCoordinatorRef.current.isCurrent(operation)) {
+        throw subscriptionLoginCancelledError();
+      }
+      if (started.user_code) {
+        notification.info(t('subscriptionAuth.userCodeHint', { code: started.user_code }));
+      }
+      await pollSubscriptionLogin(operation, deadlineMs);
+      if (!loginCoordinatorRef.current.isCurrent(operation)) {
+        throw subscriptionLoginCancelledError();
+      }
+      await refreshSubscriptionAccounts();
+      if (!loginCoordinatorRef.current.isCurrent(operation)) {
+        throw subscriptionLoginCancelledError();
+      }
+      setSubscriptionLoginPanel(null);
+      notification.success(t('subscriptionAuth.loginSuccess'));
+    } catch (e) {
+      if ((e as Error).name === 'SubscriptionLoginCancelled' || operation.cancelled) {
+        // `startSubscriptionLogin` may reject instead of returning after an
+        // early cancellation. Mark that invocation settled and retry the
+        // idempotent backend cancellation so no placeholder/session survives.
+        if (!operation.startSettled && loginCoordinatorRef.current.owns(operation)) {
+          loginCoordinatorRef.current.markStartSettled(operation);
+        }
+        let authorizationAlreadyCompleted = false;
+        try {
+          await aiApi.cancelSubscriptionLogin(provider, operation.sessionId);
+        } catch (cancelError) {
+          log.warn('Failed to finish subscription login cancellation', {
+            provider,
+            error: String(cancelError),
+          });
+        }
+        try {
+          // The backend cancellation command is a commit barrier. Refreshing
+          // now truthfully surfaces the narrow case where authorization had
+          // already crossed its commit boundary before the user cancelled.
+          const accounts = await aiApi.listSubscriptionAccounts();
+          if (subscriptionLoginMountedRef.current) {
+            setSubscriptionAccounts(accounts);
+          }
+          authorizationAlreadyCompleted = accounts.some((account) => (
+            account.provider === provider && account.connected
+          ));
+        } catch (refreshError) {
+          log.warn('Failed to refresh subscription accounts after cancellation', {
+            provider,
+            error: String(refreshError),
+          });
+        }
+        if (
+          loginCoordinatorRef.current.owns(operation)
+          && subscriptionLoginMountedRef.current
+        ) {
+          setSubscriptionLoginPanel(null);
+          notification.info(t(
+            authorizationAlreadyCompleted
+              ? 'subscriptionAuth.loginCompletedBeforeCancel'
+              : 'subscriptionAuth.loginCancelled',
+          ));
+        }
+      } else {
+        // Status/start failures can occur while the backend runner is still
+        // active. Await the session-scoped cancellation barrier before freeing
+        // the coordinator slot or presenting retry UI.
+        if (!operation.startSettled && loginCoordinatorRef.current.owns(operation)) {
+          loginCoordinatorRef.current.markStartSettled(operation);
+        }
+        try {
+          await aiApi.cancelSubscriptionLogin(provider, operation.sessionId);
+        } catch (cancelError) {
+          log.warn('Failed to stop subscription login after an operation error', {
+            provider,
+            sessionId: operation.sessionId,
+            error: String(cancelError),
+          });
+        }
+        if (
+          loginCoordinatorRef.current.isCurrent(operation)
+          && subscriptionLoginMountedRef.current
+        ) {
+          setSubscriptionLoginPanel({
+            provider,
+            authorizationUrl: '',
+            userCode: undefined,
+            status: 'failed',
+            error: String(e),
+          });
+          notification.error(t('subscriptionAuth.loginFailed', { error: String(e) }));
+        }
+      }
+    } finally {
+      if (loginCoordinatorRef.current.complete(operation)) {
+        if (subscriptionLoginMountedRef.current) {
+          setLoggingInProvider(null);
+        }
+      }
+    }
+  }, [notification, pollSubscriptionLogin, refreshSubscriptionAccounts, t]);
+
+  const handleCancelSubscriptionLogin = useCallback(async (provider: SubscriptionProvider) => {
+    const operation = loginCoordinatorRef.current.requestCancel(provider);
+    if (!operation) return;
+    // Keep the coordinator slot and loading state reserved until the start
+    // command has settled and any backend session has been cancelled.
+    setSubscriptionLoginPanel((current) => (
+      current?.provider === provider
+        ? { ...current, status: 'cancelling' }
+        : current
+    ));
+    // This first attempt makes cancellation responsive if the backend has
+    // installed its placeholder. The start-settlement path retries, because
+    // desktop command scheduling can deliver this request first.
+    try {
+      await aiApi.cancelSubscriptionLogin(provider, operation.sessionId);
+    } catch (e) {
+      log.warn('cancel_subscription_login failed', { error: String(e) });
+    }
+  }, []);
+
+  const handleOpenSubscriptionAuthorization = useCallback(async (url: string) => {
+    if (!url) return;
+    try {
+      await systemAPI.openExternal(url);
+    } catch (error) {
+      log.warn('Failed to open subscription authorization URL from pending card', {
+        url,
+        error: String(error),
+      });
+      notification.info(t('subscriptionAuth.openUrlManually', { url }));
+    }
+  }, [notification, t]);
+
+  const handleCopySubscriptionCode = useCallback(async (code: string) => {
+    try {
+      await systemAPI.setClipboard(code);
+      notification.success(t('subscriptionAuth.codeCopied'));
+    } catch (error) {
+      log.warn('Failed to copy subscription device code', { error: String(error) });
+      notification.error(t('subscriptionAuth.copyCodeFailed'));
+    }
+  }, [notification, t]);
+
+  const requestSubscriptionLogout = useCallback((account: SubscriptionAccount) => {
+    const affectedModels = aiModels.filter((model) => (
+      model.auth?.type === 'subscription' && model.auth.provider === account.provider
+    ));
+    setSubscriptionLogoutRequest({ account, affectedModels });
+  }, [aiModels]);
+
+  const confirmSubscriptionLogout = useCallback(async () => {
+    const request = subscriptionLogoutRequest;
+    if (!request) return;
+    try {
+      const result = await aiApi.logoutSubscriptionAccount(request.account.provider);
+      // Metadata removal is the source of truth for connection state. Reflect
+      // it immediately, then refresh before presenting either outcome notice.
+      setSubscriptionAccounts((current) => current.map((account) => (
+        account.provider === request.account.provider
+          ? {
+              ...account,
+              connected: false,
+              account: null,
+              expires_at: null,
+              reauthentication_required: false,
+              vault_unavailable: false,
+            }
+          : account
+      )));
+      await refreshSubscriptionAccounts();
+      setSubscriptionLogoutRequest(null);
+      if (result.cleanup_pending) {
+        log.warn('Subscription logout completed with credential cleanup pending', {
+          provider: request.account.provider,
+          warning: result.warning,
+        });
+        notification.warning(t('subscriptionAuth.logoutCleanupPending'));
+      } else {
+        notification.success(t('subscriptionAuth.logoutSuccess'));
+      }
+    } catch (e) {
+      notification.error(t('subscriptionAuth.logoutFailed', { error: String(e) }));
+    }
+  }, [notification, refreshSubscriptionAccounts, subscriptionLogoutRequest, t]);
+
+  const dismissSubscriptionMigrationNotice = useCallback(() => {
+    setShowSubscriptionMigrationNotice(false);
+    try {
+      window.localStorage.setItem(SUBSCRIPTION_MIGRATION_NOTICE_KEY, 'dismissed');
+    } catch (error) {
+      log.debug('Unable to persist subscription migration notice dismissal', { error: String(error) });
+    }
+  }, []);
+
+  const handleSubscriptionRefresh = useCallback(async (provider: SubscriptionProvider) => {
+    try {
+      await aiApi.refreshSubscriptionAccount(provider);
+      await refreshSubscriptionAccounts();
+      notification.success(t('subscriptionAuth.refreshSuccess'));
+    } catch (e) {
+      notification.error(t('subscriptionAuth.refreshFailed', { error: String(e) }));
+    }
+  }, [notification, refreshSubscriptionAccounts, t]);
 
   
   const handleSelectProvider = (providerId: string) => {
@@ -954,7 +1330,6 @@ const AIModelConfig: React.FC = () => {
       provider: template.format,
       enabled: true,
       context_window: 200000,
-      max_tokens: 32000,
       category: 'general_chat',
       capabilities: ['text_chat', 'function_calling'],
       recommended_for: [],
@@ -964,7 +1339,6 @@ const AIModelConfig: React.FC = () => {
     setSelectedModelDrafts(
       defaultModel ? [createModelDraft(defaultModel, {
             context_window: 200000,
-            max_tokens: 32000,
             reasoning_mode: DEFAULT_REASONING_MODE,
           })] : []
     );
@@ -990,8 +1364,6 @@ const AIModelConfig: React.FC = () => {
       provider: 'openai',  
       enabled: true,
       context_window: 200000,
-      max_tokens: 32000,  
-      
       category: 'general_chat',
       capabilities: ['text_chat'],
       recommended_for: [],
@@ -1030,7 +1402,7 @@ const AIModelConfig: React.FC = () => {
       provider: config.provider,
       enabled: true,
       context_window: config.context_window || 200000,
-      max_tokens: config.max_tokens || 32000,
+      max_tokens: config.max_tokens,
       category: config.category || 'general_chat',
       capabilities: config.capabilities || getCapabilitiesByCategory(config.category || 'general_chat'),
       recommended_for: config.recommended_for || [],
@@ -1062,7 +1434,7 @@ const AIModelConfig: React.FC = () => {
     setSelectedModelDrafts([
       createModelDraft(config.model_name, config, {
         contextWindow: config.context_window || 200000,
-        maxTokens: config.max_tokens || 32000,
+        maxTokens: config.max_tokens,
         reasoningMode: getEffectiveReasoningMode(config),
         reasoningEffort: config.reasoning_effort,
         thinkingBudgetTokens: config.thinking_budget_tokens,
@@ -1104,15 +1476,29 @@ const AIModelConfig: React.FC = () => {
         return;
       }
       const draftsToSave = dedupeSelectedModelDraftsByModelName(selectedModelDrafts);
+      if (draftsToSave.some(draft => draft.contextWindow < 32000)) {
+        notification.warning(t('messages.contextWindowTooSmall'));
+        return;
+      }
       const existingProviderInstanceId = getProviderInstanceId(editingConfig);
       const isProviderGroupEdit = !editingConfig.id && editingProviderModelIds.size > 0;
       const providerInstanceId = existingProviderInstanceId || generateProviderInstanceId();
       const providerGroupModelIds = isProviderGroupEdit
         ? editingProviderModelIds
         : new Set<string>();
-      const configsToSave: AIModelConfigType[] = draftsToSave.map((draft, index) => {
+      const allocatedConfigIds = new Set(
+        aiModels
+          .map(model => model.id?.trim())
+          .filter((id): id is string => Boolean(id))
+      );
+      const configsToSave: AIModelConfigType[] = draftsToSave.map((draft) => {
+        const id = editingConfig.id
+          || draft.configId
+          || allocateModelConfigId(draft.modelName, allocatedConfigIds);
+        allocatedConfigIds.add(id);
+
         return {
-          id: editingConfig.id || draft.configId || `model_${Date.now()}_${index}`,
+          id,
           name: providerName,
           base_url: baseUrl,
           request_url: resolveRequestUrl(
@@ -1272,7 +1658,7 @@ const AIModelConfig: React.FC = () => {
       const nextDefaultModels = { ...currentDefaultModels };
       let defaultModelsChanged = false;
 
-      for (const key of ['primary', 'fast', 'image_understanding']) {
+      for (const key of ['primary', 'fast', 'image_understanding', 'speech_recognition']) {
         if (nextDefaultModels[key] === id) {
           nextDefaultModels[key] = null;
           defaultModelsChanged = true;
@@ -1403,6 +1789,24 @@ const AIModelConfig: React.FC = () => {
     }
   };
 
+  const handleToggleNormalToolJsonRepair = async (enabled: boolean) => {
+    setIsToolJsonRepairSaving(true);
+    try {
+      if (enabled) {
+        await configManager.resetConfig('ai.allow_tool_json_repair');
+      } else {
+        await configManager.setConfig('ai.allow_tool_json_repair', false);
+      }
+      setAllowNormalToolJsonRepair(enabled);
+      notification.success(t('toolArgumentJsonRepair.saveSuccess'));
+    } catch (error) {
+      log.error('Failed to save normal tool JSON repair setting', error);
+      notification.error(t('messages.saveFailed'));
+    } finally {
+      setIsToolJsonRepairSaving(false);
+    }
+  };
+
   const closeEditingModal = () => {
     resetRemoteModelDiscovery();
     setSelectedModelDrafts([]);
@@ -1449,14 +1853,14 @@ const AIModelConfig: React.FC = () => {
   
   if (creationMode === 'selection') {
     return (
-      <ConfigPageLayout className="bitfun-ai-model-config">
+      <ConfigPageLayout className="bitfun-ai-model-config" data-bf-component="ai-model-config" data-bf-part="root" data-bf-view="selection">
         <ConfigPageHeader
           title={t('providerSelection.title')}
           subtitle={t('providerSelection.subtitle')}
         />
 
         <ConfigPageContent className="bitfun-ai-model-config__content bitfun-ai-model-config__content--selection">
-          <div className="bitfun-ai-model-config__provider-selection">
+          <div className="bitfun-ai-model-config__provider-selection" data-bf-component="ai-model-config" data-bf-part="providerSelection">
             
             <Card
               data-testid="settings-model-custom-config-btn"
@@ -1467,22 +1871,22 @@ const AIModelConfig: React.FC = () => {
               className="bitfun-ai-model-config__custom-option"
               onClick={handleSelectCustom}
             >
-              <div className="bitfun-ai-model-config__custom-option-content">
+              <div className="bitfun-ai-model-config__custom-option-content" data-bf-component="ai-model-config" data-bf-part="customOption">
                 <Settings size={24} />
                 <div>
-                  <div className="bitfun-ai-model-config__custom-option-title">{t('providerSelection.customTitle')}</div>
-                  <div className="bitfun-ai-model-config__custom-option-description">{t('providerSelection.customDescription')}</div>
+                  <div className="bitfun-ai-model-config__custom-option-title" data-bf-component="ai-model-config" data-bf-part="customOptionTitle">{t('providerSelection.customTitle')}</div>
+                  <div className="bitfun-ai-model-config__custom-option-description" data-bf-component="ai-model-config" data-bf-part="customOptionDescription">{t('providerSelection.customDescription')}</div>
                 </div>
               </div>
             </Card>
 
             
-            <div className="bitfun-ai-model-config__selection-divider">
+            <div className="bitfun-ai-model-config__selection-divider" data-bf-component="ai-model-config" data-bf-part="selectionDivider">
               <span>{t('providerSelection.orSelectProvider')}</span>
             </div>
 
             
-            <div className="bitfun-ai-model-config__provider-grid">
+            <div className="bitfun-ai-model-config__provider-grid" data-bf-component="ai-model-config" data-bf-part="providerGrid">
               {providers.map(provider => (
                 <Card
                   key={provider.id}
@@ -1494,15 +1898,15 @@ const AIModelConfig: React.FC = () => {
                   className="bitfun-ai-model-config__provider-card"
                   onClick={() => handleSelectProvider(provider.id)}
                 >
-                  <div className="bitfun-ai-model-config__provider-card-content">
-                    <div className="bitfun-ai-model-config__provider-name">{provider.name}</div>
-                    <div className="bitfun-ai-model-config__provider-description">{provider.description}</div>
-                    <div className="bitfun-ai-model-config__provider-models">
+                  <div className="bitfun-ai-model-config__provider-card-content" data-bf-component="ai-model-config" data-bf-part="providerCard">
+                    <div className="bitfun-ai-model-config__provider-name" data-bf-component="ai-model-config" data-bf-part="providerName">{provider.name}</div>
+                    <div className="bitfun-ai-model-config__provider-description" data-bf-component="ai-model-config" data-bf-part="providerDescription">{provider.description}</div>
+                    <div className="bitfun-ai-model-config__provider-models" data-bf-component="ai-model-config" data-bf-part="providerModels">
                       {provider.models.slice(0, 3).map(model => (
-                        <span key={model} className="bitfun-ai-model-config__provider-model-tag">{model}</span>
+                        <span key={model} className="bitfun-ai-model-config__provider-model-tag" data-bf-component="ai-model-config" data-bf-part="providerTag">{model}</span>
                       ))}
                       {provider.models.length > 3 && (
-                        <span className="bitfun-ai-model-config__provider-model-tag bitfun-ai-model-config__provider-model-tag--more">
+                        <span className="bitfun-ai-model-config__provider-model-tag bitfun-ai-model-config__provider-model-tag--more" data-bf-component="ai-model-config" data-bf-part="providerTag">
                           +{provider.models.length - 3}
                         </span>
                       )}
@@ -1533,7 +1937,7 @@ const AIModelConfig: React.FC = () => {
             </div>
 
             
-            <div className="bitfun-ai-model-config__selection-actions">
+            <div className="bitfun-ai-model-config__selection-actions" data-bf-component="ai-model-config" data-bf-part="selectionActions">
               <Button variant="secondary" onClick={() => setCreationMode(null)}>
                 {t('actions.cancel')}
               </Button>
@@ -1714,7 +2118,7 @@ const AIModelConfig: React.FC = () => {
               && draft.reasoningMode === 'enabled'
               && supportsAnthropicThinkingBudget(draft.modelName);
             const displayedThinkingBudget = draft.thinkingBudgetTokens
-              ?? Math.min(Math.floor(draft.maxTokens * 0.75), 10000);
+              ?? Math.min(Math.floor(effectiveMaxOutputTokens(draft) * 0.75), 10000);
 
             return (
               <div
@@ -1779,8 +2183,6 @@ const AIModelConfig: React.FC = () => {
                         {' · '}
                         {formatTokenCountShort(draft.contextWindow)} ctx
                         {' · '}
-                        {formatTokenCountShort(draft.maxTokens)} out
-                        {' · '}
                         {formatReasoningSummary(draft)}
                       </span>
                     </div>
@@ -1816,20 +2218,8 @@ const AIModelConfig: React.FC = () => {
                       <NumberInput
                         value={draft.contextWindow}
                         onChange={(value) => updateModelDraft(draft.modelName, { contextWindow: value })}
-                        min={1000}
+                        min={32000}
                         max={2000000}
-                        step={1000}
-                        size="small"
-                        disableWheel
-                      />
-                    </div>
-                    <div className="bitfun-ai-model-config__selected-model-field">
-                      <span>{t('form.maxTokens')}</span>
-                      <NumberInput
-                        value={draft.maxTokens}
-                        onChange={(value) => updateModelDraft(draft.modelName, { maxTokens: value })}
-                        min={1000}
-                        max={1000000}
                         step={1000}
                         size="small"
                         disableWheel
@@ -1870,7 +2260,7 @@ const AIModelConfig: React.FC = () => {
                           value={displayedThinkingBudget}
                           onChange={(value) => updateModelDraft(draft.modelName, { thinkingBudgetTokens: value || undefined })}
                           min={1024}
-                          max={50000}
+                          max={Math.min(effectiveMaxOutputTokens(draft), 50000)}
                           step={1024}
                           size="small"
                           disableWheel
@@ -1886,40 +2276,55 @@ const AIModelConfig: React.FC = () => {
       );
     };
 
-    const authType: 'api_key' | 'codex_cli' | 'gemini_cli' = editingConfig.auth?.type || 'api_key';
-    const authIsCli = authType !== 'api_key';
-    const cliAuthOptions: SelectOption[] = [
-      { value: 'api_key', label: t('cliAuth.options.apiKey') },
-      { value: 'codex_cli', label: t('cliAuth.options.codexCli') },
-      { value: 'gemini_cli', label: t('cliAuth.options.geminiCli') },
+    const authType = editingConfig.auth?.type || 'api_key';
+    const authIsSubscription = authType === 'subscription';
+    const selectedSubscriptionProvider: SubscriptionProvider | undefined =
+      editingConfig.auth?.type === 'subscription' ? editingConfig.auth.provider : undefined;
+    const authSelectValue = authIsSubscription
+      ? `subscription:${selectedSubscriptionProvider || 'codex'}`
+      : 'api_key';
+    const authOptions: SelectOption[] = [
+      { value: 'api_key', label: t('subscriptionAuth.options.apiKey') },
+      { value: 'subscription:codex', label: t('subscriptionAuth.options.codex') },
+      { value: 'subscription:antigravity', label: t('subscriptionAuth.options.antigravity') },
+      { value: 'subscription:opencode', label: t('subscriptionAuth.options.opencode') },
     ];
-    const matchedCliCredential = authType === 'codex_cli'
-      ? discoveredCli.find(c => c.kind === 'codex')
-      : authType === 'gemini_cli'
-        ? discoveredCli.find(c => c.kind === 'gemini')
-        : undefined;
+    const matchedSubscription = selectedSubscriptionProvider
+      ? subscriptionAccounts.find((account) => account.provider === selectedSubscriptionProvider)
+      : undefined;
 
     const renderAuthRow = () => (
-      <ConfigPageRow label={t('cliAuth.label')} align={authIsCli ? 'start' : 'center'} wide>
+      <ConfigPageRow label={t('subscriptionAuth.label')} align={authIsSubscription ? 'start' : 'center'} wide>
         <div className="bitfun-ai-model-config__control-stack">
           <Select
-            value={authType}
+            value={authSelectValue}
             onChange={(value) => {
-              const next = String(value) as 'api_key' | 'codex_cli' | 'gemini_cli';
-              setEditingConfig(prev => ({ ...prev, auth: { type: next } }));
+              const next = String(value);
+              if (next === 'api_key') {
+                setEditingConfig((prev) => ({ ...prev, auth: { type: 'api_key' } }));
+                return;
+              }
+              const provider = next.replace('subscription:', '') as SubscriptionProvider;
+              setEditingConfig((prev) => ({
+                ...prev,
+                auth: { type: 'subscription', provider },
+              }));
             }}
-            options={cliAuthOptions}
+            options={authOptions}
             size="small"
           />
-          {authIsCli && (
-            <small className={matchedCliCredential ? 'resolved-url__hint bitfun-ai-model-config__cli-auth-hint' : `resolved-url__hint bitfun-ai-model-config__cli-auth-hint bitfun-ai-model-config__json-status--error`}>
-              {matchedCliCredential
-                ? t('cliAuth.detected', {
-                    label: matchedCliCredential.display_label,
-                    account: matchedCliCredential.account || t('cliAuth.unknownAccount'),
+          {authIsSubscription && (
+            <small className={matchedSubscription?.connected
+              ? 'resolved-url__hint bitfun-ai-model-config__cli-auth-hint'
+              : 'resolved-url__hint bitfun-ai-model-config__cli-auth-hint bitfun-ai-model-config__json-status--error'}
+            >
+              {matchedSubscription?.connected
+                ? t('subscriptionAuth.detected', {
+                    label: matchedSubscription.display_label,
+                    account: matchedSubscription.account || t('subscriptionAuth.unknownAccount'),
                   })
-                : t('cliAuth.notDetected', {
-                    kind: authType === 'codex_cli' ? 'Codex CLI' : 'Gemini CLI',
+                : t('subscriptionAuth.notConnected', {
+                    kind: selectedSubscriptionProvider || 'subscription',
                   })}
             </small>
           )}
@@ -1946,8 +2351,8 @@ const AIModelConfig: React.FC = () => {
 
     return (
       <>
-        <div className="bitfun-ai-model-config__form bitfun-ai-model-config__form--modal">
-          <div className="bitfun-ai-model-config__form-scrollable">
+        <div className="bitfun-ai-model-config__form bitfun-ai-model-config__form--modal" data-bf-component="ai-model-config" data-bf-part="form">
+          <div className="bitfun-ai-model-config__form-scrollable" data-bf-component="ai-model-config" data-bf-part="formBody">
             <ConfigPageSection
               title={isProviderScopedEditing ? t('editProviderSubtitle') : t('editSubtitle')}
               className="bitfun-ai-model-config__edit-section"
@@ -1958,7 +2363,7 @@ const AIModelConfig: React.FC = () => {
                   <Input data-testid="settings-model-provider-name-input" value={editingConfig.name || ''} onChange={(e) => setEditingConfig(prev => ({ ...prev, name: e.target.value }))} placeholder={t('form.configNamePlaceholder')} inputSize="small" />
                 </ConfigPageRow>
                 {renderAuthRow()}
-                {!authIsCli && renderApiKeyRow(`${t('form.apiKey')} *`)}
+                {!authIsSubscription && renderApiKeyRow(`${t('form.apiKey')} *`)}
                 <ConfigPageRow label={t('form.baseUrl')} align="center" wide>
                   <div className="bitfun-ai-model-config__control-stack">
                     {currentTemplate?.baseUrlOptions && currentTemplate.baseUrlOptions.length > 0 && (
@@ -1968,6 +2373,15 @@ const AIModelConfig: React.FC = () => {
                           const selectedOption = currentTemplate.baseUrlOptions!.find(opt => opt.url === value);
                           const newProvider = selectedOption?.format || editingConfig.provider || 'openai';
                           resetRemoteModelDiscovery();
+                          if (newProvider !== editingConfig.provider) {
+                            setSelectedModelDrafts(prevDrafts =>
+                              prevDrafts.map(draft => normalizeDraftReasoningForProvider(draft, {
+                                name: editingConfig?.name,
+                                provider: newProvider,
+                                base_url: value as string,
+                              }))
+                            );
+                          }
                           setEditingConfig(prev => ({
                             ...prev,
                             base_url: value as string,
@@ -2096,7 +2510,7 @@ const AIModelConfig: React.FC = () => {
                       <Input data-testid="settings-model-provider-name-input" value={editingConfig.name || ''} onChange={(e) => setEditingConfig(prev => ({ ...prev, name: e.target.value }))} placeholder={t('form.configNamePlaceholder')} inputSize="small" />
                     </ConfigPageRow>
                     {renderAuthRow()}
-                    {!authIsCli && renderApiKeyRow(`${t('form.apiKey')} *`)}
+                    {!authIsSubscription && renderApiKeyRow(`${t('form.apiKey')} *`)}
                     <ConfigPageRow label={`${t('form.baseUrl')} *`} align="center" wide>
                       <div className="bitfun-ai-model-config__control-stack">
                         <Input
@@ -2167,7 +2581,7 @@ const AIModelConfig: React.FC = () => {
                             : [String(value)];
                           syncSelectedModelDrafts(nextModelNames, editingConfig, !!editingConfig.id);
                         }}
-                        placeholder="glm-4.7"
+                        placeholder="glm-5.2"
                         options={availableModelOptions}
                         searchable
                         multiple={!editingConfig.id}
@@ -2375,7 +2789,7 @@ const AIModelConfig: React.FC = () => {
                   className="bitfun-ai-model-config__custom-request-body-row"
                 >
                   <div className="bitfun-ai-model-config__row-control--stack">
-                    <Textarea value={editingConfig.custom_request_body || ''} onChange={(e) => setEditingConfig(prev => ({ ...prev, custom_request_body: e.target.value }))} placeholder={t('advancedSettings.customRequestBody.placeholder')} rows={8} style={{ fontFamily: 'var(--font-family-mono)', fontSize: '13px' }} />
+                    <Textarea value={editingConfig.custom_request_body || ''} onChange={(e) => setEditingConfig(prev => ({ ...prev, custom_request_body: e.target.value }))} placeholder={t('advancedSettings.customRequestBody.placeholder')} rows={8} style={{ fontFamily: 'var(--bf-appearance-token-font-family-mono)', fontSize: '13px' }} />
                     {editingConfig.custom_request_body && editingConfig.custom_request_body.trim() !== '' && (() => {
                       try { JSON.parse(editingConfig.custom_request_body); return <small className="bitfun-ai-model-config__json-status bitfun-ai-model-config__json-status--success">{t('advancedSettings.customRequestBody.validJson')}</small>; }
                       catch { return <small className="bitfun-ai-model-config__json-status bitfun-ai-model-config__json-status--error">{t('advancedSettings.customRequestBody.invalidJson')}</small>; }
@@ -2387,7 +2801,7 @@ const AIModelConfig: React.FC = () => {
           </ConfigPageSection>
           </div>
 
-          <div className="bitfun-ai-model-config__form-actions bitfun-ai-model-config__form-actions--sticky">
+          <div className="bitfun-ai-model-config__form-actions bitfun-ai-model-config__form-actions--sticky" data-bf-component="ai-model-config" data-bf-part="formActions">
             <Button variant="secondary" onClick={closeEditingModal}>{t('actions.cancel')}</Button>
             <Button data-testid="settings-model-save-btn" variant="primary" onClick={handleSave}>{t('actions.save')}</Button>
           </div>
@@ -2406,7 +2820,11 @@ const AIModelConfig: React.FC = () => {
 
     const badge = (
       <>
-        <span className="bitfun-ai-model-config__meta-tag">
+        <span
+          className="bitfun-ai-model-config__meta-tag"
+          data-bf-component="ai-model-config"
+          data-bf-part="modelMeta"
+        >
           {t(`category.${config.category}`)}
         </span>
         {testResult && (
@@ -2424,7 +2842,11 @@ const AIModelConfig: React.FC = () => {
     );
 
     const details = (
-      <div className="bitfun-ai-model-config__details">
+      <div
+        className="bitfun-ai-model-config__details"
+        data-bf-component="ai-model-config"
+        data-bf-part="modelDetails"
+      >
         <div className="bitfun-ai-model-config__details-section">
           <div className="bitfun-ai-model-config__details-section-title">
             {t('details.basicInfo')}
@@ -2441,10 +2863,6 @@ const AIModelConfig: React.FC = () => {
             <div className="bitfun-ai-model-config__details-item">
               <span className="bitfun-ai-model-config__details-label">{t('details.contextWindow')}</span>
               <span className="bitfun-ai-model-config__details-value">{config.context_window != null ? i18nService.formatNumber(config.context_window) : '128,000'}</span>
-            </div>
-            <div className="bitfun-ai-model-config__details-item">
-              <span className="bitfun-ai-model-config__details-label">{t('details.maxOutput')}</span>
-              <span className="bitfun-ai-model-config__details-value">{config.max_tokens != null ? i18nService.formatNumber(config.max_tokens) : '-'}</span>
             </div>
             <div className="bitfun-ai-model-config__details-item bitfun-ai-model-config__details-item--wide">
               <span className="bitfun-ai-model-config__details-label">{t('details.apiUrl')}</span>
@@ -2478,7 +2896,11 @@ const AIModelConfig: React.FC = () => {
     );
 
     const control = (
-      <>
+      <div
+        className="bitfun-ai-model-config__model-actions"
+        data-bf-component="ai-model-config"
+        data-bf-part="modelActions"
+      >
         <Switch
           checked={config.enabled}
           onChange={(e) => {
@@ -2511,7 +2933,7 @@ const AIModelConfig: React.FC = () => {
         >
           <Trash2 size={14} />
         </IconButton>
-      </>
+      </div>
     );
 
     return (
@@ -2528,6 +2950,9 @@ const AIModelConfig: React.FC = () => {
         data-config-id={config.id || ''}
         data-model-id={config.model_name}
         data-model-name={config.model_name}
+        data-bf-component="ai-model-config"
+        data-bf-part="modelItem"
+        data-bf-state={[isExpanded && 'expanded', !config.enabled && 'disabled'].filter(Boolean).join(' ') || undefined}
       />
     );
   };
@@ -2566,7 +2991,7 @@ const AIModelConfig: React.FC = () => {
 
   
   return (
-    <ConfigPageLayout className="bitfun-ai-model-config">
+    <ConfigPageLayout className="bitfun-ai-model-config" data-bf-component="ai-model-config" data-bf-part="root" data-bf-view="settings">
       <ConfigPageHeader
         title={t('title')}
         subtitle={t('subtitle')}
@@ -2580,75 +3005,222 @@ const AIModelConfig: React.FC = () => {
           <DefaultModelConfig />
         </ConfigPageSection>
 
+        <ConfigPageSection title={t('subagentModels.title')}>
+          <SubagentModelConfig />
+        </ConfigPageSection>
+
+        <SessionTitleConfig />
+
         <ConfigPageSection
-          title={t('cliAuth.sectionTitle')}
-          description={t('cliAuth.sectionDescription')}
+          title={t('subscriptionAuth.sectionTitle')}
+          description={t('subscriptionAuth.sectionDescription')}
           extra={(
             <IconButton
               variant="ghost"
               size="small"
-              onClick={refreshDiscoveredCli}
-              tooltip={t('cliAuth.rescan')}
-              disabled={isDiscoveringCli}
+              onClick={refreshSubscriptionAccounts}
+              tooltip={t('subscriptionAuth.rescan')}
+              disabled={isLoadingSubscriptions}
             >
-              <RefreshCw size={16} className={isDiscoveringCli ? 'bitfun-ai-model-config__spin' : ''} />
+              <RefreshCw size={16} className={isLoadingSubscriptions ? 'bitfun-ai-model-config__spin' : ''} />
             </IconButton>
           )}
         >
-          {discoveredCli.length === 0 ? (
-            <div className="bitfun-ai-model-config__cli-empty">
-              <p>{t('cliAuth.empty')}</p>
-            </div>
-          ) : (
-            <div className="bitfun-ai-model-config__cli-discovery">
-              {discoveredCli.map(cred => {
-                const descriptionParts: string[] = [];
-                if (cred.account) {
-                  descriptionParts.push(cred.account);
-                }
-                if (cred.expires_at) {
-                  descriptionParts.push(
-                    t('cliAuth.expiresAt', {
-                      time: i18nService.formatDate(new Date(cred.expires_at * 1000), {
-                        dateStyle: 'medium',
-                        timeStyle: 'short',
-                      }),
+          <div className="bitfun-ai-model-config__cli-discovery" data-bf-component="ai-model-config" data-bf-part="subscriptionArea">
+            {showSubscriptionMigrationNotice && (
+              <div className="bitfun-ai-model-config__subscription-migration-notice" data-bf-component="ai-model-config" data-bf-part="subscriptionNotice" role="status">
+                <Info size={16} aria-hidden="true" />
+                <span>{t('subscriptionAuth.secureStoreMigrationNotice')}</span>
+                <Button
+                  size="small"
+                  variant="ghost"
+                  onClick={dismissSubscriptionMigrationNotice}
+                >
+                  {t('subscriptionAuth.dismissMigrationNotice')}
+                </Button>
+              </div>
+            )}
+            {subscriptionAccounts.map((account) => {
+              const descriptionParts: string[] = [];
+              if (account.connected && account.account) {
+                descriptionParts.push(account.account);
+              }
+              if (account.connected && account.expires_at) {
+                descriptionParts.push(
+                  t('subscriptionAuth.expiresAt', {
+                    time: i18nService.formatDate(new Date(account.expires_at * 1000), {
+                      dateStyle: 'medium',
+                      timeStyle: 'short',
                     }),
-                  );
-                } else {
-                  descriptionParts.push(t('cliAuth.tokenValid'));
-                }
-                return (
+                  }),
+                );
+              } else if (account.connected) {
+                descriptionParts.push(t('subscriptionAuth.tokenValid'));
+              } else if (account.vault_unavailable) {
+                descriptionParts.push(t('subscriptionAuth.vaultUnavailable'));
+              } else if (account.reauthentication_required) {
+                descriptionParts.push(t('subscriptionAuth.reauthenticationRequired'));
+              } else {
+                descriptionParts.push(t('subscriptionAuth.notSignedIn'));
+              }
+              const isLoggingIn = loggingInProvider === account.provider;
+              const anyLoginInProgress = loggingInProvider !== null;
+              const loginPanel = subscriptionLoginPanel?.provider === account.provider
+                ? subscriptionLoginPanel
+                : null;
+              const remainingSeconds = loginPanel?.deadlineMs
+                ? Math.max(0, Math.ceil((loginPanel.deadlineMs - subscriptionLoginClock) / 1000))
+                : 0;
+              const countdown = `${Math.floor(remainingSeconds / 60)}:${String(remainingSeconds % 60).padStart(2, '0')}`;
+              return (
+                <React.Fragment key={account.provider}>
                   <ConfigPageRow
-                    key={`${cred.kind}-${cred.source_path}`}
-                    label={cred.display_label}
-                    description={descriptionParts.join(' · ')}
+                    label={account.display_label}
+                    description={descriptionParts.map((part) => (
+                      <span
+                        key={part}
+                        className="bitfun-ai-model-config__cli-description-line"
+                      >
+                        {part}
+                      </span>
+                    ))}
+                    className="bitfun-ai-model-config__cli-account"
                     align="center"
                   >
                     <div className="bitfun-ai-model-config__cli-actions">
-                      <Button
-                        size="small"
-                        variant="secondary"
-                        onClick={() => handleRefreshCli(cred.kind)}
-                      >
-                        {t('cliAuth.refresh')}
-                      </Button>
-                      <Button
-                        size="small"
-                        variant="primary"
-                        onClick={() => handleImportFromCli(cred)}
-                      >
-                        {t('cliAuth.import')}
-                      </Button>
+                      {account.connected ? (
+                        <>
+                          <Button
+                            size="small"
+                            variant="secondary"
+                            disabled={anyLoginInProgress}
+                            onClick={() => void handleSubscriptionRefresh(account.provider)}
+                          >
+                            {t('subscriptionAuth.refresh')}
+                          </Button>
+                          <Button
+                            size="small"
+                            variant="secondary"
+                            disabled={anyLoginInProgress}
+                            onClick={() => requestSubscriptionLogout(account)}
+                          >
+                            {t('subscriptionAuth.logout')}
+                          </Button>
+                          <Button
+                            size="small"
+                            variant="primary"
+                            disabled={anyLoginInProgress}
+                            onClick={() => handleImportFromSubscription(account)}
+                          >
+                            {t('subscriptionAuth.import')}
+                          </Button>
+                        </>
+                      ) : account.vault_unavailable ? (
+                        <Button
+                          size="small"
+                          variant="secondary"
+                          disabled={anyLoginInProgress}
+                          onClick={() => void handleSubscriptionRefresh(account.provider)}
+                        >
+                          {t('subscriptionAuth.retryVault')}
+                        </Button>
+                      ) : (
+                        <Button
+                          size="small"
+                          variant="primary"
+                          isLoading={isLoggingIn}
+                          disabled={anyLoginInProgress}
+                          onClick={() => void handleSubscriptionLogin(account.provider)}
+                        >
+                          {t('subscriptionAuth.login')}
+                        </Button>
+                      )}
+                      {isLoggingIn && (
+                        <Button
+                          size="small"
+                          variant="secondary"
+                          disabled={loginPanel?.status === 'cancelling'}
+                          onClick={() => void handleCancelSubscriptionLogin(account.provider)}
+                        >
+                          {t('subscriptionAuth.cancel')}
+                        </Button>
+                      )}
                     </div>
                   </ConfigPageRow>
-                );
-              })}
-            </div>
-          )}
+
+                  {loginPanel && (
+                    <div
+                      className={`bitfun-ai-model-config__subscription-login-panel bitfun-ai-model-config__subscription-login-panel--${loginPanel.status}`}
+                      data-bf-component="ai-model-config"
+                      data-bf-part="subscriptionPanel"
+                      data-bf-status={loginPanel.status}
+                      role={loginPanel.status === 'failed' ? 'alert' : 'status'}
+                    >
+                      <div className="bitfun-ai-model-config__subscription-login-summary" data-bf-component="ai-model-config" data-bf-part="subscriptionSummary">
+                        <strong>
+                          {loginPanel.status === 'failed'
+                            ? t('subscriptionAuth.loginNeedsRetry')
+                            : loginPanel.status === 'cancelling'
+                              ? t('subscriptionAuth.loginCancelling')
+                              : t('subscriptionAuth.loginPending')}
+                        </strong>
+                        {loginPanel.status === 'pending' && (
+                          <span>{t('subscriptionAuth.timeRemaining', { time: countdown })}</span>
+                        )}
+                        {loginPanel.status === 'failed' && loginPanel.error && (
+                          <span>{t('subscriptionAuth.loginFailedInline', { error: loginPanel.error })}</span>
+                        )}
+                      </div>
+
+                      {loginPanel.status === 'pending' && loginPanel.userCode && (
+                        <div className="bitfun-ai-model-config__subscription-code" data-bf-component="ai-model-config" data-bf-part="subscriptionCode">
+                          <span>{t('subscriptionAuth.verificationCode')}</span>
+                          <code>{loginPanel.userCode}</code>
+                        </div>
+                      )}
+
+                      {(loginPanel.status === 'pending' || loginPanel.status === 'failed') && (
+                        <div className="bitfun-ai-model-config__subscription-login-actions" data-bf-component="ai-model-config" data-bf-part="subscriptionActions">
+                          {loginPanel.status === 'pending' && loginPanel.userCode && (
+                            <Button
+                              size="small"
+                              variant="secondary"
+                              onClick={() => void handleCopySubscriptionCode(loginPanel.userCode!)}
+                            >
+                              {t('subscriptionAuth.copyCode')}
+                            </Button>
+                          )}
+                          {loginPanel.status === 'pending' && loginPanel.authorizationUrl && (
+                            <Button
+                              size="small"
+                              variant="secondary"
+                              onClick={() => void handleOpenSubscriptionAuthorization(loginPanel.authorizationUrl)}
+                            >
+                              <ExternalLink size={14} aria-hidden="true" />
+                              {t('subscriptionAuth.openAuthorization')}
+                            </Button>
+                          )}
+                          {loginPanel.status === 'failed' && (
+                            <Button
+                              size="small"
+                              variant="primary"
+                              onClick={() => void handleSubscriptionLogin(account.provider)}
+                            >
+                              {t('subscriptionAuth.retryLogin')}
+                            </Button>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </React.Fragment>
+              );
+            })}
+          </div>
         </ConfigPageSection>
 
         <ConfigPageSection
+          className="bitfun-ai-model-config__models-section"
           title={tDefault('tabs.models')}
           description={t('subtitle')}
           extra={(
@@ -2663,7 +3235,7 @@ const AIModelConfig: React.FC = () => {
           )}
         >
           {aiModels.length === 0 ? (
-            <div className="bitfun-ai-model-config__empty">
+            <div className="bitfun-ai-model-config__empty" data-bf-component="ai-model-config" data-bf-part="empty">
               <Wifi size={36} />
               <p>{t('empty.noModels')}</p>
               <Button data-testid="settings-model-create-first-config-btn" variant="primary" size="small" onClick={handleCreateNew}>
@@ -2672,18 +3244,18 @@ const AIModelConfig: React.FC = () => {
               </Button>
             </div>
           ) : (
-            <div className="bitfun-ai-model-config__collection" data-testid="settings-model-list">
+            <div className="bitfun-ai-model-config__collection" data-bf-component="ai-model-config" data-bf-part="collection" data-testid="settings-model-list">
               {providerGroups.map(group => (
-                <div key={group.key} className="bitfun-ai-model-config__provider-group">
-                  <div className="bitfun-ai-model-config__provider-group-header">
-                    <div className="bitfun-ai-model-config__provider-group-title">
+                <div key={group.key} className="bitfun-ai-model-config__provider-group" data-bf-component="ai-model-config" data-bf-part="providerGroup">
+                  <div className="bitfun-ai-model-config__provider-group-header" data-bf-component="ai-model-config" data-bf-part="providerGroupHeader">
+                    <div className="bitfun-ai-model-config__provider-group-title" data-bf-component="ai-model-config" data-bf-part="providerGroupTitle">
                       <span>{group.providerName}</span>
                       <span className="bitfun-ai-model-config__provider-group-count">{group.models.length}</span>
                       <span className="bitfun-ai-model-config__meta-tag">
                         {requestFormatLabelMap[group.models[0]?.provider || 'openai'] || (group.models[0]?.provider || 'openai')}
                       </span>
                     </div>
-                    <div className="bitfun-ai-model-config__provider-group-actions">
+                    <div className="bitfun-ai-model-config__provider-group-actions" data-bf-component="ai-model-config" data-bf-part="providerGroupActions">
                       <IconButton
                         variant="ghost"
                         size="small"
@@ -2694,7 +3266,7 @@ const AIModelConfig: React.FC = () => {
                       </IconButton>
                     </div>
                   </div>
-                  <div className="bitfun-ai-model-config__provider-group-list">
+                  <div className="bitfun-ai-model-config__provider-group-list" data-bf-component="ai-model-config" data-bf-part="providerGroupList">
                     {group.models.map(config => renderModelCollectionItem(config))}
                   </div>
                 </div>
@@ -2741,6 +3313,24 @@ const AIModelConfig: React.FC = () => {
               onChange={(e) => setStreamIdleTimeoutInput(e.target.value)}
               placeholder={t('streamIdleTimeout.placeholder')}
               inputSize="small"
+            />
+          </ConfigPageRow>
+        </ConfigPageSection>
+
+        <ConfigPageSection
+          title={t('toolArgumentJsonRepair.title')}
+          description={t('toolArgumentJsonRepair.description')}
+        >
+          <ConfigPageRow
+            label={t('toolArgumentJsonRepair.label')}
+            description={t('toolArgumentJsonRepair.hint')}
+            align="center"
+          >
+            <Switch
+              checked={allowNormalToolJsonRepair}
+              onChange={(e) => void handleToggleNormalToolJsonRepair(e.target.checked)}
+              disabled={isToolJsonRepairSaving}
+              size="small"
             />
           </ConfigPageRow>
         </ConfigPageSection>
@@ -2796,6 +3386,48 @@ const AIModelConfig: React.FC = () => {
           </ConfigPageRow>
         </ConfigPageSection>
       </ConfigPageContent>
+
+      <Modal
+        isOpen={!!subscriptionLogoutRequest}
+        onClose={() => setSubscriptionLogoutRequest(null)}
+        title={t('subscriptionAuth.logoutConfirmTitle')}
+        size="small"
+        closeOnOverlayClick={false}
+      >
+        <div className="bitfun-ai-model-config__subscription-logout-confirm" data-bf-component="ai-model-config" data-bf-part="logoutConfirm">
+          <p>
+            {subscriptionLogoutRequest?.affectedModels.length
+              ? t('subscriptionAuth.logoutAffectedModels', {
+                  count: subscriptionLogoutRequest.affectedModels.length,
+                })
+              : t('subscriptionAuth.logoutNoAffectedModels')}
+          </p>
+          {!!subscriptionLogoutRequest?.affectedModels.length && (
+            <ul>
+              {subscriptionLogoutRequest.affectedModels.map((model) => (
+                <li key={model.id}>{model.name} · {model.model_name}</li>
+              ))}
+            </ul>
+          )}
+          <p>{t('subscriptionAuth.logoutConsequence')}</p>
+          <div className="bitfun-ai-model-config__subscription-logout-actions" data-bf-component="ai-model-config" data-bf-part="logoutActions">
+            <Button
+              size="small"
+              variant="secondary"
+              onClick={() => setSubscriptionLogoutRequest(null)}
+            >
+              {t('subscriptionAuth.cancel')}
+            </Button>
+            <Button
+              size="small"
+              variant="danger"
+              onClick={() => void confirmSubscriptionLogout()}
+            >
+              {t('subscriptionAuth.confirmLogout')}
+            </Button>
+          </div>
+        </div>
+      </Modal>
 
       <Modal
         isOpen={isEditing && !!editingConfig}

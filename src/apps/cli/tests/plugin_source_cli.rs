@@ -42,7 +42,7 @@ fn write_package(workspace: &Path, source: &[u8], declared_hash: &str) {
 
 fn run_cli(workspace: &Path, user_root: &Path, home_root: &Path, args: &[&str]) -> Output {
     let config_root = user_root.join("host-config");
-    Command::new(env!("CARGO_BIN_EXE_bitfun-cli"))
+    Command::new(env!("CARGO_BIN_EXE_bitfun"))
         .args(args)
         .current_dir(workspace)
         .env_remove("BITFUN_USER_ROOT")
@@ -54,7 +54,7 @@ fn run_cli(workspace: &Path, user_root: &Path, home_root: &Path, args: &[&str]) 
         .env("XDG_CONFIG_HOME", &config_root)
         .env("HOME", home_root)
         .output()
-        .expect("run bitfun-cli")
+        .expect("run bitfun")
 }
 
 fn stdout(output: &Output) -> String {
@@ -71,6 +71,30 @@ fn activation_content_hash(output: &Output) -> String {
         .find_map(|line| line.strip_prefix("Content hash: "))
         .expect("activation preview content hash")
         .to_string()
+}
+
+fn activate_package(workspace: &Path, user_root: &Path, home_root: &Path) {
+    let preview = run_cli(
+        workspace,
+        user_root,
+        home_root,
+        &["plugins", "activate", "acme.demo"],
+    );
+    assert!(preview.status.success(), "{}", stderr(&preview));
+    let content_hash = activation_content_hash(&preview);
+    let activate = run_cli(
+        workspace,
+        user_root,
+        home_root,
+        &[
+            "plugins",
+            "activate",
+            "acme.demo",
+            "--confirm",
+            &content_hash,
+        ],
+    );
+    assert!(activate.status.success(), "{}", stderr(&activate));
 }
 
 fn find_trust_file(root: &Path) -> Option<PathBuf> {
@@ -96,7 +120,7 @@ fn plugin_source_cli_rejects_unavailable_product_paths() {
     let config_root = temp.path().join("host-config");
     std::fs::create_dir_all(&workspace).expect("create workspace");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_bitfun-cli"))
+    let output = Command::new(env!("CARGO_BIN_EXE_bitfun"))
         .args(["plugins", "list"])
         .current_dir(&workspace)
         .env_remove("BITFUN_USER_ROOT")
@@ -107,7 +131,7 @@ fn plugin_source_cli_rejects_unavailable_product_paths() {
         .env("APPDATA", &config_root)
         .env("XDG_CONFIG_HOME", &config_root)
         .output()
-        .expect("run bitfun-cli");
+        .expect("run bitfun");
 
     assert!(!output.status.success());
     assert!(stderr(&output).contains("Configuration error"));
@@ -172,7 +196,7 @@ fn plugin_source_cli_lifecycle_and_doctor_exit_codes() {
     assert!(!rejected.status.success());
     assert!(stderr(&rejected).contains("does not match"));
     assert!(stderr(&rejected)
-        .contains("Re-run `bitfun-cli plugins activate acme.demo` to preview the current content"));
+        .contains("Re-run `bitfun plugins activate acme.demo` to preview the current content"));
 
     let content_hash = activation_content_hash(&preview);
 
@@ -204,7 +228,7 @@ fn plugin_source_cli_lifecycle_and_doctor_exit_codes() {
         &["plugins", "deactivate", "acme.demo"],
     );
     assert!(deactivate.status.success(), "{}", stderr(&deactivate));
-    assert!(stdout(&deactivate).contains("is inactive"));
+    assert!(stdout(&deactivate).contains("was deactivated"));
 
     let healthy = run_cli(&workspace, &user_root, &home_root, &["doctor"]);
     assert!(healthy.status.success(), "{}", stderr(&healthy));
@@ -255,4 +279,128 @@ fn plugin_source_cli_lifecycle_and_doctor_exit_codes() {
     let unhealthy = run_cli(&workspace, &user_root, &home_root, &["doctor"]);
     assert_eq!(unhealthy.status.code(), Some(1), "{}", stderr(&unhealthy));
     assert!(stdout(&unhealthy).contains("hash_mismatch"));
+}
+
+#[test]
+fn plugin_deactivate_cleans_residual_records_without_revoking_source_approval() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let workspace = temp.path().join("workspace");
+    let user_root = temp.path().join("user-root");
+    let home_root = temp.path().join("home-root");
+    std::fs::create_dir_all(&workspace).expect("create workspace");
+    write_package(&workspace, PLUGIN_SOURCE, &sha256(PLUGIN_SOURCE));
+
+    let approve = run_cli(
+        &workspace,
+        &user_root,
+        &home_root,
+        &["plugins", "approve-source", "acme.demo"],
+    );
+    assert!(approve.status.success(), "{}", stderr(&approve));
+    activate_package(&workspace, &user_root, &home_root);
+
+    std::fs::remove_dir_all(workspace.join(".bitfun/plugins/acme.demo")).expect("remove package");
+    let missing = run_cli(
+        &workspace,
+        &user_root,
+        &home_root,
+        &["plugins", "deactivate", "acme.demo"],
+    );
+    assert!(missing.status.success(), "{}", stderr(&missing));
+    assert!(stdout(&missing).contains("is unavailable"));
+    assert!(stdout(&missing).contains("saved activation state was cleared"));
+
+    let repeated = run_cli(
+        &workspace,
+        &user_root,
+        &home_root,
+        &["plugins", "deactivate", "acme.demo"],
+    );
+    assert!(repeated.status.success(), "{}", stderr(&repeated));
+    assert!(stdout(&repeated).contains("is unavailable"));
+    assert!(stdout(&repeated).contains("has no saved activation state"));
+
+    let missing_list = run_cli(&workspace, &user_root, &home_root, &["plugins", "list"]);
+    assert!(missing_list.status.success(), "{}", stderr(&missing_list));
+    let missing_doctor = run_cli(&workspace, &user_root, &home_root, &["doctor"]);
+    assert!(
+        missing_doctor.status.success(),
+        "{}",
+        stderr(&missing_doctor)
+    );
+
+    write_package(&workspace, PLUGIN_SOURCE, &sha256(PLUGIN_SOURCE));
+    activate_package(&workspace, &user_root, &home_root);
+    std::fs::write(
+        workspace.join(".bitfun/plugins/acme.demo/bitfun.plugin.json"),
+        "{not-json",
+    )
+    .expect("corrupt package manifest");
+
+    let corrupt = run_cli(
+        &workspace,
+        &user_root,
+        &home_root,
+        &["plugins", "deactivate", "acme.demo"],
+    );
+    assert!(corrupt.status.success(), "{}", stderr(&corrupt));
+    assert!(stdout(&corrupt).contains("is unavailable"));
+    assert!(stdout(&corrupt).contains("saved activation state was cleared"));
+    assert!(stdout(&corrupt).contains("[error:invalid_manifest]"));
+    assert!(stdout(&corrupt).contains("bitfun.plugin.json"));
+
+    write_package(&workspace, PLUGIN_SOURCE, &sha256(PLUGIN_SOURCE));
+    activate_package(&workspace, &user_root, &home_root);
+    std::fs::remove_dir_all(workspace.join(".bitfun/plugins")).expect("remove plugin root");
+    std::fs::write(workspace.join(".bitfun/plugins"), "not a directory")
+        .expect("make plugin root unreadable");
+
+    let incomplete = run_cli(
+        &workspace,
+        &user_root,
+        &home_root,
+        &["plugins", "deactivate", "acme.demo"],
+    );
+    assert!(incomplete.status.success(), "{}", stderr(&incomplete));
+    assert!(stdout(&incomplete).contains("saved activation state was cleared"));
+    assert!(stdout(&incomplete).contains("availability could not be determined"));
+    assert!(stdout(&incomplete).contains("[error:root_read_failed]"));
+
+    let incomplete_doctor = run_cli(&workspace, &user_root, &home_root, &["doctor"]);
+    assert_eq!(incomplete_doctor.status.code(), Some(1));
+    assert!(stdout(&incomplete_doctor).contains("source scan is incomplete"));
+    assert!(!stdout(&incomplete_doctor).contains("[ok] Managed plugin source integrity checked"));
+}
+
+#[test]
+fn plugin_deactivate_does_not_claim_a_same_id_replacement_was_active() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let workspace = temp.path().join("workspace");
+    let user_root = temp.path().join("user-root");
+    let home_root = temp.path().join("home-root");
+    std::fs::create_dir_all(&workspace).expect("create workspace");
+    write_package(&workspace, PLUGIN_SOURCE, &sha256(PLUGIN_SOURCE));
+
+    let approve = run_cli(
+        &workspace,
+        &user_root,
+        &home_root,
+        &["plugins", "approve-source", "acme.demo"],
+    );
+    assert!(approve.status.success(), "{}", stderr(&approve));
+    activate_package(&workspace, &user_root, &home_root);
+
+    let replacement = b"export const ReplacementPlugin = async () => ({})";
+    write_package(&workspace, replacement, &sha256(replacement));
+    let deactivate = run_cli(
+        &workspace,
+        &user_root,
+        &home_root,
+        &["plugins", "deactivate", "acme.demo"],
+    );
+
+    assert!(deactivate.status.success(), "{}", stderr(&deactivate));
+    assert!(stdout(&deactivate).contains("previous source's saved activation state was cleared"));
+    assert!(stdout(&deactivate).contains("current package was not active"));
+    assert!(!stdout(&deactivate).contains("was deactivated"));
 }

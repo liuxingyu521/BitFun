@@ -12,6 +12,11 @@ Repository rule: **keep product logic platform-agnostic, then expose it through 
 2. For desktop development, prefer `pnpm run desktop:dev` — it provides full hot-reload (Vite HMR + Rust auto-rebuild & restart). Use `pnpm run desktop:preview:debug` only when you need a faster cold-start for frontend-only iteration (Rust changes are not auto-rebuilt).
 3. After Rust file changes, prefer `pnpm run fmt:rs` to format only changed or staged `.rs` files. Use `cargo fmt` only when you intentionally want broader formatting coverage.
 4. After changes, run the smallest matching verification from the table below.
+5. Workspace Rust dependencies own compatible versions, not broad capability
+   unions. Each crate must select the dependency features it actually uses;
+   keep test-only features in dev-dependencies and attach feature-gated service
+   capabilities to the owning crate feature. `tokio/full` is forbidden in the
+   root workspace and workspace members.
 
 ## Layered Module Index
 
@@ -24,11 +29,11 @@ Keep crate dependencies inside each layer to the smallest set needed.
 
 | # | Layer | Path | Owns | Modules / entries | Layer doc |
 |---|---|---|---|---|---|
-| 1 | Interfaces and entrypoints | `src/apps/*`, `src/web-ui`, `src/mobile-web`, `BitFun-Installer`, `tests/e2e`, `src/crates/interfaces` | Product hosts, commands, UI entrypoints, protocol interfaces, and cross-surface tests | desktop, CLI, server, relay, Web UI, mobile web, installer, E2E, `acp` | nearest local `AGENTS.md`; [interfaces](src/crates/interfaces/AGENTS.md) |
-| 2 | Product assembly | `src/crates/assembly` | Compatibility exports, product capability selection, product-full wiring, and adapter/service registration | `core`, `product-capabilities` | [AGENTS.md](src/crates/assembly/AGENTS.md) |
-| 3 | Adapters | `src/crates/adapters` | AI/API/transport/WebDriver protocol adapters and external-provider translation | `ai-adapters`, `api-layer`, `transport`, `webdriver` | [AGENTS.md](src/crates/adapters/AGENTS.md) |
-| 4 | Services | `src/crates/services` | Reusable OS, filesystem, terminal, MCP, remote, git, watch, process, LSP plugin registry, session persistence primitives, MiniApp runtime IO, and network implementations | `services-core`, `services-integrations`, `terminal` | [AGENTS.md](src/crates/services/AGENTS.md) |
-| 5 | Execution primitives | `src/crates/execution` | Portable agent, harness, stream, DeepReview policy/report, plugin host boundary, typed-service, tool-contract, tool-group, and tool-execution building blocks | `agent-runtime`, `agent-stream`, `tool-contracts`, `harness`, `plugin-runtime-host`, `runtime-services`, `tool-provider-groups`, `tool-execution` | [AGENTS.md](src/crates/execution/AGENTS.md) |
+| 1 | Interfaces and entrypoints | `src/apps/*`, `src/web-ui`, `src/mobile-web`, `BitFun-Installer`, `tests/e2e`, `src/crates/interfaces` | Product hosts, commands, UI entrypoints, protocol interfaces, and cross-surface tests | desktop, CLI, server, relay, Web UI, mobile web, installer, E2E, `acp`, `sdk-host` | nearest local `AGENTS.md`; [interfaces](src/crates/interfaces/AGENTS.md) |
+| 2 | Product assembly | `src/crates/assembly` | Compatibility exports, product capability selection, product-full wiring, adapter/service registration, and ecosystem-neutral source coordination | `core`, `external-sources`, `product-capabilities` | [AGENTS.md](src/crates/assembly/AGENTS.md) |
+| 3 | Adapters | `src/crates/adapters` | AI/transport/WebDriver protocol adapters, external AI work source adapters (OpenCode/Claude Code/Codex), and external-provider translation | `agent-runtime-ipc`, `ai-adapters`, `opencode-adapter`, `claude-code-adapter`, `codex-adapter`, `static-hook-support`, `transport`, `webdriver` | [AGENTS.md](src/crates/adapters/AGENTS.md) |
+| 4 | Services | `src/crates/services` | Reusable OS, filesystem, terminal, MCP, remote, git, watch, process, LSP plugin registry, session persistence primitives, MiniApp runtime IO, and network implementations | `services-core`, `services-integrations`, `miniapp-market-service`, `relay-service`, `page-function-runtime`, `terminal` | [AGENTS.md](src/crates/services/AGENTS.md) |
+| 5 | Execution primitives | `src/crates/execution` | Portable agent, harness, stream, DeepReview policy/report, plugin runtime client, typed-service, tool-contract, tool-group, and tool-execution building blocks | `agent-runtime`, `agent-stream`, `tool-contracts`, `harness`, `plugin-runtime-client`, `runtime-services`, `tool-provider-groups`, `tool-execution`, `tool-call-jsonrepair` | [AGENTS.md](src/crates/execution/AGENTS.md) |
 | 6 | Stable contracts and product domains | `src/crates/contracts` | Shared DTOs, event shapes, runtime ports, LSP protocol/plugin DTOs, and product domain contracts/policies | `core-types`, `events`, `runtime-ports`, `product-domains` | [AGENTS.md](src/crates/contracts/AGENTS.md) |
 
 Boundary rules:
@@ -58,6 +63,7 @@ pnpm run desktop:dev               # full hot-reload: Vite HMR + Rust auto-rebui
 pnpm run desktop:preview:debug     # reuse pre-built binary + Vite HMR; no Rust auto-rebuild
 pnpm run dev:web                   # browser-only frontend
 pnpm run cli:dev                   # CLI runtime
+pnpm run cli:install               # build release + install bitfun (Windows/macOS/Linux; deprecated bitfun-cli included)
 
 # Check
 pnpm run fmt:rs                     # format only changed / staged Rust files
@@ -66,11 +72,13 @@ pnpm run type-check:web
 pnpm --dir src/mobile-web run type-check
 pnpm run i18n:contract:test          # i18n contract / resources only
 pnpm run i18n:audit                  # i18n contract / resources only
+pnpm run product:check               # default product definition
 pnpm run check:repo-hygiene
 pnpm run check:github-config
 cargo check --workspace
 
 # Test (prefer focused paths locally; broad suites are CI-backed)
+pnpm run product:test
 pnpm --dir src/web-ui run test:run      # broad suite; prefer focused paths locally
 cargo test --workspace                  # broad suite; CI-backed
 
@@ -87,7 +95,28 @@ pnpm run desktop:build:nsis:fast      # Windows installer, release-fast profile
 
 For the full script list, see [`package.json`](package.json).
 
+### Build escape hatches
+
+The dev/build pipeline trades some flexibility for speed. Override when needed:
+
+| Variable / flag | Use when |
+| --- | --- |
+| `CARGO_PROFILE_DEV_DEBUG=2` | You need full debug info for breakpoints. The dev profile ships `line-tables-only` (panic backtraces keep line numbers, PDBs stay small). |
+| `BITFUN_MOBILE_WEB_FORCE_BUILD=1` or `node scripts/mobile-web-build.cjs --force` | mobile-web must rebuild even though its sources look unchanged. The build is skipped when `src/mobile-web/dist` is newer than every input. |
+| `VITE_USE_POLLING=1` | The Vite dev watcher misses changes — typically on a network drive or a WSL mount. Native file events are the default. |
+
+`pnpm run build:web` runs the type-check and the Vite build concurrently, so a
+type error and a bundling error can surface in either order; both are prefixed
+(`[type-check]` / `[vite-build]`) in the output.
+
 ## Global rules
+
+### Process artifacts
+
+- Do not add or update files under `docs/superpowers/**`. Keep temporary
+  planning, design, and implementation-process artifacts local. Move durable
+  architecture or feature facts into the existing document for that area, and
+  put user-facing guidance in the owning app README.
 
 ### Internationalization
 
@@ -150,27 +179,39 @@ await api.invoke('your_command', { request: { ... } });
 ### Platform boundaries
 
 - Do not call Tauri APIs directly from UI components; go through the adapter/infrastructure layer.
-- Desktop-only host adapters belong in `src/apps/desktop`, then flow back through transport/API layers.
+- Desktop-only host adapters belong in `src/apps/desktop`, then flow through typed capability interfaces and, when event delivery is needed, the production transport adapter.
 - In shared core, avoid host-specific APIs such as `tauri::AppHandle`; use shared abstractions such as `bitfun_events::EventEmitter`.
 
 ### Remote compatibility
 
 - When adding features, consider remote workspace and remote control synchronization support from the start. Local-only behavior can silently leave remote scenarios incomplete.
 - If a feature cannot reasonably support remote workspaces, gate it or show a clear unsupported-state message instead of letting it fail with a generic error.
+- Every desktop Tauri command must declare its remote-workspace policy in
+ `src/apps/desktop/src/api/remote_workspace_policy.rs`; the contract test there
+ rejects new commands without an explicit policy and forbids growing the
+ legacy-unaudited backlog.
 
 ### Agent loop behavior
 
 - Do not add hard-coded limits or pattern checks to the agent loop as a first response to looping behavior, such as blocking repeated tool calls by string or count alone.
 - Excessive hard-coding turns the agent loop into a brittle workflow engine. Investigate the root cause first: tool behavior, model interaction, session context packaging, prompt/tool schema design, or state synchronization issues.
 
+### Agent hooks
+
+- BitFun implements the Codex hook contract, so <https://learn.chatgpt.com/docs/hooks> is the reference for events, payload fields, and the decision schema. Do not fork that contract. [`docs/features/agent-hooks.md`](docs/features/agent-hooks.md) ([中文](docs/features/agent-hooks.zh-CN.md)) covers only the BitFun-specific parts — file locations, the `app.hooks` gates, and the deviations table — and must be updated whenever a deviation is added or closed.
+- The portable engine (settings parsing, payload construction, process execution, decision merging) lives in `bitfun-agent-runtime::native_hooks`. `bitfun-core::native_hooks` owns config discovery, gating, and per-event dispatch helpers; dispatch sites call those helpers instead of executing hooks inline.
+- Three separate things share the word "hook": these native user hooks, the internal compiled-in `post_call_hooks`, and the read-only external hook catalog of other AI applications (`external_hooks`). Keep them separate.
+
 ## Architecture
 
 ### Product architecture guardrails
 
 For any `bitfun-core` decomposition, feature-boundary, dependency-boundary, or
-Rust build-speed refactor, read
+Rust build-speed refactor, read both
 [`docs/architecture/product-architecture.md`](docs/architecture/product-architecture.md)
-before editing. Keep this file as an entry point; put module-specific ownership
+and
+[`docs/architecture/rust-build-dependency-boundaries.md`](docs/architecture/rust-build-dependency-boundaries.md)
+before editing. Keep these files as entry points; put module-specific ownership
 details in the nearest module `AGENTS.md`.
 
 Repository-level decomposition rules:
@@ -182,6 +223,13 @@ Repository-level decomposition rules:
   compatibility, behavior equivalence tests, and explicit confirmation when a
   behavior boundary could change.
 
+For Agent Runtime deployment, multi-GUI/TUI/Remote instances, shared Session
+control, or process-topology changes, also read
+[`docs/architecture/agent-runtime-deployment-design.md`](docs/architecture/agent-runtime-deployment-design.md).
+Do not key Rust Runtime or Node/Bun Plugin Host processes by client, workspace,
+session, or plugin by default; use the responsible state module, execution and
+security conditions, and measured capacity.
+
 ### CLI product-line guardrails
 
 For CLI/TUI parity work, non-interactive output contracts, external config
@@ -191,15 +239,37 @@ and [`src/apps/cli/AGENTS.md`](src/apps/cli/AGENTS.md). Keep CLI/TUI presentatio
 in the app; move reusable product behavior through Product Assembly, Agent
 Runtime, Tool/Harness, Runtime Services, or the existing extension boundaries.
 
+### HarmonyOS PC CLI/TUI guardrails
+
+For changes that affect HarmonyOS PC CLI/TUI support, also read
+[`docs/architecture/platform-portability-design.md`](docs/architecture/platform-portability-design.md).
+This is a future platform target, not implemented support. The product target is
+the real PC system terminal; HAP, `hdc shell`, the phone Remote App, and remote
+execution are not substitutes. Design each concrete adaptation as a separate
+topic and keep the current mobile capability unchanged.
+
 ### Product customization guardrails
 
-For Product Profiles, branded distributions, GUI/TUI Surface Blueprints,
+For product definitions, branded distributions, GUI/TUI layout selection,
 bundled product extensions, or customization build tasks, read
 [`docs/architecture/product-customization-blueprint.md`](docs/architecture/product-customization-blueprint.md).
 Keep product customization separate from user runtime configuration and plugins.
 GUI and TUI may share stable product facts, but not layout, component, theme-key,
-keybinding, or renderer schemas. Surface Blueprints must not carry runtime plugin
-trust, installation, activation, or update state.
+keybinding, or renderer schemas. Product assembly results and layout selections
+may carry a small immutable list of product identity, data-isolation, recovery,
+upgrade-integrity, or legal protection IDs. They must not carry user/source-level
+plugin policy, installation, activation, update, permission, or dynamic health state.
+Product Profile, Brand Pack, GUI/TUI Surface Blueprint, and Resolved Product Manifest are retired
+design terms, not current production objects. Do not create compatibility formats
+for them; implement only the smallest product-definition and assembly-result fields
+used by a real build and runtime consumer.
+
+For OpenCode live configuration or plugin execution, also read
+[`docs/architecture/extensions/opencode-extension-compatibility.md`](docs/architecture/extensions/opencode-extension-compatibility.md).
+The current P0 adapter remains a managed-package/static-preview path until the matching
+OC-R phase is implemented and verified. Do not extend the legacy managed-package
+path as the target OpenCode runtime model, and do not treat a design target as an
+already available capability.
 
 ### SDLC quality guardrails
 
@@ -227,13 +297,16 @@ change directly affects build, packaging, or CI cannot protect the path.
 | Locale contract or shared terms | `pnpm run i18n:generate && pnpm run i18n:contract:test && pnpm run i18n:audit` |
 | Web UI i18n runtime, namespace loading, or direct `i18nService.t(...)` usage | `pnpm run i18n:contract:test && pnpm run type-check:web && pnpm --dir src/web-ui run test:run src/infrastructure/i18n/core/I18nService.test.ts` |
 | Mobile web UI, state, pairing, disconnect, or reconnect behavior | `pnpm --dir src/mobile-web run type-check`; include manual pairing / reconnect notes when behavior changes |
-| Shared Rust logic in `core`, `transport`, `api-layer`, adapters, or services | `cargo check --workspace`, plus the nearest focused `cargo test` when behavior changed |
+| Product definition, schema, resolver, or Desktop/CLI product build adapter | `pnpm run product:test`, plus `pnpm run product:check` for the default definition |
+| Cargo manifests, features, test targets, or crate dependency boundaries | `pnpm run check:core-boundaries:test && pnpm run check:core-boundaries`; add the smallest affected `cargo check -p <owner> --no-default-features --features <feature>` or focused target test when the compiled path changes |
+| Shared Rust logic in `core`, `transport`, adapters, or services | `cargo check --workspace`, plus the nearest focused `cargo test` when behavior changed |
 | Desktop integration, Tauri APIs, browser/computer-use, or desktop-only behavior | `cargo check -p bitfun-desktop`, plus focused desktop tests when behavior changed |
 | Behavior covered by desktop smoke/functional flows | Prefer the nearest focused E2E/smoke check; rely on CI for broad build/test coverage unless build behavior changed |
 | `src/crates/adapters/ai-adapters` | Relevant Rust checks above; add `cargo test -p bitfun-agent-stream` only when stream contracts changed |
 | Installer frontend or i18n runtime without packaging changes | `pnpm --dir BitFun-Installer run type-check` |
 | Installer Tauri/Rust changes | `cargo check --manifest-path BitFun-Installer/src-tauri/Cargo.toml` |
 | Installer packaging, payload, install/uninstall flow, or native bundling | `pnpm run installer:build` |
+| Build scripts or prerequisite changes | `pnpm run check:build-prereqs`, plus `node --test scripts/check-build-prereqs.test.mjs` when the check logic changed |
 
 ## Agent-doc priority
 

@@ -6,7 +6,7 @@ use bitfun_core::agentic::agents::{
 };
 use log::{debug, warn};
 use serde::Deserialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use tauri::State;
 
@@ -16,6 +16,22 @@ fn workspace_root_from_request(workspace_path: Option<&str>) -> Option<PathBuf> 
     workspace_path
         .filter(|path| !path.is_empty())
         .map(PathBuf::from)
+}
+
+fn reject_external_agent_mutation(
+    state: &AppState,
+    agent_id: &str,
+    workspace: Option<&std::path::Path>,
+) -> Result<(), String> {
+    if state
+        .agent_registry
+        .is_external_subagent_route(agent_id, workspace)
+    {
+        return Err(
+            "external_subagent_read_only: manage external agents in External AI Apps".to_string(),
+        );
+    }
+    Ok(())
 }
 
 fn validate_agent_id(id: &str) -> Result<(), String> {
@@ -108,6 +124,7 @@ pub async fn get_custom_agent_detail(
     request: GetCustomAgentDetailRequest,
 ) -> Result<CustomAgentDetail, String> {
     let workspace = workspace_root_from_request(request.workspace_path.as_deref());
+    reject_external_agent_mutation(&state, &request.agent_id, workspace.as_deref())?;
     state
         .agent_registry
         .get_custom_agent_detail(&request.agent_id, workspace.as_deref())
@@ -215,6 +232,10 @@ pub async fn create_custom_agent(
             .readonly
             .unwrap_or(request.kind == CustomAgentKind::Subagent)
     };
+    let model_is_explicit = request
+        .model
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty());
     let model = request
         .model
         .clone()
@@ -239,7 +260,7 @@ pub async fn create_custom_agent(
             mode.save_to_file(None).map_err(|error| error.to_string())?;
         }
         CustomAgentKind::Subagent => {
-            let mut subagent = CustomSubagent::new_with_id(
+            let mut subagent = CustomSubagent::new_with_id_and_model_explicit(
                 id.clone(),
                 request.name.trim().to_string(),
                 request.description.trim().to_string(),
@@ -249,6 +270,7 @@ pub async fn create_custom_agent(
                 path_str.clone(),
                 level,
                 model.clone(),
+                model_is_explicit,
                 user_context_policy,
             );
             subagent.set_review(review);
@@ -295,6 +317,7 @@ pub async fn update_custom_agent(
     }
 
     let workspace = workspace_root_from_request(request.workspace_path.as_deref());
+    reject_external_agent_mutation(&state, &request.agent_id, workspace.as_deref())?;
     let current = state
         .agent_registry
         .get_custom_agent_detail(&request.agent_id, workspace.as_deref())
@@ -344,6 +367,7 @@ pub async fn update_custom_agent(
 #[serde(rename_all = "camelCase")]
 pub struct DeleteCustomAgentRequest {
     pub agent_id: String,
+    pub workspace_path: Option<String>,
 }
 
 #[tauri::command]
@@ -352,6 +376,8 @@ pub async fn delete_custom_agent(
     request: DeleteCustomAgentRequest,
 ) -> Result<(), String> {
     let agent_id = request.agent_id;
+    let workspace = workspace_root_from_request(request.workspace_path.as_deref());
+    reject_external_agent_mutation(&state, &agent_id, workspace.as_deref())?;
 
     if let Some(path) = state
         .agent_registry
@@ -367,22 +393,6 @@ pub async fn delete_custom_agent(
     }
 
     let config_service = &state.config_service;
-
-    let mut agent_models: HashMap<String, String> = config_service
-        .get_config(Some("ai.agent_models"))
-        .await
-        .unwrap_or_default();
-    if agent_models.remove(&agent_id).is_some() {
-        if let Err(error) = config_service
-            .set_config("ai.agent_models", &agent_models)
-            .await
-        {
-            warn!(
-                "Failed to clean up ai.agent_models after custom agent deletion: agent_id={}, error={}",
-                agent_id, error
-            );
-        }
-    }
 
     let mut agent_profiles: serde_json::Map<String, serde_json::Value> = config_service
         .get_config(Some("ai.agent_profiles"))

@@ -7,8 +7,12 @@ import type {
   DialogTurnKind,
   SessionKind,
   SessionTitleSource,
+  SessionTurnCatalog,
 } from '@/shared/types/session-history';
+import type { AiErrorDetail } from '@/shared/ai-errors/aiErrorPresenter';
 import type { ReviewTargetEvidence, ReviewTeamRunManifest } from '@/shared/services/reviewTeamService';
+
+export type ModelRoundAttemptDiagnostic = import('@/shared/types/session-history').ModelRoundAttemptDiagnostic;
 
 // Base type for streaming items.
 export interface FlowItem {
@@ -21,7 +25,7 @@ export interface FlowItem {
 
   /**
    * Session-scoped subagent linkage.
-   * Used by parent Task tools and subagent-targeted runtime status markers.
+   * Used by parent Task tools and projected subagent output.
    */
   subagentSessionId?: string;
 }
@@ -31,15 +35,6 @@ export interface FlowTextItem extends FlowItem {
   content: string;
   isStreaming: boolean;
   isMarkdown?: boolean;
-  /**
-   * Transient runtime status rendered in the current conversation only.
-   * It is not persisted as assistant content.
-   */
-  runtimeStatus?: {
-    phase: 'waiting_model' | 'streaming' | 'waiting_tool' | 'running_tool' | 'waiting_permission' | 'saving' | 'recovering';
-    scope: 'main' | 'subagent' | 'tool';
-    messageKey?: string;
-  };
 }
 
 export interface FlowThinkingItem extends FlowItem {
@@ -51,6 +46,7 @@ export interface FlowThinkingItem extends FlowItem {
 
 export interface FlowToolItem extends FlowItem {
   type: 'tool';
+  /** Provider-facing identity. Deferred calls remain `CallDeferredTool`. */
   toolName: string;
   terminalSessionId?: string;
   interruptionReason?: 'app_restart' | 'retry_superseded';
@@ -63,6 +59,10 @@ export interface FlowToolItem extends FlowItem {
     result: any;
     success: boolean;
     resultForAssistant?: string;
+    imageAttachments?: Array<{
+      mime_type: string;
+      data_base64: string;
+    }>;
     error?: string;
     duration_ms?: number;
   };
@@ -87,7 +87,6 @@ export interface FlowToolItem extends FlowItem {
   };
   aiIntent?: string; // AI rationale for calling the tool.
   startTime?: number;  // Tool start time.
-  confirmationTimeoutAt?: number;
   endTime?: number;    // Tool end time.
   durationMs?: number;
   queueWaitMs?: number;
@@ -95,8 +94,9 @@ export interface FlowToolItem extends FlowItem {
   confirmationWaitMs?: number;
   executionMs?: number;
 
-  /** Subagent model identity captured on the parent Task tool. */
+  /** Resolved subagent AI model configuration ID captured on the parent Task tool. */
   subagentModelId?: string;
+  /** Provider model name used by the subagent's round. */
   subagentModelDisplayName?: string;
 
   /** Child dialog turn produced by this parent Task call. */
@@ -162,6 +162,7 @@ export interface ModelRoundAttempt {
   index: number;
   status: 'streaming' | 'completed' | 'superseded' | 'failed' | 'cancelled';
   items: AnyFlowItem[];
+  diagnostic?: ModelRoundAttemptDiagnostic;
 }
 
 // Model round: output from a single model call.
@@ -179,12 +180,13 @@ export interface ModelRound {
   endTime?: number;
   durationMs?: number;
   providerId?: string;
-  modelId?: string;
-  modelAlias?: string;
+  modelConfigId?: string;
+  effectiveModelName?: string;
   firstChunkMs?: number;
   firstVisibleOutputMs?: number;
   streamDurationMs?: number;
   attemptCount?: number;
+  attemptDiagnostics?: ModelRoundAttemptDiagnostic[];
   failureCategory?: string;
   tokenDetails?: unknown;
   error?: string;
@@ -249,6 +251,7 @@ export interface DialogTurn {
   startTime: number;
   endTime?: number;
   error?: string;
+  errorDetail?: AiErrorDetail;
   tokenUsage?: TokenUsage;
   todos?: TodoItem[];
   backendTurnIndex?: number;
@@ -277,6 +280,36 @@ export type SessionHistoryState =
   | 'hydrating'
   | 'ready'
   | 'failed';
+
+export type LoadedTurnRangeSource = 'initial-tail' | 'target' | 'prefetch' | 'live';
+
+export interface LoadedTurnRange {
+  startOrdinal: number;
+  endOrdinalExclusive: number;
+  turns: DialogTurn[];
+  lastAccessedAt: number;
+  source: LoadedTurnRangeSource;
+}
+
+export interface ActiveTurnRenderRange {
+  startOrdinal: number;
+  endOrdinalExclusive: number;
+  targetTurnId: string | null;
+  mode: 'tail' | 'history-window';
+}
+
+export interface SessionHistoryViewState {
+  catalog: SessionTurnCatalog | null;
+  loadedRanges: LoadedTurnRange[];
+  activeRange: ActiveTurnRenderRange | null;
+  pendingTargetOrdinal: number | null;
+  navigationGeneration: number;
+}
+
+export interface SessionHistoryPresentation {
+  range: ActiveTurnRenderRange;
+  turns: DialogTurn[];
+}
 
 export type SessionContextRestoreState =
   | 'ready'
@@ -342,6 +375,7 @@ export interface Session {
   isPartial?: boolean;
   loadedTurnCount?: number;
   totalTurnCount?: number;
+  turnCatalog?: SessionTurnCatalog;
   
   todos?: TodoItem[];
   
@@ -370,6 +404,9 @@ export interface Session {
   // Sessions are always kept in store for event processing; only display is filtered.
   workspacePath?: string;
 
+  /** Main project that owns this session when `workspacePath` is a linked worktree. */
+  projectWorkspacePath?: string;
+
   /** Stable backend id — always set for new sessions; do not infer workspace from path alone. */
   workspaceId?: string;
 
@@ -378,6 +415,9 @@ export interface Session {
 
   /** SSH config host for `~/.bitfun/remote_ssh/{host}/...` session paths when disconnected. */
   remoteSshHost?: string;
+
+  /** Persisted workspace identity host; `localhost` is the local-workspace sentinel. */
+  workspaceHostname?: string;
 
   /**
    * Optional parent session id for hierarchical sessions.
@@ -458,6 +498,9 @@ export interface Session {
   /** Per-run reviewer manifest for Deep Review child sessions. */
   deepReviewRunManifest?: ReviewTeamRunManifest;
 
+  /** Runtime-admitted live projection of a focused Review label. */
+  focusedReviewDisplayLabel?: string;
+
   /** Immutable target identity used to associate Review results with a PR or Git target. */
   reviewTargetEvidence?: ReviewTargetEvidence;
 
@@ -479,6 +522,42 @@ export interface SessionConfig {
   agentType?: string;
   context?: Record<string, string>;
   workspacePath?: string;
+  /** Main project scope used for persistence when execution happens in a worktree. */
+  projectWorkspacePath?: string;
+  /** Requested target used only while creating a new session. */
+  executionTargetRequest?: import('@/infrastructure/api/service-api/WorktreeAPI').SessionExecutionTargetRequest;
+  /** Resolved target returned and persisted by the backend. */
+  executionTarget?: import('@/infrastructure/api/service-api/WorktreeAPI').SessionExecutionTarget;
+  /** Requested device on which a new session will execute. */
+  dispatchTargetRequest?: import('@/features/dispatch/types').DispatchTargetRequest;
+  /** Immutable resolved target for an observer-only dispatched session. */
+  dispatchTarget?: import('@/features/dispatch/types').DispatchTarget;
+  /** Durable target-side job observed by this projection. */
+  dispatchJobId?: string;
+  /** Explicit unattended permission behavior selected before submission. */
+  dispatchApprovalPolicy?: import('@/features/dispatch/types').DispatchApprovalPolicy;
+  /** Carry the baseline worktree's uncommitted changes into the base commit. */
+  dispatchIncludeUncommitted?: boolean;
+  /** Git revision used to create the immutable dispatch baseline. */
+  dispatchBaseRef?: string;
+  /** Target model explicitly selected during preflight; omitted to use the target default. */
+  dispatchModel?: string;
+  /** Model ids reported by the selected target during dispatch preflight. */
+  dispatchAvailableModels?: string[];
+  /** Target-owned default model reported during dispatch preflight. */
+  dispatchDefaultModel?: string;
+  /** Last target-side job state applied by the observer. */
+  dispatchJobState?: import('@/features/dispatch/types').DispatchJobState;
+  /** Byte cursor applied successfully from the target-side event log. */
+  dispatchCursor?: number;
+  /** Last target-side job error, if any. */
+  dispatchLastError?: string;
+  /**
+   * Composer-only preference for an empty session. The concrete worktree is
+   * materialized after the first prompt is submitted, not when the checkbox
+   * is clicked.
+   */
+  worktreeIsolationRequested?: boolean;
   /** Binds session to `WorkspaceInfo.id` (path alone is insufficient for remotes). */
   workspaceId?: string;
   /** Disambiguates sessions when multiple remote workspaces share the same `workspacePath`. */
@@ -516,6 +595,8 @@ export interface QueuedMessage {
   /** Image / attachment payloads forwarded to `start_dialog_turn` when drained. */
   imageContexts?: unknown[];
   imageDisplayData?: unknown[];
+  /** Structured metadata forwarded to `start_dialog_turn` when drained. */
+  userMessageMetadata?: Record<string, unknown>;
   localDialogTurnId?: string;
 }
 
@@ -558,6 +639,12 @@ export interface ToolCardProps {
   sessionId?: string;
   turnId?: string;
   displayContext?: ToolCardDisplayContext;
+  /**
+   * Whether this card is the current visual tail of the conversation.
+   * Live cards use this to keep their final result visible until a newer
+   * action arrives, instead of collapsing in the same frame as completion.
+   */
+  isLastItem?: boolean;
   /** Callback for MCP App ui/message requests. Returns whether the message was handled successfully. */
   onMcpAppMessage?: (params: import('@/infrastructure/api/service-api/MCPAPI').McpUiMessageParams) => Promise<import('@/infrastructure/api/service-api/MCPAPI').McpUiMessageResult>;
 }
@@ -584,7 +671,7 @@ export interface FlowChatActions {
   sendMessage: (message: string, sessionId?: string) => Promise<void>;
   createSession: (config?: Partial<SessionConfig>) => Promise<string>;
   switchSession: (sessionId: string) => void;
-  confirmTool: (toolId: string, updatedInput?: any) => void;
+  confirmTool: (toolId: string) => void;
   rejectTool: (toolId: string) => void;
   clearSession: (sessionId?: string) => void;
   deleteSession: (sessionId: string) => Promise<void>; // Now async.
@@ -598,5 +685,4 @@ export interface FlowChatConfig {
   showTimestamps: boolean;
   maxHistoryRounds: number;
   enableVirtualScroll: boolean;
-  theme: 'light' | 'dark' | 'auto';
 }

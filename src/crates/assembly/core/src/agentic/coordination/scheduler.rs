@@ -11,27 +11,32 @@
 //! - Queue cleared on unrecoverable failure
 
 use super::coordinator::{
-    ConversationCoordinator, DialogTriggerSource, HiddenSubagentExecutionRequest, SubagentResult,
+    session_storage_workspace_locator, ConversationCoordinator, DialogTriggerSource,
+    HiddenSubagentExecutionRequest, SubagentResult,
 };
 use super::turn_outcome::TurnOutcome;
+use super::turn_settlement::TurnSettlementRegistration;
 use crate::agentic::core::{InternalReminderKind, Message, SessionState};
+use crate::agentic::events::AgenticEvent;
 use crate::agentic::goal_mode::{
     goal_continuation_submit_retry_delay_ms, goal_internal_context_message,
     goal_objective_updated_message,
 };
 use crate::agentic::image_analysis::ImageContextData;
 use crate::agentic::init_agents_md::build_init_agents_md_user_input;
+use crate::agentic::keyed_lock::{KeyedAsyncLock, KeyedAsyncLockGuard};
 use crate::agentic::round_preempt::{DialogRoundInjectionSource, SessionRoundInjectionBuffer};
 use crate::agentic::session::session_store_port::CoreSessionStorePort;
 use crate::agentic::session::SessionManager;
 use crate::util::errors::{BitFunError, BitFunResult};
 use bitfun_runtime_ports::{ThreadGoal, MAX_THREAD_GOAL_AUTO_CONTINUATIONS};
 use log::{debug, info, warn};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
@@ -40,9 +45,10 @@ use uuid::Uuid;
 use bitfun_agent_runtime::scheduler::{
     build_thread_goal_objective_updated_delivery_plan, build_thread_goal_resumed_delivery_plan,
     resolve_agent_session_reply_action, resolve_background_delivery_action,
-    resolve_background_delivery_injection, resolve_dialog_start_route,
-    resolve_dialog_steering_action, resolve_turn_outcome_lifecycle_plan, ActiveDialogTurn,
-    ActiveDialogTurnStore, AgentSessionReplyAction, AgentSessionReplyPlan,
+    resolve_background_delivery_injection, resolve_background_delivery_injection_for_turn,
+    resolve_dialog_start_route, resolve_dialog_steering_action,
+    resolve_turn_outcome_lifecycle_plan, ActiveDialogTurn, ActiveDialogTurnStore,
+    ActiveDialogTurnTakeResult, AgentSessionReplyAction, AgentSessionReplyPlan,
     BackgroundDeliveryAction, BackgroundDeliveryFacts, BackgroundInjectionKind,
     DialogReplySuppressionSet, DialogStartRoute, DialogStartRouteFacts, DialogSteeringAction,
     DialogTurnQueue, GoalContinuationAfterTurnAction, SessionAbortFlags,
@@ -51,11 +57,12 @@ use bitfun_agent_runtime::scheduler::{
 };
 use bitfun_runtime_ports::{
     resolve_dialog_submit_queue_action, AgentBackgroundResultRequest, AgentDialogPrependedReminder,
-    AgentDialogTurnPort, AgentDialogTurnRequest, AgentInputAttachment, AgentLifecycleDeliveryPort,
-    AgentThreadGoalDeliveryKind, AgentThreadGoalDeliveryRequest, AgentTurnCancellationPort,
-    AgentTurnCancellationRequest, AgentTurnCancellationResult, DialogSessionStateFact,
-    DialogSubmitQueueAction, DialogSubmitQueueFacts, PortError, PortErrorKind, PortResult,
-    SessionStoragePathRequest, SessionStorePort,
+    AgentDialogSteerRequest, AgentDialogTurnExecution, AgentDialogTurnPort, AgentDialogTurnRequest,
+    AgentInputAttachment, AgentLifecycleDeliveryPort, AgentThreadGoalDeliveryKind,
+    AgentThreadGoalDeliveryRequest, AgentTurnCancellationPort, AgentTurnCancellationRequest,
+    AgentTurnCancellationResult, DialogSessionStateFact, DialogSubmitQueueAction,
+    DialogSubmitQueueFacts, PortError, PortErrorKind, PortResult, RoundInjection,
+    RoundInjectionKind, SessionStoragePathRequest, SessionStorePort,
 };
 pub use bitfun_runtime_ports::{
     AgentSessionReplyRoute, DialogQueuePriority, DialogSteerOutcome, DialogSubmissionPolicy,
@@ -79,14 +86,105 @@ pub struct QueuedTurn {
     pub image_contexts: Option<Vec<ImageContextData>>,
     #[allow(dead_code)]
     pub enqueued_at: SystemTime,
+    _settlement_registration: Option<TurnSettlementRegistration>,
     execution: QueuedTurnExecution,
+}
+
+impl QueuedTurn {
+    fn accept_settlement(&self) {
+        if let Some(registration) = self._settlement_registration.as_ref() {
+            registration.accept();
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
 pub(crate) enum QueuedTurnExecution {
     #[default]
     Standard,
+    FreshExternalSubagent(ExternalSubagentDelegationQueuedExecution),
     HiddenSubagent(HiddenSubagentQueuedExecution),
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ExternalSubagentDelegationQueuedExecution {
+    ecosystem_id: String,
+    logical_id: String,
+}
+
+fn remove_queued_turn_by_id(
+    queues: &DialogTurnQueue<QueuedTurn>,
+    session_id: &str,
+    turn_id: &str,
+) -> Option<QueuedTurn> {
+    queues.remove_first_matching(session_id, |turn| turn.turn_id.as_deref() == Some(turn_id))
+}
+
+#[derive(Debug)]
+enum SchedulerSubmitError {
+    Core(BitFunError),
+    Port(PortError),
+    Message(String),
+}
+
+impl SchedulerSubmitError {
+    fn into_port_error(self) -> PortError {
+        match self {
+            Self::Core(BitFunError::Validation(message)) => {
+                PortError::new(PortErrorKind::InvalidRequest, message)
+            }
+            Self::Core(BitFunError::NotFound(message)) => {
+                PortError::new(PortErrorKind::NotFound, message)
+            }
+            Self::Core(BitFunError::Cancelled(message)) => {
+                PortError::new(PortErrorKind::Cancelled, message)
+            }
+            Self::Core(BitFunError::Timeout(message)) => {
+                PortError::new(PortErrorKind::Timeout, message)
+            }
+            Self::Core(BitFunError::SessionInUse { session_id }) => PortError::new(
+                PortErrorKind::SessionInUse,
+                format!("Session is already open for writing: {session_id}"),
+            ),
+            Self::Core(BitFunError::OutcomeUnknown(message)) => {
+                PortError::new(PortErrorKind::OutcomeUnknown, message)
+            }
+            Self::Core(BitFunError::NotImplemented(message)) => {
+                PortError::new(PortErrorKind::NotAvailable, message)
+            }
+            Self::Core(error) => PortError::new(PortErrorKind::Backend, error.to_string()),
+            Self::Port(error) => error,
+            Self::Message(message) => PortError::new(PortErrorKind::Backend, message),
+        }
+    }
+}
+
+impl std::fmt::Display for SchedulerSubmitError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Core(error) => error.fmt(formatter),
+            Self::Port(error) => error.fmt(formatter),
+            Self::Message(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl From<BitFunError> for SchedulerSubmitError {
+    fn from(error: BitFunError) -> Self {
+        Self::Core(error)
+    }
+}
+
+impl From<String> for SchedulerSubmitError {
+    fn from(message: String) -> Self {
+        Self::Message(message)
+    }
+}
+
+impl From<PortError> for SchedulerSubmitError {
+    fn from(error: PortError) -> Self {
+        Self::Port(error)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -166,6 +264,50 @@ enum ActiveInternalTurn {
     HiddenSubagent,
 }
 
+#[derive(Clone)]
+struct BackgroundResultDelivery {
+    session_id: String,
+    agent_type: String,
+    workspace_path: Option<String>,
+    remote_connection_id: Option<String>,
+    remote_ssh_host: Option<String>,
+    content: String,
+    display_content: Option<String>,
+    user_message_metadata: Option<serde_json::Value>,
+}
+
+struct SchedulerRoundInjectionSource {
+    buffer: Arc<SessionRoundInjectionBuffer>,
+}
+
+impl DialogRoundInjectionSource for SchedulerRoundInjectionSource {
+    fn has_pending(&self, session_id: &str, turn_id: &str) -> bool {
+        self.buffer.has_pending_for_turn(session_id, turn_id)
+    }
+
+    fn pending_tool_preemption(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+    ) -> bitfun_runtime_ports::RoundInjectionToolPreemption {
+        self.buffer
+            .pending_tool_preemption_for_turn(session_id, turn_id)
+    }
+
+    fn take_pending(&self, session_id: &str, turn_id: &str) -> Vec<RoundInjection> {
+        self.buffer.drain_for_turn(session_id, turn_id)
+    }
+
+    fn acknowledge_consumed(
+        &self,
+        _session_id: &str,
+        _turn_id: &str,
+        _injection_id: &str,
+        _kind: RoundInjectionKind,
+    ) {
+    }
+}
+
 /// Message queue manager for dialog turns.
 ///
 /// All user-facing callers (frontend Tauri commands, remote server, bot router)
@@ -176,12 +318,21 @@ pub struct DialogScheduler {
     session_manager: Arc<SessionManager>,
     /// Per-session priority message queues.
     queues: Arc<DialogTurnQueue<QueuedTurn>>,
+    /// Serializes submit, dispatch, and targeted cancellation for one session.
+    /// This closes the dequeue-to-start gap where cancellation could otherwise
+    /// miss both the queue and the coordinator's active execution.
+    session_operation_locks: KeyedAsyncLock,
     /// Currently active turn metadata keyed by target session ID
     active_turns: Arc<ActiveDialogTurnStore>,
     active_internal_turns: Arc<dashmap::DashMap<String, ActiveInternalTurn>>,
     /// Turns whose cancelled auto-reply should be suppressed because the source
     /// agent explicitly cancelled its own outstanding SessionMessage request.
     suppressed_cancelled_replies: Arc<DialogReplySuppressionSet>,
+    /// Exact outcomes retired by destructive session maintenance. The outcome
+    /// channel may receive them only after the maintenance permit releases its
+    /// per-session operation lock; tombstoning prevents them from mutating a
+    /// newly created session that reuses the same explicit ID.
+    retired_maintenance_outcomes: Arc<DialogReplySuppressionSet>,
     /// Set when the user cancels an in-flight turn; aborts goal-continuation submit retries.
     goal_continuation_abort: Arc<SessionAbortFlags>,
     /// Cloneable sender given to ConversationCoordinator for turn outcome notifications
@@ -189,6 +340,54 @@ pub struct DialogScheduler {
     /// Per-session FIFO buffer of round injections drained at round boundaries
     /// by the engine and injected into the running dialog turn.
     round_injection_buffer: Arc<SessionRoundInjectionBuffer>,
+    round_injection_source: Arc<SchedulerRoundInjectionSource>,
+    /// Child sessions already cancelled for a parent maintenance attempt but
+    /// not yet observed as drained. Retain them across retryable timeouts even
+    /// after their one-shot cancellation controls have been claimed.
+    maintenance_background_sessions: Arc<dashmap::DashMap<String, HashSet<String>>>,
+}
+
+/// Holds the scheduler's exclusive session-operation boundary while a caller
+/// performs maintenance that must not overlap turn dispatch.
+pub(crate) struct SessionMaintenancePermit {
+    _operation_guard: KeyedAsyncLockGuard,
+    retired_turn_ids: Vec<String>,
+}
+
+impl SessionMaintenancePermit {
+    pub(crate) fn retired_turn_ids(&self) -> &[String] {
+        &self.retired_turn_ids
+    }
+}
+
+fn take_active_turn_for_outcome(
+    active_turns: &ActiveDialogTurnStore,
+    retired_maintenance_outcomes: &DialogReplySuppressionSet,
+    session_id: &str,
+    turn_id: &str,
+) -> Option<ActiveDialogTurnTakeResult> {
+    if retired_maintenance_outcomes.take(session_id, turn_id) {
+        None
+    } else {
+        Some(active_turns.take_for_outcome(session_id, turn_id))
+    }
+}
+
+fn queued_submission_outcome(
+    session_id: String,
+    resolved_turn_id: String,
+    started_turn_id: Option<String>,
+) -> DialogSubmitOutcome {
+    match started_turn_id {
+        Some(turn_id) if turn_id == resolved_turn_id => DialogSubmitOutcome::Started {
+            session_id,
+            turn_id,
+        },
+        _ => DialogSubmitOutcome::Queued {
+            session_id,
+            turn_id: resolved_turn_id,
+        },
+    }
 }
 
 impl DialogScheduler {
@@ -202,17 +401,25 @@ impl DialogScheduler {
         session_manager: Arc<SessionManager>,
     ) -> Arc<Self> {
         let (outcome_tx, outcome_rx) = mpsc::channel(128);
+        let round_injection_buffer = Arc::new(SessionRoundInjectionBuffer::default());
+        let round_injection_source = Arc::new(SchedulerRoundInjectionSource {
+            buffer: round_injection_buffer.clone(),
+        });
 
         let scheduler = Arc::new(Self {
             coordinator,
             session_manager,
             queues: Arc::new(DialogTurnQueue::default()),
+            session_operation_locks: KeyedAsyncLock::default(),
             active_turns: Arc::new(ActiveDialogTurnStore::default()),
             active_internal_turns: Arc::new(dashmap::DashMap::new()),
             suppressed_cancelled_replies: Arc::new(DialogReplySuppressionSet::default()),
+            retired_maintenance_outcomes: Arc::new(DialogReplySuppressionSet::default()),
             goal_continuation_abort: Arc::new(SessionAbortFlags::default()),
             outcome_tx,
-            round_injection_buffer: Arc::new(SessionRoundInjectionBuffer::default()),
+            round_injection_buffer,
+            round_injection_source,
+            maintenance_background_sessions: Arc::new(dashmap::DashMap::new()),
         });
 
         let scheduler_for_handler = Arc::clone(&scheduler);
@@ -228,9 +435,13 @@ impl DialogScheduler {
         self.outcome_tx.clone()
     }
 
+    async fn lock_session_operation(&self, session_id: &str) -> KeyedAsyncLockGuard {
+        self.session_operation_locks.lock(session_id).await
+    }
+
     /// Pass to [`ConversationCoordinator::set_round_injection_source`](super::coordinator::ConversationCoordinator::set_round_injection_source).
     pub fn round_injection_monitor(&self) -> Arc<dyn DialogRoundInjectionSource> {
-        self.round_injection_buffer.clone()
+        self.round_injection_source.clone()
     }
 
     /// Submit a user "steering" message into the currently running dialog turn.
@@ -240,14 +451,19 @@ impl DialogScheduler {
     /// can inject it at the next model-round boundary. Errors:
     ///
     /// - Session is not currently `Processing` the requested `turn_id` (the targeted turn
-    ///   already finished or never existed). Caller should fall back to `submit`.
-    pub async fn submit_steering(
+    ///   already finished or never existed). Callers must preserve the user's input so it
+    ///   can be submitted explicitly after authoritative state is observed.
+    async fn buffer_steering(
         &self,
         session_id: String,
         turn_id: String,
         content: String,
         display_content: Option<String>,
     ) -> Result<DialogSteerOutcome, String> {
+        if content.trim().is_empty() {
+            return Err("Steering content cannot be empty".to_string());
+        }
+        let _operation_guard = self.lock_session_operation(&session_id).await;
         let active_turn_id = match self
             .session_manager
             .get_session(&session_id)
@@ -255,7 +471,12 @@ impl DialogScheduler {
         {
             Some(SessionState::Processing {
                 current_turn_id, ..
-            }) => Some(current_turn_id),
+            }) if self
+                .active_turns
+                .matches_turn(&session_id, &current_turn_id) =>
+            {
+                Some(current_turn_id)
+            }
             _ => None,
         };
 
@@ -271,7 +492,7 @@ impl DialogScheduler {
         ) {
             DialogSteeringAction::Reject { error } => {
                 warn!(
-                    "submit_steering rejected: target turn is not running: session_id={}, turn_id={}",
+                    "Steering rejected: target turn is not running: session_id={}, turn_id={}",
                     session_id, turn_id
                 );
                 Err(error)
@@ -324,10 +545,7 @@ impl DialogScheduler {
                 );
                 Ok(())
             }
-            BackgroundDeliveryAction::SubmitAgentSessionFollowUp {
-                queue_priority,
-                skip_tool_confirmation,
-            } => {
+            BackgroundDeliveryAction::SubmitAgentSessionFollowUp { queue_priority } => {
                 let prepended = thread_goal_delivery_messages(plan.prepended_reminders);
                 self.submit_with_prepended_messages(
                     session_id,
@@ -338,11 +556,7 @@ impl DialogScheduler {
                     workspace_path,
                     remote_connection_id,
                     remote_ssh_host,
-                    DialogSubmissionPolicy::new(
-                        DialogTriggerSource::AgentSession,
-                        queue_priority,
-                        skip_tool_confirmation,
-                    ),
+                    DialogSubmissionPolicy::new(DialogTriggerSource::AgentSession, queue_priority),
                     None,
                     Some(plan.user_message_metadata),
                     prepended,
@@ -386,10 +600,7 @@ impl DialogScheduler {
                 );
                 Ok(())
             }
-            BackgroundDeliveryAction::SubmitAgentSessionFollowUp {
-                queue_priority,
-                skip_tool_confirmation,
-            } => {
+            BackgroundDeliveryAction::SubmitAgentSessionFollowUp { queue_priority } => {
                 let prepended = thread_goal_delivery_messages(plan.prepended_reminders);
                 self.submit_with_prepended_messages(
                     session_id,
@@ -400,11 +611,7 @@ impl DialogScheduler {
                     workspace_path,
                     remote_connection_id,
                     remote_ssh_host,
-                    DialogSubmissionPolicy::new(
-                        DialogTriggerSource::AgentSession,
-                        queue_priority,
-                        skip_tool_confirmation,
-                    ),
+                    DialogSubmissionPolicy::new(DialogTriggerSource::AgentSession, queue_priority),
                     None,
                     Some(plan.user_message_metadata),
                     prepended,
@@ -432,53 +639,100 @@ impl DialogScheduler {
         display_content: Option<String>,
         user_message_metadata: Option<serde_json::Value>,
     ) -> Result<(), String> {
+        let _operation_guard = self.lock_session_operation(&session_id).await;
         let display = display_content.unwrap_or_else(|| content.clone());
+        let delivery = BackgroundResultDelivery {
+            session_id: session_id.clone(),
+            agent_type,
+            workspace_path,
+            remote_connection_id,
+            remote_ssh_host,
+            content,
+            display_content: Some(display),
+            user_message_metadata,
+        };
         let state = self
             .session_manager
             .get_session(&session_id)
             .map(|s| s.state.clone());
 
         match resolve_background_delivery_action(BackgroundDeliveryFacts {
-            session_state: Self::session_state_fact(state.as_ref()),
+            session_state: background_result_delivery_state_fact(
+                &session_id,
+                state.as_ref(),
+                delivery.user_message_metadata.as_ref(),
+            ),
         }) {
             BackgroundDeliveryAction::InjectIntoRunningTurn => {
-                self.round_injection_buffer.push(
-                    &session_id,
-                    resolve_background_delivery_injection(
-                        BackgroundInjectionKind::BackgroundResult,
-                        Uuid::new_v4().to_string(),
-                        content,
-                        Some(display),
-                        SystemTime::now(),
-                    ),
+                let Some(current_turn_id) = state.as_ref().and_then(|state| match state {
+                    SessionState::Processing {
+                        current_turn_id, ..
+                    } => Some(current_turn_id.clone()),
+                    _ => None,
+                }) else {
+                    return Err(format!(
+                        "Background result resolved to injection without an active turn: session_id={session_id}"
+                    ));
+                };
+                let injection_id = Uuid::new_v4().to_string();
+                let injection = resolve_background_delivery_injection_for_turn(
+                    BackgroundInjectionKind::BackgroundResult,
+                    injection_id.clone(),
+                    delivery.content.clone(),
+                    delivery.display_content.clone(),
+                    SystemTime::now(),
+                    current_turn_id,
                 );
+                self.round_injection_buffer.push(&session_id, injection);
                 Ok(())
             }
-            BackgroundDeliveryAction::SubmitAgentSessionFollowUp {
-                queue_priority,
-                skip_tool_confirmation,
-            } => self
-                .submit(
-                    session_id,
-                    content,
-                    Some(display),
-                    None,
-                    agent_type,
-                    workspace_path,
-                    remote_connection_id,
-                    remote_ssh_host,
-                    DialogSubmissionPolicy::new(
-                        DialogTriggerSource::AgentSession,
-                        queue_priority,
-                        skip_tool_confirmation,
-                    ),
-                    None,
-                    user_message_metadata,
-                    None,
-                )
-                .await
-                .map(|_| ()),
+            BackgroundDeliveryAction::SubmitAgentSessionFollowUp { queue_priority } => {
+                self.submit_background_result_follow_up_locked(delivery, queue_priority)
+                    .await
+            }
         }
+    }
+
+    async fn submit_background_result_follow_up_locked(
+        &self,
+        delivery: BackgroundResultDelivery,
+        queue_priority: DialogQueuePriority,
+    ) -> Result<(), String> {
+        let resolved_turn_id = Uuid::new_v4().to_string();
+        let queued_turn = QueuedTurn {
+            user_input: delivery.content,
+            original_user_input: delivery.display_content,
+            prepended_messages: Vec::new(),
+            turn_id: Some(resolved_turn_id.clone()),
+            agent_type: delivery.agent_type,
+            workspace_path: delivery.workspace_path,
+            remote_connection_id: delivery.remote_connection_id,
+            remote_ssh_host: delivery.remote_ssh_host,
+            policy: DialogSubmissionPolicy::new(DialogTriggerSource::AgentSession, queue_priority),
+            reply_route: None,
+            user_message_metadata: delivery.user_message_metadata,
+            image_contexts: None,
+            enqueued_at: SystemTime::now(),
+            _settlement_registration: None,
+            execution: QueuedTurnExecution::Standard,
+        };
+        let result = self
+            .submit_queued_turn_locked(
+                delivery.session_id.clone(),
+                resolved_turn_id.clone(),
+                queued_turn,
+                false,
+            )
+            .await;
+        if result.is_err() {
+            if let Some(removed_turn) =
+                remove_queued_turn_by_id(&self.queues, &delivery.session_id, &resolved_turn_id)
+            {
+                self.finish_removed_queued_turn(&delivery.session_id, removed_turn)
+                    .await;
+            }
+        }
+        result.map(|_| ()).map_err(|error| error.to_string())
     }
 
     pub async fn submit_init_agents_md(
@@ -601,10 +855,12 @@ impl DialogScheduler {
             user_message_metadata,
             image_contexts,
             enqueued_at: SystemTime::now(),
+            _settlement_registration: None,
             execution: QueuedTurnExecution::Standard,
         };
-        self.submit_queued_turn(session_id, resolved_turn_id, queued_turn)
+        self.submit_queued_turn(session_id, resolved_turn_id, queued_turn, false)
             .await
+            .map_err(|error| error.to_string())
     }
 
     pub(crate) async fn submit_hidden_subagent(
@@ -618,9 +874,8 @@ impl DialogScheduler {
                 "prepared hidden subagent request is missing target_session_id".to_string()
             })?
             .to_string();
-        let resolved_turn_id = format!("subagent-{}", Uuid::new_v4());
-        request.set_dialog_turn_id(resolved_turn_id.clone());
-        let agent_type = request.agent_type().to_string();
+        let resolved_turn_id = request.ensure_dialog_turn_id();
+        let agent_type = request.logical_agent_type().to_string();
         let user_input = request.user_input_text().to_string();
         let session = self
             .session_manager
@@ -643,12 +898,12 @@ impl DialogScheduler {
             workspace_path: session.config.workspace_path.clone(),
             remote_connection_id: session.config.remote_connection_id.clone(),
             remote_ssh_host: session.config.remote_ssh_host.clone(),
-            policy: DialogSubmissionPolicy::for_source(DialogTriggerSource::AgentSession)
-                .with_skip_tool_confirmation(true),
+            policy: DialogSubmissionPolicy::for_source(DialogTriggerSource::AgentSession),
             reply_route: None,
             user_message_metadata: None,
             image_contexts: None,
             enqueued_at: SystemTime::now(),
+            _settlement_registration: None,
             execution: QueuedTurnExecution::HiddenSubagent(HiddenSubagentQueuedExecution {
                 request,
                 timeout_seconds,
@@ -657,8 +912,14 @@ impl DialogScheduler {
             }),
         };
 
-        self.submit_queued_turn(session_id.clone(), resolved_turn_id.clone(), queued_turn)
-            .await?;
+        self.submit_queued_turn(
+            session_id.clone(),
+            resolved_turn_id.clone(),
+            queued_turn,
+            false,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
         Ok(HiddenSubagentSubmitResult {
             receiver: result_rx,
             cancel_handle: HiddenSubagentQueueCancelHandle {
@@ -675,36 +936,17 @@ impl DialogScheduler {
         handle: &HiddenSubagentQueueCancelHandle,
     ) {
         handle.cancellation.cancel();
-        let removed_turn = self
-            .queues
-            .remove_first_matching(&handle.session_id, |turn| {
-                turn.turn_id.as_deref() == Some(handle.turn_id.as_str())
-            });
-        if let Some(removed_turn) = removed_turn {
-            if let QueuedTurnExecution::HiddenSubagent(execution) = removed_turn.execution {
-                self.coordinator
-                    .cleanup_prepared_hidden_subagent_session_if_unsubmitted(&execution.request)
-                    .await;
-            }
-            handle.result_tx.send(Err(BitFunError::Cancelled(
-                "Subagent task has been cancelled".to_string(),
-            )));
-            debug!(
-                "Removed queued hidden subagent turn after cancellation: session_id={}, turn_id={}",
-                handle.session_id, handle.turn_id
-            );
-            return;
-        }
-
         if let Err(error) = self
-            .coordinator
-            .cancel_dialog_turn(&handle.session_id, &handle.turn_id)
+            .cancel_queued_or_active_turn(&handle.session_id, &handle.turn_id)
             .await
         {
             debug!(
                 "Hidden subagent turn cancellation request did not hit an active turn: session_id={}, turn_id={}, error={}",
                 handle.session_id, handle.turn_id, error
             );
+            handle.result_tx.send(Err(BitFunError::Cancelled(
+                "Subagent task has been cancelled".to_string(),
+            )));
         }
     }
 
@@ -729,8 +971,9 @@ impl DialogScheduler {
                     remote_connection_id,
                     remote_ssh_host,
                 )
-                .await?;
-                self.session_manager
+                .await
+                .map_err(|error| error.to_string())?;
+                self.coordinator
                     .restore_session_from_storage_path(&restore_path, session_id)
                     .await
                     .map_err(|error| error.to_string())?
@@ -748,7 +991,7 @@ impl DialogScheduler {
         workspace_path: &str,
         remote_connection_id: Option<&str>,
         remote_ssh_host: Option<&str>,
-    ) -> Result<PathBuf, String> {
+    ) -> Result<PathBuf, SchedulerSubmitError> {
         let request = SessionStoragePathRequest {
             workspace_path: PathBuf::from(workspace_path),
             remote_connection_id: remote_connection_id.map(ToOwned::to_owned),
@@ -759,7 +1002,7 @@ impl DialogScheduler {
             .resolve_session_storage_path(request)
             .await
             .map(|resolution| resolution.effective_storage_path)
-            .map_err(|error| error.to_string())
+            .map_err(SchedulerSubmitError::Port)
     }
 
     async fn submit_queued_turn(
@@ -767,7 +1010,38 @@ impl DialogScheduler {
         session_id: String,
         resolved_turn_id: String,
         queued_turn: QueuedTurn,
-    ) -> Result<DialogSubmitOutcome, String> {
+        reject_if_busy: bool,
+    ) -> Result<DialogSubmitOutcome, SchedulerSubmitError> {
+        let _operation_guard = self.lock_session_operation(&session_id).await;
+        self.submit_queued_turn_locked(session_id, resolved_turn_id, queued_turn, reject_if_busy)
+            .await
+    }
+
+    async fn submit_queued_turn_locked(
+        &self,
+        session_id: String,
+        resolved_turn_id: String,
+        mut queued_turn: QueuedTurn,
+        reject_if_busy: bool,
+    ) -> Result<DialogSubmitOutcome, SchedulerSubmitError> {
+        if let Some(session) = self.session_manager.get_session(&session_id) {
+            queued_turn.workspace_path = session_storage_workspace_locator(
+                queued_turn.workspace_path.as_deref(),
+                session.config.workspace_path.as_deref(),
+                session.config.project_workspace_path.as_deref(),
+            );
+        }
+        if let Some(workspace_path) = queued_turn.workspace_path.as_deref() {
+            let requested_storage_path = Self::resolve_session_restore_path(
+                workspace_path,
+                queued_turn.remote_connection_id.as_deref(),
+                queued_turn.remote_ssh_host.as_deref(),
+            )
+            .await?;
+            self.session_manager
+                .validate_session_storage_path_binding(&session_id, &requested_storage_path)
+                .map_err(SchedulerSubmitError::Core)?;
+        }
         let state = self
             .session_manager
             .get_session(&session_id)
@@ -779,15 +1053,45 @@ impl DialogScheduler {
         };
 
         let queue_has_items = self.queues.has_items(&session_id);
+        if matches!(
+            &queued_turn.execution,
+            QueuedTurnExecution::FreshExternalSubagent(_)
+        ) && (!matches!(&state_fact, DialogSessionStateFact::Idle) || queue_has_items)
+        {
+            return Err(SchedulerSubmitError::Core(BitFunError::Validation(
+                "External subagent delegation requires an idle session with an empty queue"
+                    .to_string(),
+            )));
+        }
         let action = resolve_dialog_submit_queue_action(DialogSubmitQueueFacts {
             session_state: state_fact,
             queue_has_items,
             policy: queued_turn.policy,
         });
 
+        if reject_if_busy
+            && matches!(
+                action,
+                DialogSubmitQueueAction::EnqueueThenStartNext
+                    | DialogSubmitQueueAction::EnqueueForActiveTurn
+            )
+        {
+            return Err(SchedulerSubmitError::Message(
+                "Session state does not allow starting new dialog: Processing".to_string(),
+            ));
+        }
+
+        // OpenCode-compatible semantics: accepting a new prompt while history
+        // is staged permanently discards the hidden suffix before the Turn starts.
+        self.coordinator
+            .commit_session_revert_before_submission(&session_id)
+            .await
+            .map_err(SchedulerSubmitError::Core)?;
+
         match action {
             DialogSubmitQueueAction::StartImmediately => {
                 let tid = self.start_turn(&session_id, &queued_turn).await?;
+                queued_turn.accept_settlement();
                 self.record_last_submitted_agent_type(&session_id, &queued_turn.agent_type)
                     .await;
                 Ok(DialogSubmitOutcome::Started {
@@ -797,8 +1101,9 @@ impl DialogScheduler {
             }
 
             DialogSubmitQueueAction::ClearQueueAndStartImmediately => {
-                self.clear_queue(&session_id);
+                let _ = self.clear_queue(&session_id).await;
                 let tid = self.start_turn(&session_id, &queued_turn).await?;
+                queued_turn.accept_settlement();
                 self.record_last_submitted_agent_type(&session_id, &queued_turn.agent_type)
                     .await;
                 Ok(DialogSubmitOutcome::Started {
@@ -809,25 +1114,19 @@ impl DialogScheduler {
 
             DialogSubmitQueueAction::EnqueueThenStartNext => {
                 self.enqueue(&session_id, queued_turn.clone())?;
+                queued_turn.accept_settlement();
                 self.record_last_submitted_agent_type(&session_id, &queued_turn.agent_type)
                     .await;
-                let started_tid = self.try_start_next_queued(&session_id).await?;
-                let outcome = match started_tid {
-                    Some(tid) if tid == resolved_turn_id => DialogSubmitOutcome::Started {
-                        session_id: session_id.clone(),
-                        turn_id: tid,
-                    },
-                    _ => DialogSubmitOutcome::Queued {
-                        session_id: session_id.clone(),
-                        turn_id: resolved_turn_id,
-                    },
-                };
+                let started_tid = self.try_start_next_queued_locked(&session_id).await?;
+                let outcome =
+                    queued_submission_outcome(session_id.clone(), resolved_turn_id, started_tid);
                 Ok(outcome)
             }
 
             DialogSubmitQueueAction::EnqueueForActiveTurn => {
                 let accepted_agent_type = queued_turn.agent_type.clone();
-                self.enqueue(&session_id, queued_turn)?;
+                self.enqueue(&session_id, queued_turn.clone())?;
+                queued_turn.accept_settlement();
                 self.record_last_submitted_agent_type(&session_id, &accepted_agent_type)
                     .await;
                 Ok(DialogSubmitOutcome::Queued {
@@ -856,6 +1155,80 @@ impl DialogScheduler {
         self.queues.depth(session_id)
     }
 
+    /// Whether a session has a running or queued turn. This is intentionally a
+    /// narrow observation API for features that need an idle target without
+    /// depending on scheduler internals.
+    pub fn is_session_busy_or_queued(&self, session_id: &str) -> bool {
+        self.active_turns.contains(session_id)
+            || self.queues.has_items(session_id)
+            || self
+                .session_manager
+                .get_session(session_id)
+                .is_some_and(|session| matches!(session.state, SessionState::Processing { .. }))
+    }
+
+    async fn finish_removed_queued_turn(&self, session_id: &str, removed_turn: QueuedTurn) {
+        match removed_turn.execution {
+            QueuedTurnExecution::Standard | QueuedTurnExecution::FreshExternalSubagent(_) => {
+                if let Some(turn_id) = removed_turn.turn_id {
+                    self.coordinator
+                        .emit_event(AgenticEvent::DialogTurnCancelled {
+                            session_id: session_id.to_string(),
+                            turn_id,
+                        })
+                        .await;
+                } else {
+                    warn!("Removed queued dialog turn without a turn id: session_id={session_id}");
+                }
+            }
+            QueuedTurnExecution::HiddenSubagent(execution) => {
+                execution.cancellation.cancel();
+                self.coordinator
+                    .cleanup_prepared_hidden_subagent_session_if_unsubmitted(&execution.request)
+                    .await;
+                execution.result_tx.send(Err(BitFunError::Cancelled(
+                    "Subagent task has been cancelled".to_string(),
+                )));
+            }
+        }
+    }
+
+    /// Cancel one queued or active turn without allowing it to cross the
+    /// scheduler's dequeue-to-coordinator transition.
+    ///
+    /// Returns `true` when the turn was removed before it started. `false`
+    /// means cancellation was delivered to the active coordinator execution.
+    pub async fn cancel_queued_or_active_turn(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+    ) -> Result<bool, String> {
+        let _operation_guard = self.lock_session_operation(session_id).await;
+        let removed_turn = remove_queued_turn_by_id(&self.queues, session_id, turn_id);
+        if let Some(removed_turn) = removed_turn {
+            self.finish_removed_queued_turn(session_id, removed_turn)
+                .await;
+            debug!(
+                "Removed queued turn after targeted cancellation: session_id={}, turn_id={}",
+                session_id, turn_id
+            );
+            return Ok(true);
+        }
+
+        if !self.active_turns.matches_turn(session_id, turn_id) {
+            debug!(
+                "Ignoring cancellation for a turn that is not active in the requested session: session_id={}, turn_id={}",
+                session_id, turn_id
+            );
+            return Ok(false);
+        }
+
+        self.coordinator
+            .cancel_dialog_turn(session_id, turn_id)
+            .await?;
+        Ok(false)
+    }
+
     /// Cancel the target session's active turn on behalf of a requester session.
     ///
     /// If the requester is the same source session that originally sent the
@@ -867,6 +1240,7 @@ impl DialogScheduler {
         requester_session_id: &str,
         wait_timeout: Duration,
     ) -> crate::util::errors::BitFunResult<Option<String>> {
+        let _operation_guard = self.lock_session_operation(target_session_id).await;
         let suppression_key = self
             .active_turns
             .suppression_key_for_requester(target_session_id, requester_session_id);
@@ -905,6 +1279,124 @@ impl DialogScheduler {
         }
     }
 
+    /// Cancel the current active turn without allowing submit or outcome
+    /// dispatch to cross the cancellation boundary for this session.
+    pub async fn cancel_active_turn_for_session(
+        &self,
+        session_id: &str,
+        wait_timeout: Duration,
+    ) -> BitFunResult<Option<String>> {
+        let _operation_guard = self.lock_session_operation(session_id).await;
+        abort_thread_goal_continuation_for_session(session_id);
+        self.coordinator
+            .cancel_active_turn_for_session(session_id, wait_timeout)
+            .await
+    }
+
+    /// Quiesce one session for destructive maintenance. Queued turns receive an explicit
+    /// cancelled lifecycle event before active execution is cancelled and
+    /// drained, so no accepted turn disappears silently.
+    pub(crate) async fn begin_session_maintenance(
+        &self,
+        session_id: &str,
+        requested_storage_path: &std::path::Path,
+        wait_timeout: Duration,
+    ) -> BitFunResult<SessionMaintenancePermit> {
+        bitfun_core_types::validate_session_id(session_id).map_err(BitFunError::Validation)?;
+        let operation_guard = self.lock_session_operation(session_id).await;
+        self.session_manager
+            .validate_session_storage_path_binding(session_id, requested_storage_path)?;
+        let mut retired_turn_ids = if self.queue_depth(session_id) > 0 {
+            self.clear_queue(session_id).await
+        } else {
+            Vec::new()
+        };
+        abort_thread_goal_continuation_for_session(session_id);
+        let deadline = Instant::now() + wait_timeout;
+        let cancelled_before_parent = self
+            .coordinator
+            .cancel_background_subagents_for_parent_session(session_id)
+            .await?;
+        let mut subagent_session_ids = self
+            .maintenance_background_sessions
+            .get(session_id)
+            .map(|sessions| sessions.clone())
+            .unwrap_or_default();
+        subagent_session_ids.extend(cancelled_before_parent);
+        if !subagent_session_ids.is_empty() {
+            self.maintenance_background_sessions
+                .insert(session_id.to_string(), subagent_session_ids.clone());
+        }
+        let cancelled_turn_id = self
+            .coordinator
+            .cancel_active_turn_for_session(
+                session_id,
+                deadline.saturating_duration_since(Instant::now()),
+            )
+            .await?;
+        let cancelled_during_parent = self
+            .coordinator
+            .cancel_background_subagents_for_parent_session(session_id)
+            .await?;
+        subagent_session_ids.extend(cancelled_during_parent);
+        if !subagent_session_ids.is_empty() {
+            self.maintenance_background_sessions
+                .insert(session_id.to_string(), subagent_session_ids.clone());
+        }
+        for subagent_session_id in &subagent_session_ids {
+            self.coordinator
+                .ensure_session_execution_drained(
+                    subagent_session_id,
+                    deadline.saturating_duration_since(Instant::now()),
+                )
+                .await?;
+        }
+        self.coordinator
+            .ensure_session_execution_drained(
+                session_id,
+                deadline.saturating_duration_since(Instant::now()),
+            )
+            .await?;
+        self.maintenance_background_sessions.remove(session_id);
+        let scheduler_turn_id = self.retire_active_turn_for_maintenance(session_id);
+        for retired_turn_id in [cancelled_turn_id, scheduler_turn_id].into_iter().flatten() {
+            if !retired_turn_ids.contains(&retired_turn_id) {
+                retired_turn_ids.push(retired_turn_id);
+            }
+        }
+        Ok(SessionMaintenancePermit {
+            _operation_guard: operation_guard,
+            retired_turn_ids,
+        })
+    }
+
+    pub(crate) async fn begin_session_deletion(
+        &self,
+        session_id: &str,
+        requested_storage_path: &std::path::Path,
+        wait_timeout: Duration,
+    ) -> BitFunResult<SessionMaintenancePermit> {
+        self.begin_session_maintenance(session_id, requested_storage_path, wait_timeout)
+            .await
+    }
+
+    fn retire_active_turn_for_maintenance(&self, session_id: &str) -> Option<String> {
+        let Some(active_turn) = self.active_turns.remove(session_id) else {
+            return None;
+        };
+        let turn_id = active_turn.turn_id().to_string();
+        self.retired_maintenance_outcomes.mark(session_id, &turn_id);
+        self.active_internal_turns.remove(session_id);
+        self.round_injection_buffer
+            .drain_for_turn(session_id, &turn_id);
+        self.take_suppressed_cancelled_reply(session_id, &turn_id);
+        debug!(
+            "Retired active turn before destructive session maintenance: session_id={}, turn_id={}",
+            session_id, turn_id
+        );
+        Some(turn_id)
+    }
+
     // ── Private helpers ──────────────────────────────────────────────────────
 
     fn enqueue(&self, session_id: &str, queued_turn: QueuedTurn) -> Result<(), String> {
@@ -928,21 +1420,41 @@ impl DialogScheduler {
         Ok(())
     }
 
-    fn clear_queue(&self, session_id: &str) {
+    async fn clear_queue(&self, session_id: &str) -> Vec<String> {
         let cleared_turns = self.queues.clear(session_id);
         let count = cleared_turns.len();
+        let mut retired_turn_ids = Vec::new();
         for queued_turn in cleared_turns {
-            if let QueuedTurnExecution::HiddenSubagent(execution) = queued_turn.execution {
-                let coordinator = self.coordinator.clone();
-                tokio::spawn(async move {
-                    coordinator
-                        .cleanup_prepared_hidden_subagent_session_if_unsubmitted(&execution.request)
-                        .await;
-                    execution.result_tx.send(Err(BitFunError::Cancelled(
-                        "Subagent task was cancelled because a previous queued turn failed"
-                            .to_string(),
-                    )));
-                });
+            match queued_turn.execution {
+                QueuedTurnExecution::Standard | QueuedTurnExecution::FreshExternalSubagent(_) => {
+                    if let Some(turn_id) = queued_turn.turn_id {
+                        retired_turn_ids.push(turn_id.clone());
+                        self.coordinator
+                            .emit_event(AgenticEvent::DialogTurnCancelled {
+                                session_id: session_id.to_string(),
+                                turn_id,
+                            })
+                            .await;
+                    } else {
+                        warn!(
+                            "Cleared queued dialog turn without a turn id: session_id={session_id}"
+                        );
+                    }
+                }
+                QueuedTurnExecution::HiddenSubagent(execution) => {
+                    let coordinator = self.coordinator.clone();
+                    tokio::spawn(async move {
+                        coordinator
+                            .cleanup_prepared_hidden_subagent_session_if_unsubmitted(
+                                &execution.request,
+                            )
+                            .await;
+                        execution.result_tx.send(Err(BitFunError::Cancelled(
+                            "Subagent task was cancelled because a previous queued turn failed"
+                                .to_string(),
+                        )));
+                    });
+                }
             }
         }
         if count > 0 {
@@ -951,6 +1463,7 @@ impl DialogScheduler {
                 count, session_id
             );
         }
+        retired_turn_ids
     }
 
     fn dequeue_next(&self, session_id: &str) -> Option<QueuedTurn> {
@@ -962,7 +1475,18 @@ impl DialogScheduler {
         self.queues.requeue_front(session_id, turn, priority);
     }
 
-    async fn try_start_next_queued(&self, session_id: &str) -> Result<Option<String>, String> {
+    async fn try_start_next_queued(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<String>, SchedulerSubmitError> {
+        let _operation_guard = self.lock_session_operation(session_id).await;
+        self.try_start_next_queued_locked(session_id).await
+    }
+
+    async fn try_start_next_queued_locked(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<String>, SchedulerSubmitError> {
         let state = self
             .session_manager
             .get_session(session_id)
@@ -994,11 +1518,56 @@ impl DialogScheduler {
         &self,
         session_id: &str,
         queued_turn: &QueuedTurn,
-    ) -> Result<String, String> {
-        if let QueuedTurnExecution::HiddenSubagent(execution) = &queued_turn.execution {
-            return self
-                .start_hidden_subagent_turn(session_id, queued_turn, execution)
-                .await;
+    ) -> Result<String, SchedulerSubmitError> {
+        match &queued_turn.execution {
+            QueuedTurnExecution::HiddenSubagent(execution) => {
+                return self
+                    .start_hidden_subagent_turn(session_id, queued_turn, execution)
+                    .await
+                    .map_err(SchedulerSubmitError::Message);
+            }
+            QueuedTurnExecution::FreshExternalSubagent(execution) => {
+                self.coordinator
+                    .start_external_subagent_delegation_turn(
+                        session_id.to_string(),
+                        queued_turn.user_input.clone(),
+                        queued_turn.original_user_input.clone(),
+                        queued_turn.turn_id.clone(),
+                        queued_turn.agent_type.clone(),
+                        queued_turn.workspace_path.clone(),
+                        queued_turn.policy,
+                        queued_turn.user_message_metadata.clone(),
+                        execution.ecosystem_id.clone(),
+                        execution.logical_id.clone(),
+                    )
+                    .await
+                    .map_err(SchedulerSubmitError::Core)?;
+
+                let resolved = queued_turn.turn_id.clone().ok_or_else(|| {
+                    format!(
+                        "Scheduled external subagent delegation is missing turn_id: session_id={session_id}"
+                    )
+                })?;
+                self.active_turns.insert(
+                    session_id,
+                    ActiveDialogTurn::new(
+                        resolved.clone(),
+                        queued_turn.workspace_path.clone(),
+                        None,
+                        None,
+                        queued_turn.agent_type.clone(),
+                        queued_turn
+                            .original_user_input
+                            .clone()
+                            .unwrap_or_else(|| queued_turn.user_input.clone()),
+                        queued_turn.user_message_metadata.clone(),
+                        queued_turn.policy,
+                        queued_turn.reply_route.clone(),
+                    ),
+                );
+                return Ok(resolved);
+            }
+            QueuedTurnExecution::Standard => {}
         }
 
         let images = queued_turn
@@ -1085,23 +1654,15 @@ impl DialogScheduler {
             }
         };
 
-        res.map_err(|e| e.to_string())?;
+        res.map_err(SchedulerSubmitError::Core)?;
 
-        let resolved = self
-            .session_manager
-            .get_session(session_id)
-            .and_then(|s| match &s.state {
-                SessionState::Processing {
-                    current_turn_id, ..
-                } => Some(current_turn_id.clone()),
-                _ => None,
-            })
-            .ok_or_else(|| {
-                format!(
-                    "Failed to resolve turn_id after starting dialog: session_id={}",
-                    session_id
-                )
-            })?;
+        // Standard scheduler submissions resolve and persist their turn ID
+        // before entering the coordinator. Reading SessionState here races a
+        // very fast terminal transition and can incorrectly turn an accepted,
+        // completed turn into a submit error.
+        let resolved = queued_turn.turn_id.clone().ok_or_else(|| {
+            format!("Scheduled dialog turn is missing turn_id: session_id={session_id}")
+        })?;
 
         self.active_turns.insert(
             session_id,
@@ -1151,14 +1712,19 @@ impl DialogScheduler {
             self.coordinator
                 .cleanup_prepared_hidden_subagent_session_if_unsubmitted(&execution.request)
                 .await;
-            let _ = outcome_tx
-                .send((
-                    session_id_owned,
-                    TurnOutcome::Cancelled {
-                        turn_id: turn_id.clone(),
-                    },
-                ))
-                .await;
+            // This path can run while the caller holds the session operation
+            // permit. Never await the bounded outcome channel here: its
+            // receiver may be waiting for the same permit.
+            tokio::spawn(async move {
+                let _ = outcome_tx
+                    .send((
+                        session_id_owned,
+                        TurnOutcome::Cancelled {
+                            turn_id: turn_id_for_task,
+                        },
+                    ))
+                    .await;
+            });
             result_tx.send(Err(BitFunError::Cancelled(
                 "Subagent task has been cancelled".to_string(),
             )));
@@ -1272,6 +1838,7 @@ impl DialogScheduler {
             InternalReminderKind::SessionMessageReply,
             plan.reminder_text,
         )];
+        let user_message_metadata = plan.user_message_metadata;
 
         if let Err(error) = self
             .submit_with_prepended_messages(
@@ -1285,7 +1852,7 @@ impl DialogScheduler {
                 target_remote_ssh_host,
                 DialogSubmissionPolicy::for_source(DialogTriggerSource::AgentSession),
                 None,
-                None,
+                user_message_metadata,
                 prepended_messages,
                 None,
             )
@@ -1303,18 +1870,67 @@ impl DialogScheduler {
     }
 
     async fn dispatch_next_if_idle(&self, session_id: &str) -> Result<(), String> {
-        let _ = self.try_start_next_queued(session_id).await?;
+        let _ = self
+            .try_start_next_queued(session_id)
+            .await
+            .map_err(|error| error.to_string())?;
         Ok(())
     }
 
     /// Background loop that receives turn outcome notifications from the coordinator.
     async fn run_outcome_handler(&self, mut outcome_rx: mpsc::Receiver<(String, TurnOutcome)>) {
         while let Some((session_id, outcome)) = outcome_rx.recv().await {
-            let lifecycle_plan = resolve_turn_outcome_lifecycle_plan(
-                &outcome,
-                self.active_turns.contains(&session_id),
-            );
-
+            let (active_turn, active_internal_turn, lifecycle_plan) = {
+                let _operation_guard = self.lock_session_operation(&session_id).await;
+                let Some(active_turn_result) = take_active_turn_for_outcome(
+                    &self.active_turns,
+                    &self.retired_maintenance_outcomes,
+                    &session_id,
+                    outcome.turn_id(),
+                ) else {
+                    self.round_injection_buffer
+                        .drain_for_turn(&session_id, outcome.turn_id());
+                    self.take_suppressed_cancelled_reply(&session_id, outcome.turn_id());
+                    debug!(
+                        "Ignoring outcome retired by session deletion: session_id={}, turn_id={}",
+                        session_id,
+                        outcome.turn_id()
+                    );
+                    continue;
+                };
+                let active_turn = match active_turn_result {
+                    ActiveDialogTurnTakeResult::Matched(turn) => Some(turn),
+                    ActiveDialogTurnTakeResult::Absent => None,
+                    ActiveDialogTurnTakeResult::DifferentTurn => {
+                        self.round_injection_buffer
+                            .drain_for_turn(&session_id, outcome.turn_id());
+                        self.take_suppressed_cancelled_reply(&session_id, outcome.turn_id());
+                        debug!(
+                            "Ignoring stale turn outcome: session_id={}, turn_id={}",
+                            session_id,
+                            outcome.turn_id()
+                        );
+                        continue;
+                    }
+                };
+                let active_internal_turn = active_turn.as_ref().and_then(|_| {
+                    self.active_internal_turns
+                        .remove(&session_id)
+                        .map(|(_, turn)| turn)
+                });
+                let lifecycle_plan =
+                    resolve_turn_outcome_lifecycle_plan(&outcome, active_turn.is_some());
+                if lifecycle_plan.queue_action == TurnOutcomeQueueAction::ClearQueue {
+                    debug!(
+                        "Turn {}, clearing queue: session_id={}",
+                        lifecycle_plan.status, session_id
+                    );
+                    let _ = self.clear_queue(&session_id).await;
+                }
+                (active_turn, active_internal_turn, lifecycle_plan)
+            };
+            let status = lifecycle_plan.status;
+            let queue_action = lifecycle_plan.queue_action;
             // Only drop steering messages targeted at the *finished* turn. We
             // must NOT clear the entire session buffer here: a user might have
             // legitimately submitted steering against a brand-new follow-up
@@ -1322,18 +1938,11 @@ impl DialogScheduler {
             // outcome is processed (race window between turn finalize and the
             // next turn starting). Targeting by turn_id keeps those alive.
             if lifecycle_plan.drain_finished_turn_injections {
-                let _drained = self
-                    .round_injection_buffer
+                self.round_injection_buffer
                     .drain_for_turn(&session_id, outcome.turn_id());
             }
             let suppressed_cancelled_reply =
                 self.take_suppressed_cancelled_reply(&session_id, outcome.turn_id());
-
-            let active_turn = self.active_turns.remove(&session_id);
-            let active_internal_turn = self
-                .active_internal_turns
-                .remove(&session_id)
-                .map(|(_, turn)| turn);
             let is_internal_turn = active_internal_turn.is_some();
             if !is_internal_turn {
                 if let Some(active_turn) = active_turn.as_ref() {
@@ -1356,13 +1965,6 @@ impl DialogScheduler {
                         }
                     }
                 }
-            }
-
-            let status = lifecycle_plan.status;
-            let queue_action = lifecycle_plan.queue_action;
-            if queue_action == TurnOutcomeQueueAction::ClearQueue {
-                debug!("Turn {}, clearing queue: session_id={}", status, session_id);
-                self.clear_queue(&session_id);
             }
 
             if !is_internal_turn {
@@ -1623,12 +2225,55 @@ fn agent_dialog_turn_prepended_messages(
         .collect()
 }
 
-#[async_trait::async_trait]
-impl AgentDialogTurnPort for DialogScheduler {
-    async fn submit_dialog_turn(
+impl DialogScheduler {
+    pub(crate) async fn submit_agent_dialog_turn_reject_if_busy(
         &self,
         request: AgentDialogTurnRequest,
     ) -> PortResult<DialogSubmitOutcome> {
+        self.submit_agent_dialog_turn_with_busy_policy(request, true)
+            .await
+    }
+
+    async fn submit_agent_dialog_turn_with_busy_policy(
+        &self,
+        request: AgentDialogTurnRequest,
+        reject_if_busy: bool,
+    ) -> PortResult<DialogSubmitOutcome> {
+        let (execution, reject_if_busy) = match &request.execution {
+            AgentDialogTurnExecution::Standard => (QueuedTurnExecution::Standard, reject_if_busy),
+            AgentDialogTurnExecution::FreshExternalSubagent {
+                ecosystem_id,
+                logical_id,
+            } => {
+                if ecosystem_id.trim().is_empty() || logical_id.trim().is_empty() {
+                    return Err(PortError::new(
+                        PortErrorKind::InvalidRequest,
+                        "External subagent delegation requires non-empty ecosystem_id and logical_id",
+                    ));
+                }
+                if !request.attachments.is_empty() || !request.prepended_reminders.is_empty() {
+                    return Err(PortError::new(
+                        PortErrorKind::InvalidRequest,
+                        "External subagent delegation does not accept attachments or prepended reminders",
+                    ));
+                }
+                if request.remote_connection_id.is_some() || request.remote_ssh_host.is_some() {
+                    return Err(PortError::new(
+                        PortErrorKind::NotAvailable,
+                        "External subagent delegation is unavailable for remote workspaces",
+                    ));
+                }
+                (
+                    QueuedTurnExecution::FreshExternalSubagent(
+                        ExternalSubagentDelegationQueuedExecution {
+                            ecosystem_id: ecosystem_id.trim().to_string(),
+                            logical_id: logical_id.trim().to_string(),
+                        },
+                    ),
+                    true,
+                )
+            }
+        };
         let image_contexts = agent_dialog_turn_image_contexts(&request.attachments)?;
         let prepended_messages =
             agent_dialog_turn_prepended_messages(&request.prepended_reminders)?;
@@ -1637,24 +2282,83 @@ impl AgentDialogTurnPort for DialogScheduler {
         } else {
             Some(serde_json::Value::Object(request.metadata))
         };
-
-        self.submit_with_prepended_messages(
-            request.session_id,
-            request.message,
-            request.original_message,
-            request.turn_id,
-            request.agent_type,
-            request.workspace_path,
-            request.remote_connection_id,
-            request.remote_ssh_host,
-            request.policy,
-            request.reply_route,
-            user_message_metadata,
+        let resolved_turn_id = request
+            .turn_id
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let settlement_registration = self
+            .coordinator
+            .try_register_turn_settlement(&request.session_id, &resolved_turn_id)
+            .ok_or_else(|| {
+                PortError::new(
+                    PortErrorKind::InvalidRequest,
+                    format!(
+                        "Dialog turn ID is already active or completed: session_id={}, turn_id={resolved_turn_id}",
+                        request.session_id
+                    ),
+                )
+            })?;
+        let queued_turn = QueuedTurn {
+            user_input: request.message,
+            original_user_input: request.original_message,
             prepended_messages,
+            turn_id: Some(resolved_turn_id.clone()),
+            agent_type: request.agent_type,
+            workspace_path: request.workspace_path,
+            remote_connection_id: request.remote_connection_id,
+            remote_ssh_host: request.remote_ssh_host,
+            policy: request.policy,
+            reply_route: request.reply_route,
+            user_message_metadata,
             image_contexts,
+            enqueued_at: SystemTime::now(),
+            _settlement_registration: Some(settlement_registration),
+            execution,
+        };
+
+        self.submit_queued_turn(
+            request.session_id,
+            resolved_turn_id,
+            queued_turn,
+            reject_if_busy,
         )
         .await
-        .map_err(|error| PortError::new(PortErrorKind::Backend, error))
+        .map_err(SchedulerSubmitError::into_port_error)
+    }
+}
+
+#[async_trait::async_trait]
+impl AgentDialogTurnPort for DialogScheduler {
+    async fn submit_dialog_turn(
+        &self,
+        request: AgentDialogTurnRequest,
+    ) -> PortResult<DialogSubmitOutcome> {
+        self.submit_agent_dialog_turn_with_busy_policy(request, false)
+            .await
+    }
+
+    async fn steer_dialog_turn(
+        &self,
+        request: AgentDialogSteerRequest,
+    ) -> PortResult<DialogSteerOutcome> {
+        let empty_content = request.content.trim().is_empty();
+        DialogScheduler::buffer_steering(
+            self,
+            request.session_id,
+            request.turn_id,
+            request.content,
+            request.display_content,
+        )
+        .await
+        .map_err(|error| {
+            PortError::new(
+                if empty_content {
+                    PortErrorKind::InvalidRequest
+                } else {
+                    PortErrorKind::SessionInUse
+                },
+                error,
+            )
+        })
     }
 }
 
@@ -1727,8 +2431,7 @@ impl AgentTurnCancellationPort for DialogScheduler {
         let wait_timeout = Duration::from_millis(request.wait_timeout_ms.unwrap_or(1500));
 
         let cancelled_turn_id = if let Some(turn_id) = request.turn_id {
-            self.coordinator
-                .cancel_dialog_turn(&session_id, &turn_id)
+            self.cancel_queued_or_active_turn(&session_id, &turn_id)
                 .await
                 .map_err(|error| PortError::new(PortErrorKind::Backend, error.to_string()))?;
             Some(turn_id)
@@ -1741,8 +2444,7 @@ impl AgentTurnCancellationPort for DialogScheduler {
             .await
             .map_err(|error| PortError::new(PortErrorKind::Backend, error.to_string()))?
         } else {
-            self.coordinator
-                .cancel_active_turn_for_session(&session_id, wait_timeout)
+            self.cancel_active_turn_for_session(&session_id, wait_timeout)
                 .await
                 .map_err(|error| PortError::new(PortErrorKind::Backend, error.to_string()))?
         };
@@ -1767,6 +2469,46 @@ fn thread_goal_delivery_messages(reminders: Vec<ThreadGoalDeliveryReminder>) -> 
             }
         })
         .collect()
+}
+
+fn background_result_delivery_state_fact(
+    session_id: &str,
+    state: Option<&SessionState>,
+    metadata: Option<&serde_json::Value>,
+) -> DialogSessionStateFact {
+    let Some(SessionState::Processing {
+        current_turn_id, ..
+    }) = state
+    else {
+        return DialogScheduler::session_state_fact(state);
+    };
+    let Some(metadata) = metadata.and_then(serde_json::Value::as_object) else {
+        return DialogSessionStateFact::Processing;
+    };
+    let has_exact_parent =
+        metadata.contains_key("parentSessionId") || metadata.contains_key("parentDialogTurnId");
+    if !has_exact_parent {
+        return DialogSessionStateFact::Processing;
+    }
+
+    let exact_parent_matches = metadata
+        .get("parentSessionId")
+        .and_then(serde_json::Value::as_str)
+        .zip(
+            metadata
+                .get("parentDialogTurnId")
+                .and_then(serde_json::Value::as_str),
+        )
+        .is_some_and(|(parent_session_id, parent_turn_id)| {
+            parent_session_id == session_id && parent_turn_id == current_turn_id
+        });
+    if exact_parent_matches {
+        DialogSessionStateFact::Processing
+    } else {
+        // The session is busy, but this result does not belong to the running turn.
+        // Resolve it as a follow-up; the normal submission path will queue it.
+        DialogSessionStateFact::Idle
+    }
 }
 
 // ── Global instance ──────────────────────────────────────────────────────────
@@ -1798,13 +2540,1140 @@ pub fn clear_thread_goal_continuation_abort(session_id: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agentic::core::{ProcessingPhase, SessionConfig};
+    use crate::agentic::events::{EventQueue, EventQueueConfig, EventRouter};
+    use crate::agentic::execution::{
+        ExecutionEngine, ExecutionEngineConfig, RoundExecutor, StreamProcessor,
+    };
+    use crate::agentic::persistence::PersistenceManager;
+    use crate::agentic::session::{
+        compression::{CompressionConfig, ContextCompressor},
+        revert::{SessionRevertPhase, SessionRevertState, SESSION_REVERT_SCHEMA_VERSION},
+        PromptCachePolicy, SessionContextStore, SessionManagerConfig,
+    };
+    use crate::agentic::tools::registry::ToolRegistry;
+    use crate::agentic::tools::{ToolPipeline, ToolStateManager};
+    use crate::infrastructure::PathManager;
     use bitfun_runtime_ports::{AgentDialogPrependedReminder, AgentInputAttachment, PortErrorKind};
+    use tokio::sync::RwLock as TokioRwLock;
+
+    #[test]
+    fn scheduler_preserves_session_writer_conflicts() {
+        let error = SchedulerSubmitError::Core(BitFunError::SessionInUse {
+            session_id: "session-1".to_string(),
+        })
+        .into_port_error();
+
+        assert_eq!(error.kind, PortErrorKind::SessionInUse);
+    }
+
+    fn test_scheduler() -> (
+        Arc<DialogScheduler>,
+        Arc<SessionManager>,
+        Arc<EventQueue>,
+        tempfile::TempDir,
+    ) {
+        let root = tempfile::tempdir().expect("test root");
+        let event_queue = Arc::new(EventQueue::new(EventQueueConfig::default()));
+        let session_manager = Arc::new(SessionManager::new(
+            Arc::new(SessionContextStore::new()),
+            Arc::new(
+                PersistenceManager::new(Arc::new(PathManager::with_user_root_for_tests(
+                    root.path().join("user-root"),
+                )))
+                .expect("persistence manager"),
+            ),
+            SessionManagerConfig {
+                max_active_sessions: 100,
+                session_idle_timeout: Duration::from_secs(3600),
+                auto_save_interval: Duration::from_secs(300),
+                enable_persistence: false,
+                prompt_cache_policy: PromptCachePolicy::default(),
+            },
+        ));
+        let tool_pipeline = Arc::new(ToolPipeline::new(
+            Arc::new(TokioRwLock::new(ToolRegistry::new())),
+            Arc::new(ToolStateManager::new(event_queue.clone())),
+            None,
+        ));
+        let execution_engine = Arc::new(ExecutionEngine::new(
+            Arc::new(RoundExecutor::new(
+                Arc::new(StreamProcessor::new(event_queue.clone())),
+                event_queue.clone(),
+                tool_pipeline.clone(),
+            )),
+            event_queue.clone(),
+            session_manager.clone(),
+            Arc::new(ContextCompressor::new(CompressionConfig::default())),
+            ExecutionEngineConfig::default(),
+        ));
+        let coordinator = Arc::new(ConversationCoordinator::new(
+            session_manager.clone(),
+            execution_engine,
+            tool_pipeline,
+            event_queue.clone(),
+            Arc::new(EventRouter::new()),
+            Arc::new(
+                crate::runtime_ownership::CoreRuntimeOwnership::embedded_with_facts(
+                    std::env::temp_dir().join(format!(
+                        "bitfun-scheduler-ownership-test-{}",
+                        uuid::Uuid::new_v4()
+                    )),
+                    "bitfun".to_string(),
+                    "test",
+                ),
+            ),
+        ));
+        (
+            DialogScheduler::new(coordinator, session_manager.clone()),
+            session_manager,
+            event_queue,
+            root,
+        )
+    }
 
     #[test]
     fn queued_turn_execution_default_is_standard() {
         assert!(matches!(
             QueuedTurnExecution::default(),
             QueuedTurnExecution::Standard
+        ));
+    }
+
+    #[tokio::test]
+    async fn submission_preflight_commits_a_persisted_revert_marker() {
+        let (scheduler, session_manager, _, root) = test_scheduler();
+        let session_id = "reverted-session";
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        session_manager
+            .create_session_with_id(
+                Some(session_id.to_string()),
+                "Reverted".to_string(),
+                "agentic".to_string(),
+                SessionConfig {
+                    workspace_path: Some(workspace.to_string_lossy().into_owned()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create session");
+        let storage_path = session_manager
+            .effective_session_storage_path(session_id)
+            .await
+            .expect("storage path");
+        session_manager
+            .persistence_manager()
+            .save_session_revert_state(
+                &storage_path,
+                session_id,
+                &SessionRevertState {
+                    schema_version: SESSION_REVERT_SCHEMA_VERSION,
+                    boundary_turn: 0,
+                    original_turn_end: 1,
+                    phase: SessionRevertPhase::Staged,
+                    workspace_checkpoint: Vec::new(),
+                },
+            )
+            .await
+            .expect("persist staged revert");
+
+        scheduler
+            .coordinator
+            .commit_session_revert_before_submission(session_id)
+            .await
+            .expect("commit staged revert");
+
+        assert!(session_manager
+            .persistence_manager()
+            .load_session_revert_state(&storage_path, session_id)
+            .await
+            .expect("load revert marker")
+            .is_none());
+        let source = include_str!("scheduler.rs");
+        let submission = source
+            .split_once("async fn submit_queued_turn_locked(")
+            .expect("submission method")
+            .1
+            .split_once("async fn record_last_submitted_agent_type(")
+            .expect("submission method boundary")
+            .0;
+        assert!(submission.contains("commit_session_revert_before_submission(&session_id)"));
+    }
+
+    #[tokio::test]
+    async fn background_bash_result_injects_into_its_running_parent_turn() {
+        let (scheduler, session_manager, _, root) = test_scheduler();
+        let session_id = "parent-session";
+        let turn_id = "parent-turn";
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        session_manager
+            .create_session_with_id(
+                Some(session_id.to_string()),
+                "Parent".to_string(),
+                "agentic".to_string(),
+                SessionConfig {
+                    workspace_path: Some(workspace.to_string_lossy().into_owned()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create parent session");
+        session_manager
+            .update_session_state(
+                session_id,
+                SessionState::Processing {
+                    current_turn_id: turn_id.to_string(),
+                    phase: ProcessingPhase::Thinking,
+                },
+            )
+            .await
+            .expect("mark parent turn active");
+
+        scheduler
+            .deliver_background_result(
+                session_id.to_string(),
+                "agentic".to_string(),
+                None,
+                None,
+                None,
+                "Background Bash command completed".to_string(),
+                None,
+                Some(serde_json::json!({
+                    "kind": "background_result",
+                    "sourceKind": "bash_command",
+                    "parentSessionId": session_id,
+                    "parentDialogTurnId": turn_id,
+                })),
+            )
+            .await
+            .expect("inject background Bash result");
+
+        let pending = scheduler
+            .round_injection_monitor()
+            .take_pending(session_id, turn_id);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(scheduler.queue_depth(session_id), 0);
+    }
+
+    fn standard_queued_turn(turn_id: &str) -> QueuedTurn {
+        QueuedTurn {
+            user_input: "queued".to_string(),
+            original_user_input: None,
+            prepended_messages: Vec::new(),
+            turn_id: Some(turn_id.to_string()),
+            agent_type: "agentic".to_string(),
+            workspace_path: Some("/workspace".to_string()),
+            remote_connection_id: None,
+            remote_ssh_host: None,
+            policy: DialogSubmissionPolicy::for_source(DialogTriggerSource::DesktopUi),
+            reply_route: None,
+            user_message_metadata: None,
+            image_contexts: None,
+            enqueued_at: SystemTime::now(),
+            _settlement_registration: None,
+            execution: QueuedTurnExecution::Standard,
+        }
+    }
+
+    #[test]
+    fn targeted_queue_removal_cancels_a_standard_turn_by_id() {
+        let queues = DialogTurnQueue::default();
+        let queued_turn = standard_queued_turn("turn-queued");
+        queues
+            .enqueue("session-1", queued_turn, DialogQueuePriority::Normal)
+            .expect("standard turn should enqueue");
+
+        let removed = remove_queued_turn_by_id(&queues, "session-1", "turn-queued")
+            .expect("targeted cancellation should remove the queued turn");
+
+        assert!(matches!(removed.execution, QueuedTurnExecution::Standard));
+        assert_eq!(queues.depth("session-1"), 0);
+    }
+
+    #[tokio::test]
+    async fn targeted_standard_queue_cancellation_emits_one_terminal_event() {
+        let (scheduler, _, event_queue, _root) = test_scheduler();
+        let mut events = event_queue.subscribe();
+        scheduler
+            .queues
+            .enqueue(
+                "session",
+                standard_queued_turn("turn-queued"),
+                DialogQueuePriority::Normal,
+            )
+            .expect("queue standard turn");
+
+        assert!(scheduler
+            .cancel_queued_or_active_turn("session", "turn-queued")
+            .await
+            .expect("cancel queued turn"));
+        let event = tokio::time::timeout(Duration::from_secs(1), events.recv())
+            .await
+            .expect("terminal event timeout")
+            .expect("terminal event");
+        assert!(matches!(
+            event.event,
+            AgenticEvent::DialogTurnCancelled { session_id, turn_id }
+                if session_id == "session" && turn_id == "turn-queued"
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), events.recv())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn maintenance_does_not_release_parent_while_background_child_is_still_running() {
+        let (scheduler, session_manager, _, root) = test_scheduler();
+        let parent_session_id = "parent-session";
+        let child_session_id = "background-child-session";
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        session_manager
+            .create_session_with_id(
+                Some(parent_session_id.to_string()),
+                "Parent".to_string(),
+                "agentic".to_string(),
+                SessionConfig {
+                    workspace_path: Some(workspace.to_string_lossy().to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create parent session");
+        let storage_path = session_manager
+            .storage_path_binding_for_test(parent_session_id)
+            .expect("parent storage binding");
+        scheduler
+            .coordinator
+            .register_background_subagent_task_for_test(1, parent_session_id, child_session_id);
+        scheduler
+            .coordinator
+            .set_active_turn_count_for_test(child_session_id, 1);
+
+        let result = scheduler
+            .begin_session_maintenance(parent_session_id, &storage_path, Duration::from_millis(40))
+            .await;
+        let error = match result {
+            Ok(_) => panic!("maintenance must not detach a parent with a running child"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, BitFunError::Timeout(_)));
+        assert!(error.to_string().contains(child_session_id));
+        assert!(session_manager.get_session(parent_session_id).is_some());
+
+        let retry_error = match scheduler
+            .begin_session_maintenance(parent_session_id, &storage_path, Duration::from_millis(40))
+            .await
+        {
+            Ok(_) => panic!("retry must retain ownership of the still-running child"),
+            Err(error) => error,
+        };
+        assert!(matches!(retry_error, BitFunError::Timeout(_)));
+        assert!(retry_error.to_string().contains(child_session_id));
+
+        scheduler
+            .coordinator
+            .set_active_turn_count_for_test(child_session_id, 0);
+        let maintenance = scheduler
+            .begin_session_maintenance(parent_session_id, &storage_path, Duration::from_millis(40))
+            .await
+            .expect("maintenance should succeed after the child drains");
+        drop(maintenance);
+        assert!(!scheduler
+            .maintenance_background_sessions
+            .contains_key(parent_session_id));
+    }
+
+    #[test]
+    fn queued_submission_without_started_turn_reports_queued() {
+        assert_eq!(
+            queued_submission_outcome("session".to_string(), "turn-submitted".to_string(), None,),
+            DialogSubmitOutcome::Queued {
+                session_id: "session".to_string(),
+                turn_id: "turn-submitted".to_string(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn dialog_port_preserves_not_found_for_a_missing_session() {
+        let (scheduler, _, _, root) = test_scheduler();
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+
+        let error = scheduler
+            .submit_dialog_turn(AgentDialogTurnRequest {
+                session_id: "missing-session".to_string(),
+                message: "hello".to_string(),
+                original_message: None,
+                turn_id: Some("missing-turn".to_string()),
+                execution: Default::default(),
+                agent_type: "agentic".to_string(),
+                workspace_path: Some(workspace.to_string_lossy().to_string()),
+                remote_connection_id: None,
+                remote_ssh_host: None,
+                policy: DialogSubmissionPolicy::for_source(DialogTriggerSource::Cli),
+                reply_route: None,
+                prepended_reminders: Vec::new(),
+                attachments: Vec::new(),
+                metadata: serde_json::Map::new(),
+            })
+            .await
+            .expect_err("a missing session must remain distinguishable");
+
+        assert_eq!(error.kind, PortErrorKind::NotFound);
+        assert!(error.message.contains("missing-session"), "{error}");
+        assert!(matches!(
+            scheduler
+                .coordinator
+                .wait_for_turn_settlement(
+                    "missing-session",
+                    "missing-turn",
+                    Duration::from_millis(10),
+                )
+                .await,
+            Err(BitFunError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn dialog_port_tracks_settlement_from_queue_admission_through_cancellation() {
+        let (scheduler, session_manager, _, root) = test_scheduler();
+        let session_id = "queued-session";
+        let turn_id = "queued-turn";
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        session_manager
+            .create_session_with_id(
+                Some(session_id.to_string()),
+                "Queued".to_string(),
+                "agentic".to_string(),
+                SessionConfig {
+                    workspace_path: Some(workspace.to_string_lossy().to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create queued session");
+        session_manager
+            .update_session_state(
+                session_id,
+                SessionState::Processing {
+                    current_turn_id: "active-turn".to_string(),
+                    phase: ProcessingPhase::Thinking,
+                },
+            )
+            .await
+            .expect("mark another turn active");
+
+        let outcome = scheduler
+            .submit_dialog_turn(AgentDialogTurnRequest {
+                session_id: session_id.to_string(),
+                message: "queued prompt".to_string(),
+                original_message: None,
+                turn_id: Some(turn_id.to_string()),
+                execution: Default::default(),
+                agent_type: "agentic".to_string(),
+                workspace_path: None,
+                remote_connection_id: None,
+                remote_ssh_host: None,
+                policy: DialogSubmissionPolicy::for_source(DialogTriggerSource::Cli),
+                reply_route: None,
+                prepended_reminders: Vec::new(),
+                attachments: Vec::new(),
+                metadata: serde_json::Map::new(),
+            })
+            .await
+            .expect("queue the submitted turn");
+
+        assert_eq!(
+            outcome,
+            DialogSubmitOutcome::Queued {
+                session_id: session_id.to_string(),
+                turn_id: turn_id.to_string(),
+            }
+        );
+        assert!(matches!(
+            scheduler
+                .coordinator
+                .wait_for_turn_settlement(session_id, turn_id, Duration::from_millis(10))
+                .await,
+            Err(BitFunError::Timeout(_))
+        ));
+
+        assert!(scheduler
+            .cancel_queued_or_active_turn(session_id, turn_id)
+            .await
+            .expect("cancel queued turn"));
+        scheduler
+            .coordinator
+            .wait_for_turn_settlement(session_id, turn_id, Duration::from_millis(10))
+            .await
+            .expect("cancelled queued turn should settle");
+    }
+
+    #[tokio::test]
+    async fn delegated_dialog_turn_rejects_instead_of_queueing_behind_an_active_turn() {
+        let (scheduler, session_manager, _, root) = test_scheduler();
+        let session_id = "delegated-busy-session";
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        session_manager
+            .create_session_with_id(
+                Some(session_id.to_string()),
+                "Delegated".to_string(),
+                "agentic".to_string(),
+                SessionConfig {
+                    workspace_path: Some(workspace.to_string_lossy().to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create delegated session");
+        session_manager
+            .update_session_state(
+                session_id,
+                SessionState::Processing {
+                    current_turn_id: "active-turn".to_string(),
+                    phase: ProcessingPhase::Thinking,
+                },
+            )
+            .await
+            .expect("mark active turn");
+
+        let error = scheduler
+            .submit_dialog_turn(AgentDialogTurnRequest {
+                session_id: session_id.to_string(),
+                message: "expanded command prompt".to_string(),
+                original_message: Some("/review".to_string()),
+                turn_id: Some("delegated-turn".to_string()),
+                execution: bitfun_runtime_ports::AgentDialogTurnExecution::FreshExternalSubagent {
+                    ecosystem_id: "opencode".to_string(),
+                    logical_id: "reviewer".to_string(),
+                },
+                agent_type: "agentic".to_string(),
+                workspace_path: None,
+                remote_connection_id: None,
+                remote_ssh_host: None,
+                policy: DialogSubmissionPolicy::for_source(DialogTriggerSource::Cli),
+                reply_route: None,
+                prepended_reminders: Vec::new(),
+                attachments: Vec::new(),
+                metadata: serde_json::Map::new(),
+            })
+            .await
+            .expect_err("delegated commands must not queue behind another turn");
+
+        assert_eq!(error.kind, PortErrorKind::InvalidRequest);
+        assert!(error.message.contains("idle session"), "{error}");
+        assert_eq!(scheduler.queue_depth(session_id), 0);
+    }
+
+    #[tokio::test]
+    async fn delegated_dialog_turn_does_not_clear_a_queue_from_an_error_session() {
+        let (scheduler, session_manager, _, root) = test_scheduler();
+        let session_id = "delegated-error-session";
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        session_manager
+            .create_session_with_id(
+                Some(session_id.to_string()),
+                "Delegated".to_string(),
+                "agentic".to_string(),
+                SessionConfig {
+                    workspace_path: Some(workspace.to_string_lossy().to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create delegated session");
+        session_manager
+            .update_session_state(
+                session_id,
+                SessionState::Processing {
+                    current_turn_id: "active-turn".to_string(),
+                    phase: ProcessingPhase::Thinking,
+                },
+            )
+            .await
+            .expect("mark active turn");
+
+        scheduler
+            .submit_dialog_turn(AgentDialogTurnRequest {
+                session_id: session_id.to_string(),
+                message: "queued prompt".to_string(),
+                original_message: None,
+                turn_id: Some("queued-turn".to_string()),
+                execution: Default::default(),
+                agent_type: "agentic".to_string(),
+                workspace_path: None,
+                remote_connection_id: None,
+                remote_ssh_host: None,
+                policy: DialogSubmissionPolicy::for_source(DialogTriggerSource::Cli),
+                reply_route: None,
+                prepended_reminders: Vec::new(),
+                attachments: Vec::new(),
+                metadata: serde_json::Map::new(),
+            })
+            .await
+            .expect("queue standard turn");
+        session_manager
+            .update_session_state(
+                session_id,
+                SessionState::Error {
+                    error: "previous turn failed".to_string(),
+                    recoverable: true,
+                },
+            )
+            .await
+            .expect("mark session recoverable error");
+
+        let error = scheduler
+            .submit_dialog_turn(AgentDialogTurnRequest {
+                session_id: session_id.to_string(),
+                message: "expanded command prompt".to_string(),
+                original_message: Some("/review".to_string()),
+                turn_id: Some("delegated-turn".to_string()),
+                execution: bitfun_runtime_ports::AgentDialogTurnExecution::FreshExternalSubagent {
+                    ecosystem_id: "opencode".to_string(),
+                    logical_id: "reviewer".to_string(),
+                },
+                agent_type: "agentic".to_string(),
+                workspace_path: None,
+                remote_connection_id: None,
+                remote_ssh_host: None,
+                policy: DialogSubmissionPolicy::for_source(DialogTriggerSource::Cli),
+                reply_route: None,
+                prepended_reminders: Vec::new(),
+                attachments: Vec::new(),
+                metadata: serde_json::Map::new(),
+            })
+            .await
+            .expect_err("delegated commands must not replace a queued turn after an error");
+
+        assert_eq!(error.kind, PortErrorKind::InvalidRequest);
+        assert!(error.message.contains("idle"), "{error}");
+        assert_eq!(scheduler.queue_depth(session_id), 1);
+        assert!(scheduler
+            .cancel_queued_or_active_turn(session_id, "queued-turn")
+            .await
+            .expect("cancel preserved queued turn"));
+    }
+
+    #[tokio::test]
+    async fn reject_busy_dialog_port_does_not_enqueue_or_replace_the_active_turn() {
+        let (scheduler, session_manager, _, root) = test_scheduler();
+        let session_id = "acp-session";
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        session_manager
+            .create_session_with_id(
+                Some(session_id.to_string()),
+                "ACP".to_string(),
+                "agentic".to_string(),
+                SessionConfig {
+                    workspace_path: Some(workspace.to_string_lossy().to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create ACP session");
+        session_manager
+            .update_session_state(
+                session_id,
+                SessionState::Processing {
+                    current_turn_id: "active-turn".to_string(),
+                    phase: ProcessingPhase::Thinking,
+                },
+            )
+            .await
+            .expect("mark active turn");
+
+        let error = scheduler
+            .submit_agent_dialog_turn_reject_if_busy(AgentDialogTurnRequest {
+                session_id: session_id.to_string(),
+                message: "second prompt".to_string(),
+                original_message: None,
+                turn_id: Some("rejected-turn".to_string()),
+                execution: Default::default(),
+                agent_type: "agentic".to_string(),
+                workspace_path: None,
+                remote_connection_id: None,
+                remote_ssh_host: None,
+                policy: DialogSubmissionPolicy::for_source(DialogTriggerSource::Cli),
+                reply_route: None,
+                prepended_reminders: Vec::new(),
+                attachments: Vec::new(),
+                metadata: serde_json::Map::new(),
+            })
+            .await
+            .expect_err("busy ACP prompt must be rejected");
+
+        assert_eq!(error.kind, PortErrorKind::Backend);
+        assert!(error.message.contains("Processing"), "{error}");
+        assert_eq!(scheduler.queue_depth(session_id), 0);
+        assert!(matches!(
+            session_manager
+                .get_session(session_id)
+                .expect("session")
+                .state,
+            SessionState::Processing { current_turn_id, .. } if current_turn_id == "active-turn"
+        ));
+        assert!(matches!(
+            scheduler
+                .coordinator
+                .wait_for_turn_settlement(session_id, "rejected-turn", Duration::from_millis(10),)
+                .await,
+            Err(BitFunError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn dialog_port_rejects_duplicate_active_turn_id() {
+        let (scheduler, session_manager, _, root) = test_scheduler();
+        let session_id = "duplicate-active-session";
+        let turn_id = "duplicate-turn";
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        session_manager
+            .create_session_with_id(
+                Some(session_id.to_string()),
+                "Duplicate".to_string(),
+                "agentic".to_string(),
+                SessionConfig {
+                    workspace_path: Some(workspace.to_string_lossy().to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create session");
+        let _active_registration = scheduler
+            .coordinator
+            .register_turn_settlement(session_id, turn_id);
+        session_manager
+            .update_session_state(
+                session_id,
+                SessionState::Processing {
+                    current_turn_id: turn_id.to_string(),
+                    phase: ProcessingPhase::Thinking,
+                },
+            )
+            .await
+            .expect("mark active turn");
+
+        let error = scheduler
+            .submit_dialog_turn(AgentDialogTurnRequest {
+                session_id: session_id.to_string(),
+                message: "duplicate".to_string(),
+                original_message: None,
+                turn_id: Some(turn_id.to_string()),
+                execution: Default::default(),
+                agent_type: "agentic".to_string(),
+                workspace_path: None,
+                remote_connection_id: None,
+                remote_ssh_host: None,
+                policy: DialogSubmissionPolicy::for_source(DialogTriggerSource::Cli),
+                reply_route: None,
+                prepended_reminders: Vec::new(),
+                attachments: Vec::new(),
+                metadata: serde_json::Map::new(),
+            })
+            .await
+            .expect_err("duplicate active turn ID must be rejected");
+
+        assert_eq!(error.kind, PortErrorKind::InvalidRequest);
+    }
+
+    #[tokio::test]
+    async fn dialog_port_preserves_invalid_request_for_wrong_workspace() {
+        let (scheduler, session_manager, _, root) = test_scheduler();
+        let session_id = "workspace-bound-session";
+        let turn_id = "wrong-workspace-turn";
+        let workspace_a = root.path().join("workspace-a");
+        let workspace_b = root.path().join("workspace-b");
+        std::fs::create_dir_all(&workspace_a).expect("workspace a");
+        std::fs::create_dir_all(&workspace_b).expect("workspace b");
+        session_manager
+            .create_session_with_id(
+                Some(session_id.to_string()),
+                "Workspace".to_string(),
+                "agentic".to_string(),
+                SessionConfig {
+                    workspace_path: Some(workspace_a.to_string_lossy().to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create session");
+        let error = scheduler
+            .submit_dialog_turn(AgentDialogTurnRequest {
+                session_id: session_id.to_string(),
+                message: "wrong workspace".to_string(),
+                original_message: None,
+                turn_id: Some(turn_id.to_string()),
+                execution: Default::default(),
+                agent_type: "agentic".to_string(),
+                workspace_path: Some(workspace_b.to_string_lossy().to_string()),
+                remote_connection_id: None,
+                remote_ssh_host: None,
+                policy: DialogSubmissionPolicy::for_source(DialogTriggerSource::Cli),
+                reply_route: None,
+                prepended_reminders: Vec::new(),
+                attachments: Vec::new(),
+                metadata: serde_json::Map::new(),
+            })
+            .await
+            .expect_err("wrong workspace must be rejected");
+
+        assert_eq!(error.kind, PortErrorKind::InvalidRequest);
+        assert!(matches!(
+            scheduler
+                .coordinator
+                .wait_for_turn_settlement(session_id, turn_id, Duration::from_millis(10))
+                .await,
+            Err(BitFunError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn dialog_port_treats_unknown_agent_as_invalid_request() {
+        let (scheduler, session_manager, _, root) = test_scheduler();
+        let session_id = "invalid-agent-session";
+        let turn_id = "invalid-agent-turn";
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        session_manager
+            .create_session_with_id(
+                Some(session_id.to_string()),
+                "Invalid agent".to_string(),
+                "agentic".to_string(),
+                SessionConfig {
+                    workspace_path: Some(workspace.to_string_lossy().to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create session");
+
+        let error = scheduler
+            .submit_dialog_turn(AgentDialogTurnRequest {
+                session_id: session_id.to_string(),
+                message: "invalid agent".to_string(),
+                original_message: None,
+                turn_id: Some(turn_id.to_string()),
+                execution: Default::default(),
+                agent_type: "agent-that-does-not-exist".to_string(),
+                workspace_path: None,
+                remote_connection_id: None,
+                remote_ssh_host: None,
+                policy: DialogSubmissionPolicy::for_source(DialogTriggerSource::Cli),
+                reply_route: None,
+                prepended_reminders: Vec::new(),
+                attachments: Vec::new(),
+                metadata: serde_json::Map::new(),
+            })
+            .await
+            .expect_err("unknown agent must be rejected");
+
+        assert_eq!(error.kind, PortErrorKind::InvalidRequest);
+    }
+
+    #[tokio::test]
+    async fn missing_settlement_evidence_for_known_turn_fails_closed() {
+        let (scheduler, session_manager, _, root) = test_scheduler();
+        let session_id = "known-turn-session";
+        let turn_id = "known-turn";
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        session_manager
+            .create_session_with_id(
+                Some(session_id.to_string()),
+                "Known turn".to_string(),
+                "agentic".to_string(),
+                SessionConfig {
+                    workspace_path: Some(workspace.to_string_lossy().to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create session");
+        session_manager
+            .start_dialog_turn(
+                session_id,
+                "agentic".to_string(),
+                "hello".to_string(),
+                Some(turn_id.to_string()),
+                None,
+                None,
+            )
+            .await
+            .expect("record turn");
+        session_manager
+            .update_session_state(session_id, SessionState::Idle)
+            .await
+            .expect("mark idle");
+
+        let error = scheduler
+            .coordinator
+            .wait_for_turn_settlement(session_id, turn_id, Duration::from_millis(10))
+            .await
+            .expect_err("missing settlement evidence must not be treated as success");
+
+        assert!(matches!(error, BitFunError::Service(_)), "{error}");
+    }
+
+    fn desktop_active_turn(turn_id: &str) -> ActiveDialogTurn {
+        ActiveDialogTurn::new(
+            turn_id.to_string(),
+            Some("/workspace".to_string()),
+            None,
+            None,
+            "agentic".to_string(),
+            "hello".to_string(),
+            None,
+            DialogSubmissionPolicy::for_source(DialogTriggerSource::DesktopUi),
+            None,
+        )
+    }
+
+    async fn mark_session_processing(
+        session_manager: &SessionManager,
+        root: &tempfile::TempDir,
+        session_id: &str,
+        turn_id: &str,
+    ) {
+        let workspace = root.path().join(format!("workspace-{session_id}"));
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        session_manager
+            .create_session_with_id(
+                Some(session_id.to_string()),
+                "Steering".to_string(),
+                "agentic".to_string(),
+                SessionConfig {
+                    workspace_path: Some(workspace.to_string_lossy().into_owned()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create session");
+        session_manager
+            .update_session_state(
+                session_id,
+                SessionState::Processing {
+                    current_turn_id: turn_id.to_string(),
+                    phase: ProcessingPhase::Thinking,
+                },
+            )
+            .await
+            .expect("mark turn active");
+    }
+
+    #[tokio::test]
+    async fn steering_rejects_stale_processing_state_without_authoritative_active_turn() {
+        let (scheduler, session_manager, _, root) = test_scheduler();
+        let session_id = "stale-steering-session";
+        let turn_id = "stale-turn";
+        mark_session_processing(&session_manager, &root, session_id, turn_id).await;
+
+        let error = scheduler
+            .buffer_steering(
+                session_id.to_string(),
+                turn_id.to_string(),
+                "check tests".to_string(),
+                None,
+            )
+            .await
+            .expect_err("stale processing state must not accept steering");
+
+        assert!(error.contains("no longer running"), "{error}");
+        assert!(scheduler
+            .round_injection_monitor()
+            .take_pending(session_id, turn_id)
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn steering_rejects_empty_content_as_an_invalid_request() {
+        let (scheduler, _, _, _) = test_scheduler();
+
+        let error = AgentDialogTurnPort::steer_dialog_turn(
+            scheduler.as_ref(),
+            AgentDialogSteerRequest {
+                session_id: "session-1".to_string(),
+                turn_id: "turn-1".to_string(),
+                content: "  ".to_string(),
+                display_content: None,
+            },
+        )
+        .await
+        .expect_err("empty steering must fail");
+
+        assert_eq!(error.kind, PortErrorKind::InvalidRequest);
+    }
+
+    #[tokio::test]
+    async fn steering_serializes_with_other_operations_for_the_same_session() {
+        let (scheduler, session_manager, _, root) = test_scheduler();
+        let session_id = "locked-steering-session";
+        let turn_id = "active-turn";
+        mark_session_processing(&session_manager, &root, session_id, turn_id).await;
+        scheduler
+            .active_turns
+            .insert(session_id, desktop_active_turn(turn_id));
+
+        let operation_guard = scheduler.lock_session_operation(session_id).await;
+        let steering_scheduler = scheduler.clone();
+        let steering = tokio::spawn(async move {
+            steering_scheduler
+                .buffer_steering(
+                    session_id.to_string(),
+                    turn_id.to_string(),
+                    "check tests".to_string(),
+                    None,
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+
+        assert!(
+            !steering.is_finished(),
+            "steering must wait for the session operation lock"
+        );
+        drop(operation_guard);
+        steering
+            .await
+            .expect("steering task")
+            .expect("steering outcome");
+    }
+
+    #[tokio::test]
+    async fn explicit_cancel_cannot_cross_session_by_reusing_a_turn_id() {
+        let (scheduler, _, _, _root) = test_scheduler();
+        scheduler
+            .active_turns
+            .insert("session-a", desktop_active_turn("shared-turn"));
+
+        let removed = scheduler
+            .cancel_queued_or_active_turn("session-b", "shared-turn")
+            .await
+            .expect("stale cancellation is idempotent");
+
+        assert!(!removed);
+        assert!(scheduler
+            .active_turns
+            .matches_turn("session-a", "shared-turn"));
+    }
+
+    #[tokio::test]
+    async fn wrong_workspace_deletion_leaves_active_and_queued_turns_untouched() {
+        let (scheduler, session_manager, _, root) = test_scheduler();
+        let session_id = "session-bound-to-a";
+        let storage_a = root.path().join("workspace-a-sessions");
+        let storage_b = root.path().join("workspace-b-sessions");
+        session_manager
+            .ensure_session_storage_path(session_id, &storage_a)
+            .expect("bind session storage");
+        scheduler
+            .queues
+            .enqueue(
+                session_id,
+                standard_queued_turn("turn-queued"),
+                DialogQueuePriority::Normal,
+            )
+            .expect("queue turn");
+        scheduler
+            .active_turns
+            .insert(session_id, desktop_active_turn("turn-active"));
+
+        let error = scheduler
+            .begin_session_deletion(session_id, &storage_b, Duration::ZERO)
+            .await
+            .err()
+            .expect("wrong workspace must be rejected before quiescence");
+
+        assert!(matches!(error, BitFunError::Validation(_)));
+        assert_eq!(scheduler.queue_depth(session_id), 1);
+        assert!(scheduler
+            .active_turns
+            .matches_turn(session_id, "turn-active"));
+    }
+
+    #[tokio::test]
+    async fn maintenance_retires_scheduler_state_even_when_core_cancel_returns_a_turn_id() {
+        let (scheduler, session_manager, _, root) = test_scheduler();
+        let session_id = "session-maintenance-retire";
+        let turn_id = "turn-active";
+        let workspace = root.path().join("workspace-maintenance-retire");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        session_manager
+            .create_session_with_id(
+                Some(session_id.to_string()),
+                "Maintenance retire".to_string(),
+                "agentic".to_string(),
+                SessionConfig {
+                    workspace_path: Some(workspace.to_string_lossy().to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create session");
+        session_manager
+            .update_session_state(
+                session_id,
+                SessionState::Processing {
+                    current_turn_id: turn_id.to_string(),
+                    phase: ProcessingPhase::ToolCalling,
+                },
+            )
+            .await
+            .expect("mark processing");
+        scheduler
+            .active_turns
+            .insert(session_id, desktop_active_turn(turn_id));
+        let storage_path = session_manager
+            .storage_path_binding_for_test(session_id)
+            .expect("storage binding");
+
+        let maintenance = scheduler
+            .begin_session_maintenance(session_id, &storage_path, Duration::from_secs(1))
+            .await
+            .expect("maintenance");
+
+        assert_eq!(maintenance.retired_turn_ids(), &[turn_id.to_string()]);
+        assert!(!scheduler.active_turns.matches_turn(session_id, turn_id));
+        assert!(take_active_turn_for_outcome(
+            &scheduler.active_turns,
+            &scheduler.retired_maintenance_outcomes,
+            session_id,
+            turn_id,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn retired_maintenance_outcome_cannot_mutate_a_recreated_session_generation() {
+        let active_turns = ActiveDialogTurnStore::default();
+        let retired = DialogReplySuppressionSet::default();
+        let session_id = "reused-session";
+        active_turns.insert(session_id, desktop_active_turn("turn-old"));
+        let old = active_turns
+            .remove(session_id)
+            .expect("old active turn should be present");
+        retired.mark(session_id, old.turn_id());
+        active_turns.insert(session_id, desktop_active_turn("turn-new"));
+
+        assert!(
+            take_active_turn_for_outcome(&active_turns, &retired, session_id, "turn-old").is_none()
+        );
+        assert!(active_turns.matches_turn(session_id, "turn-new"));
+        assert!(matches!(
+            take_active_turn_for_outcome(&active_turns, &retired, session_id, "turn-new"),
+            Some(ActiveDialogTurnTakeResult::Matched(_))
         ));
     }
 
@@ -1899,18 +3768,15 @@ mod tests {
     }
 
     #[test]
-    fn remote_queue_policy_preserves_confirmation_boundary() {
+    fn remote_queue_policy_preserves_priority_boundary() {
         let remote = DialogSubmissionPolicy::for_source(DialogTriggerSource::RemoteRelay);
         assert_eq!(remote.queue_priority, DialogQueuePriority::Normal);
-        assert!(remote.skip_tool_confirmation);
 
         let bot = DialogSubmissionPolicy::for_source(DialogTriggerSource::Bot);
         assert_eq!(bot.queue_priority, DialogQueuePriority::Normal);
-        assert!(bot.skip_tool_confirmation);
 
         let agent_session = DialogSubmissionPolicy::for_source(DialogTriggerSource::AgentSession);
         assert_eq!(agent_session.queue_priority, DialogQueuePriority::Low);
-        assert!(agent_session.skip_tool_confirmation);
     }
 
     #[test]

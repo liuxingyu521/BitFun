@@ -16,11 +16,13 @@ impl Default for DeepResearchMode {
 impl DeepResearchMode {
     pub fn new() -> Self {
         let mut tool_exposure_overrides = AgentToolPolicyOverrides::default();
-        tool_exposure_overrides.insert("WebSearch".to_string(), ToolExposure::Expanded);
-        tool_exposure_overrides.insert("WebFetch".to_string(), ToolExposure::Expanded);
+        tool_exposure_overrides.insert("WebSearch".to_string(), ToolExposure::Direct);
+        tool_exposure_overrides.insert("WebFetch".to_string(), ToolExposure::Direct);
         Self {
             default_tools: vec![
                 "Task".to_string(),
+                "ListModels".to_string(),
+                "AgentWait".to_string(),
                 "WebSearch".to_string(),
                 "WebFetch".to_string(),
                 "Read".to_string(),
@@ -96,6 +98,7 @@ mod tests {
             tools.contains(&"Task".to_string()),
             "Task tool required for parallel sub-agent orchestration"
         );
+        assert!(tools.contains(&"ListModels".to_string()));
         assert!(tools.contains(&"WebSearch".to_string()));
         assert!(tools.contains(&"WebFetch".to_string()));
         assert!(tools.contains(&"Write".to_string()));

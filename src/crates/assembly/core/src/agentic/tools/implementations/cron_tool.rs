@@ -35,24 +35,7 @@ impl CronTool {
     }
 
     fn validate_session_id(session_id: &str) -> Result<(), String> {
-        if session_id.is_empty() {
-            return Err("session_id cannot be empty".to_string());
-        }
-        if session_id == "." || session_id == ".." {
-            return Err("session_id cannot be '.' or '..'".to_string());
-        }
-        if session_id.contains('/') || session_id.contains('\\') {
-            return Err("session_id cannot contain path separators".to_string());
-        }
-        if !session_id
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
-        {
-            return Err(
-                "session_id can only contain ASCII letters, numbers, '-' and '_'".to_string(),
-            );
-        }
-        Ok(())
+        bitfun_core_types::validate_session_id(session_id)
     }
 
     fn validate_job_id(job_id: &str) -> Result<(), String> {
@@ -152,6 +135,8 @@ impl CronTool {
             return Ok(CronWorkspaceRef {
                 workspace_id: None,
                 workspace_path: resolved,
+                project_workspace_path: None,
+                execution_target: None,
                 remote_connection_id: None,
                 remote_ssh_host: None,
             });
@@ -179,7 +164,10 @@ impl CronTool {
     ) -> BitFunResult<()> {
         let sessions = runtime
             .list_sessions(AgentSessionListRequest {
-                workspace_path: workspace_ref.workspace_path.clone(),
+                workspace_path: workspace_ref
+                    .project_workspace_path
+                    .clone()
+                    .unwrap_or_else(|| workspace_ref.workspace_path.clone()),
                 remote_connection_id: workspace_ref.remote_connection_id.clone(),
                 remote_ssh_host: workspace_ref.remote_ssh_host.clone(),
             })
@@ -244,6 +232,8 @@ impl CronTool {
         CronWorkspaceRef {
             workspace_id: binding.workspace_id.clone(),
             workspace_path: binding.root_path_string(),
+            project_workspace_path: Some(binding.project_root_path_string()),
+            execution_target: binding.execution_target.clone(),
             remote_connection_id: binding.connection_id().map(ToOwned::to_owned),
             remote_ssh_host: if binding.is_remote() {
                 Some(binding.session_identity.hostname.clone())
@@ -258,6 +248,8 @@ impl CronTool {
         CronWorkspaceRef {
             workspace_id: binding.workspace_id,
             workspace_path: binding.workspace_path,
+            project_workspace_path: binding.project_workspace_path,
+            execution_target: binding.execution_target,
             remote_connection_id: binding.remote_connection_id,
             remote_ssh_host: binding.remote_ssh_host,
         }
@@ -681,7 +673,7 @@ Patch schema for "update":
     }
 
     fn default_exposure(&self) -> ToolExposure {
-        ToolExposure::Collapsed
+        ToolExposure::Deferred
     }
 
     fn input_schema(&self) -> Value {
@@ -763,10 +755,6 @@ Patch schema for "update":
             return false;
         };
         matches!(action, "get_time" | "list")
-    }
-
-    fn needs_permissions(&self, _input: Option<&Value>) -> bool {
-        false
     }
 
     async fn validate_input(
@@ -1256,7 +1244,7 @@ mod tests {
             session_id: None,
             dialog_turn_id: None,
             workspace: None,
-            unlocked_collapsed_tools: Vec::new(),
+            loaded_deferred_tool_specs: Vec::new(),
             primary_model_facts: tool_runtime::context::PrimaryModelFacts::default(),
             custom_data: HashMap::new(),
             computer_use_host: None,
@@ -1284,7 +1272,7 @@ mod tests {
                 "Dev SSH".to_string(),
                 session_identity,
             )),
-            unlocked_collapsed_tools: Vec::new(),
+            loaded_deferred_tool_specs: Vec::new(),
             primary_model_facts: tool_runtime::context::PrimaryModelFacts::default(),
             custom_data: HashMap::new(),
             computer_use_host: None,
@@ -1387,6 +1375,8 @@ mod tests {
             CronTool::workspace_ref_from_agent_binding(AgentSessionWorkspaceBinding {
                 workspace_id: Some("workspace-1".to_string()),
                 workspace_path: "/home/wsp/projects/test".to_string(),
+                project_workspace_path: None,
+                execution_target: None,
                 remote_connection_id: Some("conn-1".to_string()),
                 remote_ssh_host: Some("ssh.dev".to_string()),
             });

@@ -21,13 +21,15 @@ export const MarkdownMathRenderer: React.FC<MarkdownMathRendererProps> = ({
   rehypePlugins,
   remarkAutolinkComputerFileLinks,
 }) => (
-  <ReactMarkdown
-    remarkPlugins={[remarkGfm, remarkMath, remarkAutolinkComputerFileLinks]}
-    rehypePlugins={[...rehypePlugins, rehypeKatex]}
-    components={components}
-  >
-    {markdownContent}
-  </ReactMarkdown>
+  <div data-bf-component="markdown" data-bf-part="math">
+    <ReactMarkdown
+      remarkPlugins={[remarkGfm, remarkMath, remarkAutolinkComputerFileLinks]}
+      rehypePlugins={[...rehypePlugins, rehypeKatex]}
+      components={components}
+    >
+      {markdownContent}
+    </ReactMarkdown>
+  </div>
 );
 
 export default MarkdownMathRenderer;

@@ -1,5 +1,11 @@
 # Cache-Friendly Message Structure In BitFun
 
+This document owns the model-visible request ordering and the rules for keeping
+that prefix stable. Session cache identity, persistence, cloning, invalidation,
+and observability are owned by
+[`model-request-cache-reuse.md`](model-request-cache-reuse.md); changes should
+update the owning document instead of duplicating the same contract in both.
+
 This note explains the cache-friendly request shape BitFun tries to preserve
 for long-running agent sessions, where each layer is stored, and which kinds
 of changes tend to preserve or break provider-side prefix cache reuse.
@@ -237,6 +243,15 @@ What usually breaks reuse:
 - changing to a different user-context policy scope
 - explicit prompt-cache invalidation
 - context compression, which resets prompt cache after rewriting history
+
+The user-facing `/reload instructions` command intentionally invalidates only
+the current Session's `UserContext` cache. The active turn is not rewritten;
+workspace instructions are read again when the next message is assembled.
+Plain `/reload` combines that operation with the independently owned Skill
+Registry refresh, while `/reload skills` leaves `UserContext` intact.
+An in-memory generation guard rejects a user-context build that started before
+the invalidation from repopulating the cache after it, so active-turn reloads
+preserve the same next-message guarantee.
 
 ### 6. Conversation history
 

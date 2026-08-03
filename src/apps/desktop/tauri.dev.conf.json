@@ -1,11 +1,11 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "BitFun",
-  "identifier": "com.bitfun.desktop",
+  "identifier": "com.bitfun.desktop.dev",
   "build": {
     "beforeDevCommand": "pnpm run dev:web",
     "devUrl": "http://localhost:1422",
-    "beforeBuildCommand": "pnpm run build:web && pnpm run prepare:mobile-web",
+    "beforeBuildCommand": "pnpm run frontend:build-all",
     "frontendDist": "../../../dist"
   },
   "bundle": {

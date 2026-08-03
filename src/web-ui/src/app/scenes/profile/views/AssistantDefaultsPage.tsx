@@ -15,12 +15,18 @@ import '@/app/components/GalleryLayout/GalleryLayout.scss';
 import { Switch } from '@/component-library';
 import { configAPI } from '@/infrastructure/api/service-api/ConfigAPI';
 import type { AgentProfileConfigItem, ModeSkillInfo } from '@/infrastructure/config/types';
+import {
+  buildSkillCoverageSourceMap,
+  formatSkillOrigin,
+  getModeSkillRuntimeStatus,
+} from '@/infrastructure/config/skillSourcePresentation';
 import { MCPAPI, type MCPServerInfo } from '@/infrastructure/api/service-api/MCPAPI';
 import { notificationService } from '@/shared/notification-system';
 import type { DynamicToolInfo } from '@/shared/types/agent-api';
 import { createLogger } from '@/shared/utils/logger';
-import { ModelSelector } from '@/flow_chat/components/ModelSelector';
+import { isUserSelectableToolName } from '@/shared/utils/toolVisibility';
 import { useNurseryStore } from '../nurseryStore';
+import './NurseryView.scss';
 
 const log = createLogger('AssistantDefaultsPage');
 const ASSISTANT_MODE_ID = 'Claw';
@@ -61,15 +67,15 @@ function buildDuplicateSkillNameSet(skills: ModeSkillInfo[]): Set<string> {
   );
 }
 
-function formatSkillOrigin(skill: ModeSkillInfo): string {
-  return `${skill.level}/${skill.sourceSlot}`;
-}
-
-function formatSkillDisplayName(skill: ModeSkillInfo, duplicateNames: Set<string>): string {
+function formatSkillDisplayName(
+  skill: ModeSkillInfo,
+  duplicateNames: Set<string>,
+  origin: string,
+): string {
   if (!duplicateNames.has(skill.name)) {
     return skill.name;
   }
-  return `${skill.name} [${formatSkillOrigin(skill)}]`;
+  return `${skill.name} [${origin}]`;
 }
 
 const AssistantDefaultsPage: React.FC = () => {
@@ -99,11 +105,49 @@ const AssistantDefaultsPage: React.FC = () => {
     () => buildDuplicateSkillNameSet(modeSkills),
     [modeSkills],
   );
+  const coverageSourceBySkillKey = useMemo(
+    () => buildSkillCoverageSourceMap(
+      modeSkills,
+      t('nursery.template.unknownSkillSource'),
+    ),
+    [modeSkills, t],
+  );
+
+  const getLocalizedSkillOrigin = useCallback((skill: ModeSkillInfo) => (
+    formatSkillOrigin(skill, {
+      fallbackSourceLabel: t('nursery.template.unknownSkillSource'),
+      userLabel: t('nursery.template.skillScopeUser'),
+      projectLabel: t('nursery.template.skillScopeProject'),
+    })
+  ), [t]);
+
+  const getSkillRuntimeStatusLabel = useCallback((skill: ModeSkillInfo): string | null => {
+    const status = getModeSkillRuntimeStatus(
+      skill,
+      coverageSourceBySkillKey,
+      t('nursery.template.unknownSkillSource'),
+    );
+    switch (status.kind) {
+      case 'selected':
+        return t('nursery.template.skillRuntimeSelected');
+      case 'covered':
+        return t('nursery.template.skillRuntimeCovered', { source: status.sourceLabel });
+      case 'enabled':
+        return t('nursery.template.skillRuntimeEnabled');
+      case 'disabled':
+        return null;
+    }
+  }, [coverageSourceBySkillKey, t]);
+
+  const userSelectableTools = useMemo(
+    () => availableTools.filter((tool) => isUserSelectableToolName(tool.name)),
+    [availableTools],
+  );
 
   // Split tools into built-in vs MCP
   const builtinTools = useMemo(
-    () => availableTools.filter((tool) => !isMcpTool(tool)),
-    [availableTools],
+    () => userSelectableTools.filter((tool) => !isMcpTool(tool)),
+    [userSelectableTools],
   );
 
   const builtinToolsEnabled = useMemo(
@@ -119,14 +163,14 @@ const AssistantDefaultsPage: React.FC = () => {
   // MCP tools grouped by server id
   const mcpToolsByServer = useMemo(() => {
     const map = new Map<string, ToolInfo[]>();
-    for (const tool of availableTools) {
+    for (const tool of userSelectableTools) {
       if (!isMcpTool(tool)) continue;
       const server = getMcpServerName(tool);
       if (!map.has(server)) map.set(server, []);
       map.get(server)!.push(tool);
     }
     return map;
-  }, [availableTools]);
+  }, [userSelectableTools]);
 
   // All known MCP server ids — union of detected tool servers + registered servers
   const mcpServerIds = useMemo(() => {
@@ -168,7 +212,7 @@ const AssistantDefaultsPage: React.FC = () => {
   }, [detail]);
 
   const handleToolToggle = useCallback(async (toolName: string) => {
-    if (!assistantModeConfig) return;
+    if (!assistantModeConfig || !isUserSelectableToolName(toolName)) return;
     setToolsLoading((prev) => ({ ...prev, [toolName]: true }));
     const current = assistantModeConfig.enabled_tools ?? [];
     const isEnabled = current.includes(toolName);
@@ -208,11 +252,13 @@ const AssistantDefaultsPage: React.FC = () => {
 
   const handleGroupToggleAll = useCallback(async (toolNames: string[]) => {
     if (!assistantModeConfig) return;
+    const selectableToolNames = toolNames.filter(isUserSelectableToolName);
+    if (selectableToolNames.length === 0) return;
     const current = assistantModeConfig.enabled_tools ?? [];
-    const allEnabled = toolNames.every((n) => current.includes(n));
+    const allEnabled = selectableToolNames.every((n) => current.includes(n));
     const newTools = allEnabled
-      ? current.filter((n) => !toolNames.includes(n))
-      : [...new Set([...current, ...toolNames])];
+      ? current.filter((n) => !selectableToolNames.includes(n))
+      : [...new Set([...current, ...selectableToolNames])];
     const newConfig = { ...assistantModeConfig, enabled_tools: newTools };
     setAssistantModeConfig(newConfig);
     try {
@@ -279,15 +325,16 @@ const AssistantDefaultsPage: React.FC = () => {
   // ── Render helpers ───────────────────────────────────────────────────────
 
   const renderToolList = (tools: ToolInfo[], isMcp: boolean) => (
-    <div className="tc-tool-list">
+    <div className="tc-tool-list" data-bf-component="assistant-defaults-page" data-bf-part="toolList">
       {tools.map((tool) => {
         const enabled = assistantModeConfig?.enabled_tools?.includes(tool.name) ?? false;
         const displayName = isMcp ? getMcpShortName(tool) : tool.name;
         const selected = detail?.type === 'tool' && detail.tool.name === tool.name;
         return (
-          <div
+          <div data-bf-component="assistant-defaults-page" data-bf-part="tool"
             key={tool.name}
             className={`tc-tool-row${!enabled ? ' tc-tool-row--off' : ''}${selected ? ' tc-tool-row--selected' : ''}`}
+            data-bf-state={[!enabled && 'disabled', selected && 'selected'].filter(Boolean).join(' ') || undefined}
           >
             <button
               type="button"
@@ -317,7 +364,7 @@ const AssistantDefaultsPage: React.FC = () => {
     disabledList: ToolInfo[],
     isMcp: boolean,
   ) => (
-    <div className="tc-enabled-disabled-split">
+    <div className="tc-enabled-disabled-split" data-bf-component="assistant-defaults-page" data-bf-part="split">
       <div className="tc-enabled-disabled-split__col">
         <p className="tc-enabled-disabled-split__title">{t('nursery.template.colEnabled')}</p>
         {enabledList.length > 0 ? (
@@ -338,15 +385,27 @@ const AssistantDefaultsPage: React.FC = () => {
   );
 
   const renderSkillList = (list: ModeSkillInfo[]) => (
-    <div className="tc-skill-list">
+    <div className="tc-skill-list" data-bf-component="assistant-defaults-page" data-bf-part="skillList">
       {list.map((skill) => {
         const on = skill.effectiveEnabled;
         const selected = detail?.type === 'skill' && detail.skill.key === skill.key;
-        const displayName = formatSkillDisplayName(skill, duplicateSkillNames);
+        const origin = getLocalizedSkillOrigin(skill);
+        const displayName = formatSkillDisplayName(skill, duplicateSkillNames, origin);
+        const runtimeStatus = getModeSkillRuntimeStatus(
+          skill,
+          coverageSourceBySkillKey,
+          t('nursery.template.unknownSkillSource'),
+        );
+        const runtimeStatusLabel = getSkillRuntimeStatusLabel(skill);
         return (
-          <div
+          <div data-bf-component="assistant-defaults-page" data-bf-part="skill"
             key={skill.key}
-            className={`tc-skill-row${!on ? ' tc-skill-row--off' : ''}${selected ? ' tc-skill-row--selected' : ''}`}
+            className={`tc-skill-row${!on ? ' tc-skill-row--off' : ''}${runtimeStatus.kind === 'covered' ? ' tc-skill-row--covered' : ''}${selected ? ' tc-skill-row--selected' : ''}`}
+            data-bf-state={[
+              !on && 'disabled',
+              runtimeStatus.kind === 'covered' && 'covered',
+              selected && 'selected',
+            ].filter(Boolean).join(' ') || undefined}
           >
             <button
               type="button"
@@ -354,13 +413,17 @@ const AssistantDefaultsPage: React.FC = () => {
               onClick={() => openSkillDetail(skill)}
             >
               <span className="tc-skill-row__name">{displayName}</span>
-              <span className="tc-skill-row__level">{formatSkillOrigin(skill)}</span>
+              <span className="tc-skill-row__level">{origin}</span>
+              {runtimeStatusLabel ? (
+                <span className="tc-skill-row__state" title={runtimeStatusLabel}>{runtimeStatusLabel}</span>
+              ) : null}
             </button>
             <Switch
               checked={on}
               onChange={() => handleSkillToggle(skill)}
               disabled={skillsLoading[skill.key]}
               size="small"
+              aria-label={displayName}
             />
           </div>
         );
@@ -369,9 +432,9 @@ const AssistantDefaultsPage: React.FC = () => {
   );
 
   const renderSkillEnabledDisabledSplit = () => (
-    <div className="tc-enabled-disabled-split">
+    <div className="tc-enabled-disabled-split" data-bf-component="assistant-defaults-page" data-bf-part="split">
       <div className="tc-enabled-disabled-split__col">
-        <p className="tc-enabled-disabled-split__title">{t('nursery.template.colEnabled')}</p>
+        <p className="tc-enabled-disabled-split__title">{t('nursery.template.skillEnabledCandidates')}</p>
         {skillsEnabled.length > 0 ? (
           renderSkillList(skillsEnabled)
         ) : (
@@ -404,7 +467,7 @@ const AssistantDefaultsPage: React.FC = () => {
     const allOn = toolNames.length > 0 && groupEnabled === toolNames.length;
 
     return (
-      <div className="tc-group-header">
+      <div data-bf-component="assistant-defaults-page" data-bf-part="groupHeader" data-bf-state={isCollapsed ? 'collapsed' : undefined} className="tc-group-header">
         {toolNames.length > 0 && (
           <button
             type="button"
@@ -468,8 +531,8 @@ const AssistantDefaultsPage: React.FC = () => {
       const displayName = isMcp ? getMcpShortName(tool) : tool.name;
       const enabled = assistantModeConfig?.enabled_tools?.includes(tool.name) ?? false;
       return (
-        <aside className="tc-template-detail" aria-label={t('nursery.template.detailPanel')}>
-          <div className="tc-template-detail__head tc-template-detail__head--center-line">
+        <aside data-bf-component="assistant-defaults-page" data-bf-part="detail" className="tc-template-detail" aria-label={t('nursery.template.detailPanel')}>
+          <div className="tc-template-detail__head tc-template-detail__head--center-line" data-bf-component="assistant-defaults-page" data-bf-part="detailHeader">
             <span className="tc-template-detail__head-spacer" aria-hidden />
             <div className="tc-template-detail__head-text">
               <div className="tc-template-detail__head-line">
@@ -488,7 +551,7 @@ const AssistantDefaultsPage: React.FC = () => {
               <X size={14} strokeWidth={2} />
             </button>
           </div>
-          <div className="tc-template-detail__body">
+          <div className="tc-template-detail__body" data-bf-component="assistant-defaults-page" data-bf-part="detailBody">
             {tool.is_readonly && (
               <span className="tc-template-detail__badge">{t('nursery.template.readonlyTool')}</span>
             )}
@@ -515,8 +578,8 @@ const AssistantDefaultsPage: React.FC = () => {
       const serverTools = mcpToolsByServer.get(serverId) ?? [];
       const status = serverInfo?.status ?? (serverTools.length > 0 ? 'Connected' : 'Unknown');
       return (
-        <aside className="tc-template-detail" aria-label={t('nursery.template.detailPanel')}>
-          <div className="tc-template-detail__head tc-template-detail__head--center-line">
+        <aside data-bf-component="assistant-defaults-page" data-bf-part="detail" className="tc-template-detail" aria-label={t('nursery.template.detailPanel')}>
+          <div className="tc-template-detail__head tc-template-detail__head--center-line" data-bf-component="assistant-defaults-page" data-bf-part="detailHeader">
             <span className="tc-template-detail__head-spacer" aria-hidden />
             <div className="tc-template-detail__head-text">
               <div className="tc-template-detail__head-line">
@@ -533,7 +596,7 @@ const AssistantDefaultsPage: React.FC = () => {
               <X size={14} strokeWidth={2} />
             </button>
           </div>
-          <div className="tc-template-detail__body">
+          <div className="tc-template-detail__body" data-bf-component="assistant-defaults-page" data-bf-part="detailBody">
             <span className={`tc-template-detail__status tc-group-header__status tc-group-header__status--${status.toLowerCase()}`}>
               {status}
             </span>
@@ -554,14 +617,16 @@ const AssistantDefaultsPage: React.FC = () => {
 
     const { skill } = detail;
     const on = skill.effectiveEnabled;
+    const origin = getLocalizedSkillOrigin(skill);
+    const runtimeStatusLabel = getSkillRuntimeStatusLabel(skill);
     return (
-      <aside className="tc-template-detail" aria-label={t('nursery.template.detailPanel')}>
-        <div className="tc-template-detail__head tc-template-detail__head--center-line">
+      <aside data-bf-component="assistant-defaults-page" data-bf-part="detail" className="tc-template-detail" aria-label={t('nursery.template.detailPanel')}>
+        <div className="tc-template-detail__head tc-template-detail__head--center-line" data-bf-component="assistant-defaults-page" data-bf-part="detailHeader">
           <span className="tc-template-detail__head-spacer" aria-hidden />
           <div className="tc-template-detail__head-text">
             <div className="tc-template-detail__head-line">
               <span className="tc-template-detail__kind">{t('cards.skills')}</span>
-              <h3 className="tc-template-detail__title">{formatSkillDisplayName(skill, duplicateSkillNames)}</h3>
+              <h3 className="tc-template-detail__title">{formatSkillDisplayName(skill, duplicateSkillNames, origin)}</h3>
             </div>
           </div>
           <button
@@ -573,8 +638,11 @@ const AssistantDefaultsPage: React.FC = () => {
             <X size={14} strokeWidth={2} />
           </button>
         </div>
-        <div className="tc-template-detail__body">
-          <p className="tc-template-detail__meta">{t('nursery.template.skillLevel', { level: formatSkillOrigin(skill) })}</p>
+        <div className="tc-template-detail__body" data-bf-component="assistant-defaults-page" data-bf-part="detailBody">
+          <p className="tc-template-detail__meta">{t('nursery.template.skillOrigin', { origin })}</p>
+          {runtimeStatusLabel ? (
+            <p className="tc-template-detail__meta">{runtimeStatusLabel}</p>
+          ) : null}
           <p className="tc-template-detail__desc">
             {skill.description?.trim() ? skill.description : '—'}
           </p>
@@ -584,6 +652,7 @@ const AssistantDefaultsPage: React.FC = () => {
               onChange={() => handleSkillToggle(skill)}
               disabled={skillsLoading[skill.key]}
               size="small"
+              aria-label={skill.name}
             />
           </div>
         </div>
@@ -592,8 +661,8 @@ const AssistantDefaultsPage: React.FC = () => {
   };
 
   return (
-    <div className="nursery-page">
-      <div className="nursery-page__bar">
+    <div data-bf-component="assistant-defaults-page" data-bf-part="root" className="nursery-page">
+      <div className="nursery-page__bar" data-bf-component="assistant-defaults-page" data-bf-part="toolbar">
         <button
           type="button"
           className="nursery-page__back"
@@ -604,47 +673,28 @@ const AssistantDefaultsPage: React.FC = () => {
         </button>
       </div>
 
-      <div className="nursery-page__content">
+      <div className="nursery-page__content" data-bf-component="assistant-defaults-page" data-bf-part="content">
         {loading ? (
-          <div className="nursery-page__loading">
+          <div className="nursery-page__loading" data-bf-component="assistant-defaults-page" data-bf-part="loading">
             <RefreshCw size={16} className="nursery-spinning" />
           </div>
         ) : (
-          <div className={`tc-template-shell${detail ? ' tc-template-shell--has-detail' : ''}`}>
-            <div className="tc-template-shell__main">
+          <div className={`tc-template-shell${detail ? ' tc-template-shell--has-detail' : ''}`} data-bf-component="assistant-defaults-page" data-bf-part="shell">
+            <div className="tc-template-shell__main" data-bf-component="assistant-defaults-page" data-bf-part="main">
             <div className="tc-template-main-column">
-            <div className="gallery-page-header tc-template-page-header">
+            <div className="gallery-page-header tc-template-page-header" data-bf-component="assistant-defaults-page" data-bf-part="header">
               <div className="gallery-page-header__identity">
                 <h2 className="gallery-page-header__title">{t('nursery.template.title')}</h2>
                 <div className="gallery-page-header__subtitle">{t('nursery.template.subtitle')}</div>
               </div>
             </div>
 
-            <div className="gallery-zones tc-template-shell__zones">
-            <GalleryZone
-              className="tc-template-model-zone"
-              title={t('cards.model')}
-              subtitle={t('nursery.template.sectionModelsSubtitle')}
-              tools={(
-                <div className="tc-model-slot tc-model-slot--header">
-                  <div className="tc-model-slot__select tc-model-slot__select--model-selector">
-                    <ModelSelector
-                      currentMode={ASSISTANT_MODE_ID}
-                      className="tc-model-slot__selector"
-                      dropdownPlacement="bottom"
-                    />
-                  </div>
-                </div>
-              )}
-            >
-              {null}
-            </GalleryZone>
-
+            <div className="gallery-zones tc-template-shell__zones" data-bf-component="assistant-defaults-page" data-bf-part="zones">
             <GalleryZone
               title={t('cards.skills')}
             >
               {modeSkills.length === 0 ? (
-                <p className="nursery-empty">{t('empty.skills')}</p>
+                <p className="nursery-empty" data-bf-component="assistant-defaults-page" data-bf-part="empty">{t('empty.skills')}</p>
               ) : (
                 renderSkillEnabledDisabledSplit()
               )}
@@ -691,7 +741,7 @@ const AssistantDefaultsPage: React.FC = () => {
                     const mcpDisabled = serverTools.filter((tool) => !assistantModeConfig?.enabled_tools?.includes(tool.name));
 
                     return (
-                      <div key={serverId} className="tc-tool-block">
+                      <div data-bf-component="assistant-defaults-page" data-bf-part="group" key={serverId} className="tc-tool-block">
                         {renderGroupHeader(
                           groupId,
                           serverInfo?.name ?? serverId,

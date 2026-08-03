@@ -1,7 +1,11 @@
 use super::manager::PersistenceManager;
 use crate::agentic::core::{Session, SessionKind};
 use crate::util::errors::{BitFunError, BitFunResult};
-use bitfun_services_core::session::{build_branched_session_metadata, BranchSessionMetadataFacts};
+use bitfun_services_core::session::{
+    build_branched_session_metadata, format_branch_session_name, resolve_branch_session_lineage,
+    BranchSessionMetadataFacts,
+};
+use bitfun_services_core::session::SessionBranchBoundary;
 pub use bitfun_services_core::session::{SessionBranchRequest, SessionBranchResult};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -12,6 +16,13 @@ impl PersistenceManager {
         workspace_path: &Path,
         request: &SessionBranchRequest,
     ) -> BitFunResult<SessionBranchResult> {
+        bitfun_core_types::validate_session_id(&request.source_session_id)
+            .map_err(BitFunError::Validation)?;
+        let branch_allocation_lock = self
+            .get_session_branch_allocation_lock(workspace_path)
+            .await;
+        let _branch_allocation_guard = branch_allocation_lock.lock().await;
+
         let source_session = self
             .load_session(workspace_path, &request.source_session_id)
             .await?;
@@ -24,6 +35,14 @@ impl PersistenceManager {
                     request.source_session_id
                 ))
             })?;
+        let metadata_list = self
+            .list_session_metadata_including_internal(workspace_path)
+            .await?;
+        let branch_lineage = resolve_branch_session_lineage(
+            &source_metadata,
+            &source_session.session_name,
+            &metadata_list,
+        );
         let source_turns = self
             .load_session_turns(workspace_path, &request.source_session_id)
             .await?;
@@ -46,8 +65,10 @@ impl PersistenceManager {
                     request.source_turn_id
                 ))
             })?;
+        let copied_turn_count = request.boundary.copied_turn_count(source_turn_index);
 
-        let target_session_name = source_session.session_name.clone();
+        let target_session_name =
+            format_branch_session_name(&branch_lineage.base_session_name, branch_lineage.ordinal);
         let target_agent_type = source_session.agent_type.clone();
 
         let mut target_session = Session::new(
@@ -58,15 +79,19 @@ impl PersistenceManager {
         target_session.created_by = None;
         target_session.kind = SessionKind::Standard;
         target_session.snapshot_session_id = None;
-        target_session.compression_state = source_session.compression_state.clone();
+        if copied_turn_count > 0 && request.boundary == SessionBranchBoundary::ThroughTurn {
+            target_session.compression_state = source_session.compression_state.clone();
+        }
         let target_session_id = target_session.session_id.clone();
+        let _target_session_write =
+            self.lock_session_write_operation(workspace_path, &target_session_id)?;
 
         self.save_session(workspace_path, &target_session).await?;
 
         let branch_result = async {
             let branched_turns = source_turns
                 .iter()
-                .take(source_turn_index + 1)
+                .take(copied_turn_count)
                 .enumerate()
                 .map(|(new_index, turn)| {
                     let mut branched_turn = turn.clone();
@@ -76,8 +101,7 @@ impl PersistenceManager {
                 })
                 .collect::<Vec<_>>();
 
-            for (new_index, source_turn) in
-                source_turns.iter().take(source_turn_index + 1).enumerate()
+            for (new_index, source_turn) in source_turns.iter().take(copied_turn_count).enumerate()
             {
                 if let Some(messages) = self
                     .load_turn_context_snapshot(
@@ -117,13 +141,15 @@ impl PersistenceManager {
                 self.save_dialog_turn(workspace_path, turn).await?;
             }
 
-            self.copy_compression_transcripts_through(
-                workspace_path,
-                &request.source_session_id,
-                &target_session_id,
-                source_turn_index,
-            )
-            .await?;
+            if let Some(last_copied_turn_index) = copied_turn_count.checked_sub(1) {
+                self.copy_compression_transcripts_through(
+                    workspace_path,
+                    &request.source_session_id,
+                    &target_session_id,
+                    last_copied_turn_index,
+                )
+                .await?;
+            }
 
             if let Some(cache) = source_prompt_cache.as_ref() {
                 self.save_prompt_cache(workspace_path, &target_session_id, cache)
@@ -156,7 +182,9 @@ impl PersistenceManager {
                 source_session_id: &request.source_session_id,
                 source_turn_id: &request.source_turn_id,
                 source_turn_index,
+                boundary: request.boundary,
                 branched_turns: &branched_turns,
+                branch_lineage: &branch_lineage,
                 now_ms,
             });
 
@@ -184,7 +212,7 @@ impl PersistenceManager {
 
 #[cfg(test)]
 mod tests {
-    use super::{PersistenceManager, SessionBranchRequest};
+    use super::{PersistenceManager, SessionBranchBoundary, SessionBranchRequest};
     use crate::agentic::core::{Message, Session, SessionKind};
     use crate::agentic::session::{
         CachedSystemPrompt, CachedUserContext, SessionPromptCache, SystemPromptCacheIdentity,
@@ -245,6 +273,34 @@ mod tests {
         );
         turn.mark_completed();
         turn
+    }
+
+    async fn rename_persisted_session(
+        manager: &PersistenceManager,
+        workspace_path: &Path,
+        session_id: &str,
+        session_name: &str,
+    ) {
+        let mut session = manager
+            .load_session(workspace_path, session_id)
+            .await
+            .expect("session should load for rename");
+        session.session_name = session_name.to_string();
+        manager
+            .save_session(workspace_path, &session)
+            .await
+            .expect("renamed session should save");
+
+        let mut metadata = manager
+            .load_session_metadata(workspace_path, session_id)
+            .await
+            .expect("metadata should load for rename")
+            .expect("metadata should exist for rename");
+        metadata.session_name = session_name.to_string();
+        manager
+            .save_session_metadata(workspace_path, &metadata)
+            .await
+            .expect("renamed metadata should save");
     }
 
     #[tokio::test]
@@ -374,13 +430,14 @@ mod tests {
                 &SessionBranchRequest {
                     source_session_id: source_session.session_id.clone(),
                     source_turn_id: "turn-0".to_string(),
+                    boundary: SessionBranchBoundary::ThroughTurn,
                 },
             )
             .await
             .expect("branch should succeed");
 
         assert_ne!(result.session_id, source_session.session_id);
-        assert_eq!(result.session_name, "Source Title");
+        assert_eq!(result.session_name, "Source Title (1)");
         assert_eq!(result.agent_type, "agentic");
 
         let branched_turns = manager
@@ -446,7 +503,7 @@ mod tests {
             .await
             .expect("branched metadata load should succeed")
             .expect("branched metadata should exist");
-        assert_eq!(branched_metadata.session_name, "Source Title");
+        assert_eq!(branched_metadata.session_name, "Source Title (1)");
         assert_eq!(branched_metadata.session_kind, SessionKind::Standard);
         assert_eq!(branched_metadata.tags, vec!["kept".to_string()]);
         assert!(branched_metadata.relationship.is_none());
@@ -465,8 +522,388 @@ mod tests {
             serde_json::json!({
                 "sessionId": source_session.session_id,
                 "turnId": "turn-0",
-                "turnIndex": 1
+                "turnIndex": 1,
+                "baseTitle": "Source Title"
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn branch_session_before_first_turn_creates_an_empty_replayable_session() {
+        let workspace = TestWorkspace::new();
+        let manager =
+            PersistenceManager::new(workspace.path_manager()).expect("persistence manager");
+        let source_session = Session::new(
+            "Source Title".to_string(),
+            "agentic".to_string(),
+            Default::default(),
+        );
+        manager
+            .save_session(workspace.path(), &source_session)
+            .await
+            .expect("source session should save");
+        manager
+            .save_dialog_turn(
+                workspace.path(),
+                &build_turn(&source_session.session_id, "turn-0", 0, "first"),
+            )
+            .await
+            .expect("source turn should save");
+
+        let result = manager
+            .branch_session(
+                workspace.path(),
+                &SessionBranchRequest {
+                    source_session_id: source_session.session_id.clone(),
+                    source_turn_id: "turn-0".to_string(),
+                    boundary: SessionBranchBoundary::BeforeTurn,
+                },
+            )
+            .await
+            .expect("before-turn branch should succeed");
+
+        let branched_turns = manager
+            .load_session_turns(workspace.path(), &result.session_id)
+            .await
+            .expect("branched turns should load");
+        assert!(branched_turns.is_empty());
+
+        let branched_metadata = manager
+            .load_session_metadata(workspace.path(), &result.session_id)
+            .await
+            .expect("branched metadata should load")
+            .expect("branched metadata should exist");
+        assert_eq!(branched_metadata.turn_count, 0);
+        assert_eq!(
+            branched_metadata.custom_metadata.unwrap()["forkOrigin"],
+            serde_json::json!({
+                "sessionId": source_session.session_id,
+                "turnId": "turn-0",
+                "turnIndex": 0,
+                "boundary": "before_turn",
+                "baseTitle": "Source Title"
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn branch_session_before_middle_turn_copies_only_earlier_turn_state() {
+        let workspace = TestWorkspace::new();
+        let manager =
+            PersistenceManager::new(workspace.path_manager()).expect("persistence manager");
+        let mut source_session = Session::new(
+            "Source Title".to_string(),
+            "agentic".to_string(),
+            Default::default(),
+        );
+        source_session.compression_state.compression_count = 3;
+        manager
+            .save_session(workspace.path(), &source_session)
+            .await
+            .expect("source session should save");
+        for (index, turn_id) in ["turn-0", "turn-1", "turn-2"].into_iter().enumerate() {
+            manager
+                .save_dialog_turn(
+                    workspace.path(),
+                    &build_turn(
+                        &source_session.session_id,
+                        turn_id,
+                        index,
+                        &format!("prompt-{index}"),
+                    ),
+                )
+                .await
+                .expect("source turn should save");
+            manager
+                .save_turn_context_snapshot(
+                    workspace.path(),
+                    &source_session.session_id,
+                    index,
+                    &[Message::user(format!("snapshot-{index}"))],
+                )
+                .await
+                .expect("source snapshot should save");
+        }
+
+        let result = manager
+            .branch_session(
+                workspace.path(),
+                &SessionBranchRequest {
+                    source_session_id: source_session.session_id.clone(),
+                    source_turn_id: "turn-1".to_string(),
+                    boundary: SessionBranchBoundary::BeforeTurn,
+                },
+            )
+            .await
+            .expect("before-turn branch should succeed");
+
+        let turns = manager
+            .load_session_turns(workspace.path(), &result.session_id)
+            .await
+            .expect("branched turns should load");
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].turn_id, "turn-0");
+        assert!(manager
+            .load_turn_context_snapshot(workspace.path(), &result.session_id, 0)
+            .await
+            .expect("snapshot load")
+            .is_some());
+        assert!(manager
+            .load_turn_context_snapshot(workspace.path(), &result.session_id, 1)
+            .await
+            .expect("snapshot load")
+            .is_none());
+        let metadata = manager
+            .load_session_metadata(workspace.path(), &result.session_id)
+            .await
+            .expect("metadata load")
+            .expect("metadata exists");
+        assert_eq!(metadata.turn_count, 1);
+        assert_eq!(
+            metadata.custom_metadata.unwrap()["forkOrigin"]["turnIndex"],
+            1
+        );
+        let forked_session = manager
+            .load_session(workspace.path(), &result.session_id)
+            .await
+            .expect("forked session load");
+        assert_eq!(forked_session.compression_state.compression_count, 0);
+    }
+
+    #[tokio::test]
+    async fn branch_session_advances_the_family_title_without_growing_suffixes() {
+        let workspace = TestWorkspace::new();
+        let manager =
+            PersistenceManager::new(workspace.path_manager()).expect("persistence manager");
+        let mut source_session = Session::new(
+            "Source Title".to_string(),
+            "agentic".to_string(),
+            Default::default(),
+        );
+        source_session.kind = SessionKind::Standard;
+        manager
+            .save_session(workspace.path(), &source_session)
+            .await
+            .expect("source session should save");
+        manager
+            .save_dialog_turn(
+                workspace.path(),
+                &build_turn(&source_session.session_id, "turn-0", 0, "first"),
+            )
+            .await
+            .expect("source turn should save");
+
+        let first_branch = manager
+            .branch_session(
+                workspace.path(),
+                &SessionBranchRequest {
+                    source_session_id: source_session.session_id.clone(),
+                    source_turn_id: "turn-0".to_string(),
+                    boundary: SessionBranchBoundary::ThroughTurn,
+                },
+            )
+            .await
+            .expect("first branch should succeed");
+        assert_eq!(first_branch.session_name, "Source Title (1)");
+
+        let nested_branch = manager
+            .branch_session(
+                workspace.path(),
+                &SessionBranchRequest {
+                    source_session_id: first_branch.session_id,
+                    source_turn_id: "turn-0".to_string(),
+                    boundary: SessionBranchBoundary::ThroughTurn,
+                },
+            )
+            .await
+            .expect("nested branch should succeed");
+        assert_eq!(nested_branch.session_name, "Source Title (2)");
+
+        let sibling_branch = manager
+            .branch_session(
+                workspace.path(),
+                &SessionBranchRequest {
+                    source_session_id: source_session.session_id.clone(),
+                    source_turn_id: "turn-0".to_string(),
+                    boundary: SessionBranchBoundary::ThroughTurn,
+                },
+            )
+            .await
+            .expect("sibling branch should succeed");
+        assert_eq!(sibling_branch.session_name, "Source Title (3)");
+
+        let nested_metadata = manager
+            .load_session_metadata(workspace.path(), &nested_branch.session_id)
+            .await
+            .expect("nested metadata should load")
+            .expect("nested metadata should exist");
+        assert_eq!(
+            nested_metadata.custom_metadata.and_then(|metadata| {
+                metadata
+                    .get("forkOrigin")
+                    .and_then(|origin| origin.get("baseTitle"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            }),
+            Some("Source Title".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn branch_session_respects_inherited_and_unrelated_renamed_suffixes() {
+        let workspace = TestWorkspace::new();
+        let manager =
+            PersistenceManager::new(workspace.path_manager()).expect("persistence manager");
+        let mut source_session = Session::new(
+            "Source Title".to_string(),
+            "agentic".to_string(),
+            Default::default(),
+        );
+        source_session.kind = SessionKind::Standard;
+        manager
+            .save_session(workspace.path(), &source_session)
+            .await
+            .expect("source session should save");
+        manager
+            .save_dialog_turn(
+                workspace.path(),
+                &build_turn(&source_session.session_id, "turn-0", 0, "first"),
+            )
+            .await
+            .expect("source turn should save");
+
+        let first_branch = manager
+            .branch_session(
+                workspace.path(),
+                &SessionBranchRequest {
+                    source_session_id: source_session.session_id.clone(),
+                    source_turn_id: "turn-0".to_string(),
+                    boundary: SessionBranchBoundary::ThroughTurn,
+                },
+            )
+            .await
+            .expect("first branch should succeed");
+        assert_eq!(first_branch.session_name, "Source Title (1)");
+
+        rename_persisted_session(
+            &manager,
+            workspace.path(),
+            &first_branch.session_id,
+            "Source Title (2)",
+        )
+        .await;
+        let inherited_suffix_branch = manager
+            .branch_session(
+                workspace.path(),
+                &SessionBranchRequest {
+                    source_session_id: first_branch.session_id.clone(),
+                    source_turn_id: "turn-0".to_string(),
+                    boundary: SessionBranchBoundary::ThroughTurn,
+                },
+            )
+            .await
+            .expect("inherited suffix branch should succeed");
+        assert_eq!(inherited_suffix_branch.session_name, "Source Title (3)");
+
+        rename_persisted_session(
+            &manager,
+            workspace.path(),
+            &first_branch.session_id,
+            "Another title (2)",
+        )
+        .await;
+        let unrelated_suffix_branch = manager
+            .branch_session(
+                workspace.path(),
+                &SessionBranchRequest {
+                    source_session_id: first_branch.session_id,
+                    source_turn_id: "turn-0".to_string(),
+                    boundary: SessionBranchBoundary::ThroughTurn,
+                },
+            )
+            .await
+            .expect("unrelated suffix branch should succeed");
+        assert_eq!(
+            unrelated_suffix_branch.session_name,
+            "Another title (2) (1)"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_branches_allocate_distinct_workspace_title_ordinals() {
+        let workspace = TestWorkspace::new();
+        let manager = Arc::new(
+            PersistenceManager::new(workspace.path_manager()).expect("persistence manager"),
+        );
+        let mut source_session = Session::new(
+            "Source Title".to_string(),
+            "agentic".to_string(),
+            Default::default(),
+        );
+        source_session.kind = SessionKind::Standard;
+        manager
+            .save_session(workspace.path(), &source_session)
+            .await
+            .expect("source session should save");
+        manager
+            .save_dialog_turn(
+                workspace.path(),
+                &build_turn(&source_session.session_id, "turn-0", 0, "first"),
+            )
+            .await
+            .expect("source turn should save");
+
+        let mut second_source_session = Session::new(
+            "Source Title".to_string(),
+            "agentic".to_string(),
+            Default::default(),
+        );
+        second_source_session.kind = SessionKind::Standard;
+        manager
+            .save_session(workspace.path(), &second_source_session)
+            .await
+            .expect("second source session should save");
+        manager
+            .save_dialog_turn(
+                workspace.path(),
+                &build_turn(&second_source_session.session_id, "turn-0", 0, "first"),
+            )
+            .await
+            .expect("second source turn should save");
+
+        let source_session_id = source_session.session_id.clone();
+        let first_manager = Arc::clone(&manager);
+        let second_manager = Arc::clone(&manager);
+        let first_request = SessionBranchRequest {
+            source_session_id: source_session_id.clone(),
+            source_turn_id: "turn-0".to_string(),
+            boundary: SessionBranchBoundary::ThroughTurn,
+        };
+        let second_request = SessionBranchRequest {
+            source_session_id: second_source_session.session_id,
+            source_turn_id: "turn-0".to_string(),
+            boundary: SessionBranchBoundary::ThroughTurn,
+        };
+        let (first_result, second_result) = tokio::join!(
+            first_manager.branch_session(workspace.path(), &first_request),
+            second_manager.branch_session(workspace.path(), &second_request),
+        );
+
+        let mut session_names = vec![
+            first_result
+                .expect("first concurrent branch should succeed")
+                .session_name,
+            second_result
+                .expect("second concurrent branch should succeed")
+                .session_name,
+        ];
+        session_names.sort();
+        assert_eq!(
+            session_names,
+            vec![
+                "Source Title (1)".to_string(),
+                "Source Title (2)".to_string()
+            ]
         );
     }
 
@@ -516,6 +953,7 @@ mod tests {
                 &SessionBranchRequest {
                     source_session_id: source_session.session_id.clone(),
                     source_turn_id: "turn-0".to_string(),
+                    boundary: SessionBranchBoundary::ThroughTurn,
                 },
             )
             .await

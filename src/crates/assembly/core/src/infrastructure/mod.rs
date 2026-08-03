@@ -5,18 +5,22 @@
 #[cfg(feature = "ai-adapter-runtime")]
 pub mod ai;
 pub mod app_paths;
-#[cfg(feature = "ai-adapter-runtime")]
-pub mod cli_credentials;
 #[cfg(feature = "product-full")]
 pub mod debug_log;
 pub mod events;
+#[cfg(feature = "filesystem")]
 pub mod filesystem;
+#[cfg(feature = "local-storage")]
 pub mod storage;
+#[cfg(feature = "ai-adapter-runtime")]
+pub mod subscription_auth;
 
 #[cfg(feature = "ai-adapter-runtime")]
 pub use ai::AIClient;
 pub use app_paths::{get_path_manager_arc, try_get_path_manager_arc, PathManager, StorageLevel};
+#[cfg(feature = "runtime-services")]
 pub use events::BackendEventManager;
+#[cfg(feature = "filesystem")]
 pub use filesystem::{
     BatchedFileSearchProgressSink, FileContentSearchOptions, FileInfo, FileNameSearchOptions,
     FileOperationOptions, FileOperationService, FileReadResult, FileSearchOutcome,

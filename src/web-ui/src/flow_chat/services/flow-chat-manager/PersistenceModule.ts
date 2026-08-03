@@ -7,13 +7,31 @@ import { createLogger } from '@/shared/utils/logger';
 import type { FlowChatContext, DialogTurn } from './types';
 import { buildSessionMetadata } from '../../utils/sessionMetadata';
 import { settleInterruptedDialogTurn } from '../../utils/dialogTurnStability';
-import { isRuntimeStatusItem } from './RuntimeStatusModule';
+import {
+  DEFERRED_TOOL_GATEWAY_NAME,
+  effectiveToolInvocation,
+} from '../../utils/toolInvocationIdentity';
+import { requireSessionProjectWorkspacePath } from '../../utils/sessionWorkspace';
+import { resolveSessionDriverId } from '../../session-drivers/resolve';
 
 const log = createLogger('PersistenceModule');
 const COALESCED_IMMEDIATE_SAVE_DELAY_MS = 500;
 
 function isTransientSession(session: { isTransient?: boolean } | undefined): boolean {
   return session?.isTransient === true;
+}
+
+/**
+ * Observer projections are target-owned; the controller must never persist
+ * them as local sessions. Uses the driver resolver so a projection whose
+ * config is not bound yet (startup race) is still recognized via the
+ * observer-store membership signal.
+ */
+function isObserverOnlyDispatchSession(
+  sessionId: string,
+  session: Parameters<typeof resolveSessionDriverId>[1],
+): boolean {
+  return resolveSessionDriverId(sessionId, session) === 'dispatch';
 }
 
 function requireWorkspacePath(sessionId: string, workspacePath?: string): string {
@@ -83,7 +101,7 @@ export function calculateTurnHash(dialogTurn: DialogTurn): string {
     lastRoundData: dialogTurn.modelRounds[dialogTurn.modelRounds.length - 1]
       ? {
           ...dialogTurn.modelRounds[dialogTurn.modelRounds.length - 1],
-          items: dialogTurn.modelRounds[dialogTurn.modelRounds.length - 1].items.filter(item => !isRuntimeStatusItem(item)),
+          items: dialogTurn.modelRounds[dialogTurn.modelRounds.length - 1].items,
         }
       : null,
     error: dialogTurn.error,
@@ -101,8 +119,11 @@ export function calculateTurnHash(dialogTurn: DialogTurn): string {
 }
 
 /**
- * Debounced save dialog turn
- * Only executes the last call when called multiple times in a short period
+ * Coalesce frequent dialog-turn updates into periodic latest-state saves.
+ *
+ * This intentionally behaves like a trailing throttle, not a pure debounce:
+ * continuous model output must still reach persistence so Peer Device
+ * snapshot recovery can advance while a turn is running.
  */
 export function debouncedSaveDialogTurn(
   context: FlowChatContext,
@@ -114,14 +135,14 @@ export function debouncedSaveDialogTurn(
   
   const existingTimer = context.saveDebouncers.get(key);
   if (existingTimer) {
-    clearTimeout(existingTimer);
+    return;
   }
   
   const timer = setTimeout(() => {
-    saveDialogTurnToDisk(context, sessionId, turnId).catch(error => {
-      log.warn('Debounced save failed', { sessionId, turnId, error });
-    });
     context.saveDebouncers.delete(key);
+    saveDialogTurnToDisk(context, sessionId, turnId).catch(error => {
+      log.warn('Coalesced checkpoint save failed', { sessionId, turnId, error });
+    });
   }, delay);
   
   context.saveDebouncers.set(key, timer);
@@ -269,11 +290,11 @@ async function performSaveDialogTurnToDisk(
       log.debug('Session not found, skipping save', { sessionId, turnId });
       return;
     }
-    if (isTransientSession(session)) {
+    if (isTransientSession(session) || isObserverOnlyDispatchSession(sessionId, session)) {
       return;
     }
 
-    const workspacePath = requireWorkspacePath(sessionId, session.workspacePath);
+    const workspacePath = requireSessionProjectWorkspacePath(session, sessionId);
     
     const dialogTurn = session.dialogTurns.find(turn => turn.id === turnId);
     if (!dialogTurn) {
@@ -307,7 +328,7 @@ export async function saveAllInProgressTurns(context: FlowChatContext): Promise<
   const savePromises: Promise<void>[] = [];
   
   for (const [sessionId, session] of state.sessions.entries()) {
-    if (isTransientSession(session)) {
+    if (isTransientSession(session) || isObserverOnlyDispatchSession(sessionId, session)) {
       continue;
     }
     const lastTurn = session.dialogTurns[session.dialogTurns.length - 1];
@@ -402,7 +423,7 @@ export function convertDialogTurnToBackendFormat(dialogTurn: DialogTurn, turnInd
         renderHints: round.renderHints,
         textItems: round.items
           .map((item, index) => ({ item, index }))
-          .filter(({ item }) => item.type === 'text' && !isRuntimeStatusItem(item))
+          .filter(({ item }) => item.type === 'text')
           .map(({ item, index }) => {
             return {
               id: item.id,
@@ -422,6 +443,14 @@ export function convertDialogTurnToBackendFormat(dialogTurn: DialogTurn, turnInd
           .filter(({ item }) => item.type === 'tool')
           .map(({ item, index }) => {
             const toolItem = item as any;
+            const effective = effectiveToolInvocation(toolItem.toolName, toolItem.toolCall?.input);
+            if (
+              toolItem.toolName === DEFERRED_TOOL_GATEWAY_NAME
+              && toolItem.status === 'completed'
+              && !effective.isDeferred
+            ) {
+              throw new Error(`Completed deferred tool is missing its wire invocation: ${item.id}`);
+            }
             return {
               id: item.id,
               toolName: toolItem.toolName || '',
@@ -465,6 +494,7 @@ export function convertDialogTurnToBackendFormat(dialogTurn: DialogTurn, turnInd
         startTime: round.startTime,
         endTime: round.endTime,
         attemptCount: round.attemptCount,
+        attemptDiagnostics: round.attemptDiagnostics,
         status: round.status || 'completed',
       };
     }),
@@ -480,6 +510,8 @@ export function convertDialogTurnToBackendFormat(dialogTurn: DialogTurn, turnInd
       : undefined,
     finishReason: dialogTurn.finishReason,
     hasFinalResponse: dialogTurn.hasFinalResponse,
+    error: dialogTurn.error,
+    errorDetail: dialogTurn.errorDetail,
     status: dialogTurn.status === 'completed' ? 'completed' : 
             dialogTurn.status === 'error' ? 'error' : 
             dialogTurn.status === 'cancelled' ? 'cancelled' : 'inprogress',
@@ -501,9 +533,9 @@ export async function updateSessionMetadata(
 
     const session = context.flowChatStore.getState().sessions.get(sessionId);
     if (!session) return;
-    if (isTransientSession(session)) return;
+    if (isTransientSession(session) || isObserverOnlyDispatchSession(sessionId, session)) return;
 
-    const workspacePath = requireWorkspacePath(sessionId, session.workspacePath);
+    const workspacePath = requireSessionProjectWorkspacePath(session, sessionId);
 
     let existingMetadata: any = null;
     try {
@@ -522,6 +554,14 @@ export async function updateSessionMetadata(
     await sessionAPI.saveSessionMetadata(
       metadata,
       workspacePath,
+      [
+        'sessionName',
+        'tags',
+        'todos',
+        'unreadCompletion',
+        'needsUserAttention',
+        'titleMetadata',
+      ],
       session.remoteConnectionId,
       session.remoteSshHost
     );

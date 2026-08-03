@@ -88,8 +88,8 @@ impl PathManager {
 
     /// Get user config root directory
     ///
-    /// - Windows: %APPDATA%\BitFun\
-    /// - macOS: ~/Library/Application Support/BitFun/
+    /// - Windows: %APPDATA%\bitfun\
+    /// - macOS: ~/Library/Application Support/bitfun/
     /// - Linux: ~/.config/bitfun/
     fn get_user_config_root() -> BitFunResult<PathBuf> {
         if let Some(path) =
@@ -210,6 +210,11 @@ impl PathManager {
         false
     }
 
+    /// Get the root directory for user-scoped BitFun storage.
+    pub fn user_root_dir(&self) -> &Path {
+        &self.user_root
+    }
+
     /// Get user config directory: ~/.config/bitfun/config/
     pub fn user_config_dir(&self) -> PathBuf {
         self.user_root.join("config")
@@ -218,6 +223,11 @@ impl PathManager {
     /// Get app config file path: ~/.config/bitfun/config/app.json
     pub fn app_config_file(&self) -> PathBuf {
         self.user_config_dir().join("app.json")
+    }
+
+    /// Get user agent hooks file: ~/.config/bitfun/config/hooks.json
+    pub fn user_hooks_file(&self) -> PathBuf {
+        self.user_config_dir().join("hooks.json")
     }
 
     /// Get user agent directory: ~/.config/bitfun/agents/
@@ -272,11 +282,48 @@ impl PathManager {
         self.user_root.join("data")
     }
 
+    /// User-level managed model resources shared across workspaces.
+    pub fn user_models_dir(&self) -> PathBuf {
+        self.user_data_dir().join("models")
+    }
+
+    /// User-level speech recognition model resources shared across workspaces.
+    pub fn speech_models_dir(&self) -> PathBuf {
+        self.user_models_dir().join("speech")
+    }
+
+    /// Versioned speech model resource directory.
+    pub fn speech_model_dir(&self, model_id: &str, version: &str) -> PathBuf {
+        self.speech_models_dir().join(model_id).join(version)
+    }
+
+    /// Temporary download workspace for managed speech model resources.
+    pub fn speech_model_downloads_dir(&self) -> PathBuf {
+        self.cache_root().join("model-downloads").join("speech")
+    }
+
+    /// Temporary audio chunks for local voice input sessions.
+    pub fn speech_input_temp_dir(&self) -> PathBuf {
+        self.temp_dir().join("speech-input")
+    }
+
     /// Get user memory database file: ~/.config/bitfun/data/memories/memories.sqlite
     pub fn memories_database_file(&self) -> PathBuf {
         self.user_data_dir()
             .join("memories")
             .join("memories.sqlite")
+    }
+
+    /// Get the durable agent coordination database file.
+    pub fn agent_coordination_database_file(&self) -> PathBuf {
+        self.user_data_dir()
+            .join("agent-runtime")
+            .join("coordination.sqlite")
+    }
+
+    /// Process-level ownership locks for local Agent Runtime deployments.
+    pub fn agent_runtime_ownership_dir(&self) -> PathBuf {
+        self.user_data_dir().join("agent-runtime").join("ownership")
     }
 
     /// Get user memory workspace root directory: ~/.bitfun/memories/
@@ -355,6 +402,11 @@ impl PathManager {
         self.bitfun_home_dir().join("projects")
     }
 
+    /// Default root for opt-in managed Git worktrees.
+    pub fn worktrees_root(&self) -> PathBuf {
+        self.bitfun_home_dir().join("worktrees")
+    }
+
     /// Get the runtime root for a workspace: ~/.bitfun/projects/<workspace-slug>/
     pub fn project_runtime_root(&self, workspace_path: &Path) -> PathBuf {
         self.projects_root()
@@ -372,6 +424,12 @@ impl PathManager {
             .join("agent_profiles.json")
     }
 
+    /// Get project tool permission rules file: {project}/.bitfun/config/tool_permissions.json
+    pub fn project_permission_file(&self, workspace_path: &Path) -> PathBuf {
+        self.project_internal_config_dir(workspace_path)
+            .join("tool_permissions.json")
+    }
+
     /// Get project mode skills file: {project}/.bitfun/config/mode_skills.json
     pub fn project_mode_skills_file(&self, workspace_path: &Path) -> PathBuf {
         self.project_internal_config_dir(workspace_path)
@@ -382,6 +440,12 @@ impl PathManager {
     pub fn project_agent_subagents_file(&self, workspace_path: &Path) -> PathBuf {
         self.project_internal_config_dir(workspace_path)
             .join("agent_subagents.json")
+    }
+
+    /// Get project agent hooks file: {project}/.bitfun/config/hooks.json
+    pub fn project_hooks_file(&self, workspace_path: &Path) -> PathBuf {
+        self.project_internal_config_dir(workspace_path)
+            .join("hooks.json")
     }
 
     /// Get project agent directory: {project}/.bitfun/agents/
@@ -492,14 +556,14 @@ impl PathManager {
     }
 
     #[cfg(unix)]
-    fn native_path_digest(path: &Path) -> String {
+    pub(crate) fn native_path_digest(path: &Path) -> String {
         use std::os::unix::ffi::OsStrExt;
 
         hex::encode(Sha256::digest(path.as_os_str().as_bytes()))
     }
 
     #[cfg(windows)]
-    fn native_path_digest(path: &Path) -> String {
+    pub(crate) fn native_path_digest(path: &Path) -> String {
         use std::os::windows::ffi::OsStrExt;
 
         let mut hasher = Sha256::new();
@@ -510,7 +574,7 @@ impl PathManager {
     }
 
     #[cfg(not(any(unix, windows)))]
-    fn native_path_digest(path: &Path) -> String {
+    pub(crate) fn native_path_digest(path: &Path) -> String {
         hex::encode(Sha256::digest(path.to_string_lossy().as_bytes()))
     }
 
@@ -534,11 +598,15 @@ impl PathManager {
             self.user_agents_dir(),
             self.cache_root(),
             self.user_data_dir(),
+            self.user_models_dir(),
+            self.speech_models_dir(),
+            self.speech_model_downloads_dir(),
             self.user_cron_dir(),
             self.user_rules_dir(),
             self.miniapps_dir(),
             self.logs_dir(),
             self.temp_dir(),
+            self.speech_input_temp_dir(),
         ];
 
         for dir in dirs {
@@ -666,6 +734,20 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn runtime_ownership_lives_under_the_agent_runtime_data_root() {
+        let user_root = std::env::temp_dir().join("bitfun-runtime-ownership-path-test");
+        let path_manager = PathManager::with_user_root_for_tests(user_root);
+
+        assert_eq!(
+            path_manager.agent_runtime_ownership_dir(),
+            path_manager
+                .user_data_dir()
+                .join("agent-runtime")
+                .join("ownership")
+        );
+    }
 
     #[test]
     fn strict_path_access_rejects_a_cached_temporary_fallback() {

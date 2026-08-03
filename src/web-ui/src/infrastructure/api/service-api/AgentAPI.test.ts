@@ -16,6 +16,42 @@ describe('AgentAPI', () => {
     invokeMock.mockResolvedValue(undefined);
   });
 
+  it('loads a bounded Session Turn window through a structured request', async () => {
+    invokeMock.mockResolvedValueOnce({
+      status: 'ready',
+      catalogRevision: 'catalog-1',
+      totalTurnCount: 20,
+      startOrdinal: 4,
+      endOrdinalExclusive: 20,
+      targetTurnId: 'turn-8',
+      turns: [],
+    });
+
+    await agentAPI.loadSessionTurnWindow({
+      sessionId: 'session-1',
+      workspacePath: 'D:/workspace/BitFun',
+      targetStorageTurnIndex: 8,
+      expectedTurnId: 'turn-8',
+      expectedCatalogRevision: 'catalog-1',
+      before: 4,
+      after: 12,
+      remoteConnectionId: 'remote-1',
+    });
+
+    expect(invokeMock).toHaveBeenCalledWith('load_session_turn_window', {
+      request: {
+        sessionId: 'session-1',
+        workspacePath: 'D:/workspace/BitFun',
+        targetStorageTurnIndex: 8,
+        expectedTurnId: 'turn-8',
+        expectedCatalogRevision: 'catalog-1',
+        before: 4,
+        after: 12,
+        remoteConnectionId: 'remote-1',
+      },
+    });
+  });
+
   it('sends subagent timeout controls with the desktop command request shape', async () => {
     await agentAPI.setSubagentTimeout('subagent-session', { type: 'disable' });
 
@@ -23,6 +59,64 @@ describe('AgentAPI', () => {
       request: {
         sessionId: 'subagent-session',
         action: { type: 'Disable', payload: null },
+      },
+    });
+  });
+
+  it('reloads one closed session context target through a structured request', async () => {
+    invokeMock.mockResolvedValueOnce(undefined);
+
+    await expect(agentAPI.reloadSessionContext({
+      sessionId: 'session-1',
+      target: 'instructions',
+    })).resolves.toBeUndefined();
+    expect(invokeMock).toHaveBeenCalledWith('reload_session_context', {
+      request: {
+        sessionId: 'session-1',
+        target: 'instructions',
+      },
+    });
+  });
+
+  it('returns whether session cancellation was accepted for an active turn', async () => {
+    invokeMock.mockResolvedValueOnce({
+      cancelled: true,
+      dialogTurnId: 'turn-1',
+    });
+
+    await expect(agentAPI.cancelSession('subagent-session')).resolves.toEqual({
+      cancelled: true,
+      dialogTurnId: 'turn-1',
+    });
+    expect(invokeMock).toHaveBeenCalledWith('cancel_session', {
+      request: { sessionId: 'subagent-session' },
+    });
+  });
+
+  it('preserves a no-active-turn cancellation response', async () => {
+    invokeMock.mockResolvedValueOnce({
+      cancelled: false,
+      dialogTurnId: null,
+    });
+
+    await expect(agentAPI.cancelSession('idle-session')).resolves.toEqual({
+      cancelled: false,
+      dialogTurnId: null,
+    });
+  });
+
+  it('can cancel a session without cancelling its descendants', async () => {
+    invokeMock.mockResolvedValueOnce({
+      cancelled: true,
+      dialogTurnId: 'turn-parent',
+    });
+
+    await agentAPI.cancelSession('parent-session', { cancelDescendants: false });
+
+    expect(invokeMock).toHaveBeenCalledWith('cancel_session', {
+      request: {
+        sessionId: 'parent-session',
+        cancelDescendants: false,
       },
     });
   });
@@ -35,6 +129,58 @@ describe('AgentAPI', () => {
         sessionId: 'subagent-session',
         action: { type: 'Extend', payload: { seconds: 300 } },
       },
+    });
+  });
+
+  it('responds to permission requests by request id', async () => {
+    await agentAPI.respondPermission('permission-1', 'reject', 'Use a read-only path');
+
+    expect(invokeMock).toHaveBeenCalledWith('respond_permission', {
+      request: {
+        requestId: 'permission-1',
+        reply: 'reject',
+        feedback: 'Use a read-only path',
+      },
+    });
+  });
+
+  it('responds to the current and following permission requests atomically', async () => {
+    invokeMock.mockResolvedValue(['permission-1', 'permission-2']);
+
+    await expect(
+      agentAPI.respondPermissionBatch('permission-1', 'always'),
+    ).resolves.toEqual(['permission-1', 'permission-2']);
+
+    expect(invokeMock).toHaveBeenCalledWith('respond_permission_batch', {
+      request: {
+        requestId: 'permission-1',
+        reply: 'always',
+      },
+    });
+  });
+
+  it('preserves structured worktree errors during atomic session creation', async () => {
+    invokeMock.mockRejectedValueOnce(JSON.stringify({
+      code: 'copy_conflict',
+      message: 'A selected local file already exists in the target worktree',
+      recoveryPath: '/tmp/recover-worktree',
+    }));
+
+    await expect(agentAPI.createSession({
+      sessionName: 'Isolated task',
+      agentType: 'agentic',
+      workspacePath: '/repo',
+      projectWorkspacePath: '/repo',
+      requestId: 'request-worktree-1',
+      executionTarget: {
+        kind: 'newManagedWorktree',
+        baseRef: 'HEAD',
+        copyLocalChanges: true,
+      },
+    })).rejects.toMatchObject({
+      name: 'WorktreeCommandError',
+      code: 'copy_conflict',
+      recoveryPath: '/tmp/recover-worktree',
     });
   });
 

@@ -159,9 +159,9 @@ async fn tray_toggle_desktop_pet(app: &AppHandle) -> Result<(), String> {
 
     let show = desktop_pet_should_show(&exp);
     if show {
-        crate::theme::show_agent_companion_desktop_pet(app.clone()).await?;
+        crate::appearance::show_agent_companion_desktop_pet(app.clone()).await?;
     } else {
-        crate::theme::hide_agent_companion_desktop_pet(app.clone()).await?;
+        crate::appearance::hide_agent_companion_desktop_pet(app.clone()).await?;
     }
 
     Ok(())
@@ -220,6 +220,7 @@ pub fn setup_tray(
             } else if id == "quit" {
                 log::info!("Quit requested from tray menu");
                 crate::crash_diagnostics::mark_clean_shutdown("tray_quit");
+                crate::save_main_window_state(app);
                 crate::perform_process_exit_cleanup();
                 app.exit(0);
             } else if id == "toggle_desktop_pet" {

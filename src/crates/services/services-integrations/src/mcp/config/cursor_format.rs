@@ -67,6 +67,13 @@ pub fn config_to_cursor_format(config: &MCPServerConfig) -> serde_json::Value {
         cursor_config.insert("command".to_string(), serde_json::json!(command));
     }
 
+    if let Some(inherit) = config.inherit_parent_environment {
+        cursor_config.insert(
+            "inheritParentEnvironment".to_string(),
+            serde_json::json!(inherit),
+        );
+    }
+
     if !config.args.is_empty() {
         cursor_config.insert("args".to_string(), serde_json::json!(config.args));
     }
@@ -212,6 +219,10 @@ pub fn parse_cursor_format(config: &serde_json::Value) -> Vec<MCPServerConfig> {
                     .and_then(|v| v.as_bool())
                     .unwrap_or(true);
 
+                let inherit_parent_environment = obj
+                    .get("inheritParentEnvironment")
+                    .and_then(|value| value.as_bool());
+
                 let server_config = MCPServerConfig {
                     id: server_id.clone(),
                     name,
@@ -220,6 +231,8 @@ pub fn parse_cursor_format(config: &serde_json::Value) -> Vec<MCPServerConfig> {
                     command,
                     args,
                     env,
+                    working_directory: None,
+                    inherit_parent_environment,
                     headers,
                     url,
                     auto_start,
@@ -231,10 +244,12 @@ pub fn parse_cursor_format(config: &serde_json::Value) -> Vec<MCPServerConfig> {
                         .get("oauth")
                         .cloned()
                         .and_then(|value| serde_json::from_value(value).ok()),
+                    oauth_enabled: None,
                     xaa: obj
                         .get("xaa")
                         .cloned()
                         .and_then(|value| serde_json::from_value(value).ok()),
+                    timeouts: Default::default(),
                 };
 
                 servers.push(server_config);

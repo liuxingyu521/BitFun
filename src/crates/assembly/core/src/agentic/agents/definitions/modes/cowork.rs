@@ -22,8 +22,8 @@ impl CoworkMode {
         // Cowork is the office/research mode; web research is baseline there,
         // so keep WebSearch/WebFetch expanded (same as DeepResearch).
         let mut tool_exposure_overrides = AgentToolPolicyOverrides::default();
-        tool_exposure_overrides.insert("WebSearch".to_string(), ToolExposure::Expanded);
-        tool_exposure_overrides.insert("WebFetch".to_string(), ToolExposure::Expanded);
+        tool_exposure_overrides.insert("WebSearch".to_string(), ToolExposure::Direct);
+        tool_exposure_overrides.insert("WebFetch".to_string(), ToolExposure::Direct);
         Self {
             tool_exposure_overrides,
             default_tools: vec![
@@ -31,6 +31,8 @@ impl CoworkMode {
                 "AskUserQuestion".to_string(),
                 "TodoWrite".to_string(),
                 "Task".to_string(),
+                "ListModels".to_string(),
+                "AgentWait".to_string(),
                 "Skill".to_string(),
                 // Discovery + editing
                 "LS".to_string(),
@@ -52,6 +54,8 @@ impl CoworkMode {
                 "WebFetch".to_string(),
                 "ControlHub".to_string(),
                 "InitMiniApp".to_string(),
+                "FinalizeMiniApp".to_string(),
+                "PublishMiniApp".to_string(),
             ],
         }
     }
@@ -105,8 +109,10 @@ mod tests {
     use crate::agentic::agents::Agent;
 
     #[test]
-    fn cowork_mode_includes_init_miniapp_in_default_tools() {
+    fn cowork_mode_includes_miniapp_lifecycle_tools_in_defaults() {
         let tools = CoworkMode::new().default_tools();
         assert!(tools.contains(&"InitMiniApp".to_string()));
+        assert!(tools.contains(&"FinalizeMiniApp".to_string()));
+        assert!(tools.contains(&"ListModels".to_string()));
     }
 }

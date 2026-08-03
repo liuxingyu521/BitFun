@@ -173,14 +173,14 @@ fn capability_packs_describe_service_tool_and_harness_requirements() {
             "deep-review",
             "deep-research",
             "miniapp",
-            "canvas"
+            "canvas",
+            "voice-input"
         ]
     );
 
     let service_capabilities = registry.required_service_capabilities();
     assert!(service_capabilities.contains(&RuntimeServiceCapability::FileSystem));
     assert!(service_capabilities.contains(&RuntimeServiceCapability::Workspace));
-    assert!(service_capabilities.contains(&RuntimeServiceCapability::Permission));
     assert!(service_capabilities.contains(&RuntimeServiceCapability::Events));
 
     let harness_capabilities = registry
@@ -223,7 +223,7 @@ fn capability_packs_describe_service_tool_and_harness_requirements() {
 
 #[test]
 fn product_assembly_plan_keeps_full_capabilities_only_for_core_compatibility_profiles() {
-    let expected_capabilities = vec![
+    let shared_capabilities = vec![
         "code-agent",
         "deep-review",
         "deep-research",
@@ -238,11 +238,36 @@ fn product_assembly_plan_keeps_full_capabilities_only_for_core_compatibility_pro
         "core.integration",
     ];
 
+    for profile in [DeliveryProfile::ProductFull, DeliveryProfile::Desktop] {
+        let plan = product_assembly_plan_for_profile(profile);
+        let mut expected_capabilities = shared_capabilities.clone();
+        expected_capabilities.push("voice-input");
+
+        assert_eq!(plan.profile(), profile);
+        assert_eq!(
+            plan.capability_set()
+                .ids()
+                .iter()
+                .map(|capability_id| capability_id.id())
+                .collect::<Vec<_>>(),
+            expected_capabilities,
+            "{profile} must include the desktop voice-input capability"
+        );
+        assert_eq!(
+            plan.capability_assembly()
+                .tool_provider_group_plan()
+                .iter()
+                .map(|group| group.provider_id())
+                .collect::<Vec<_>>(),
+            expected_tool_groups,
+            "{profile} must preserve current tool provider groups"
+        );
+    }
+
     for profile in [
-        DeliveryProfile::ProductFull,
-        DeliveryProfile::Desktop,
         DeliveryProfile::Cli,
         DeliveryProfile::Acp,
+        DeliveryProfile::Sdk,
     ] {
         let plan = product_assembly_plan_for_profile(profile);
 
@@ -253,8 +278,8 @@ fn product_assembly_plan_keeps_full_capabilities_only_for_core_compatibility_pro
                 .iter()
                 .map(|capability_id| capability_id.id())
                 .collect::<Vec<_>>(),
-            expected_capabilities,
-            "{profile} must preserve the current product-full capability set until explicit trimming is proven"
+            shared_capabilities,
+            "{profile} must not select desktop-only voice input"
         );
         assert_eq!(
             plan.capability_assembly()
@@ -275,7 +300,6 @@ fn no_direct_core_profiles_do_not_select_product_full_runtime_capabilities() {
         DeliveryProfile::Remote,
         DeliveryProfile::Web,
         DeliveryProfile::MobileWeb,
-        DeliveryProfile::Sdk,
     ] {
         let plan = product_assembly_plan_for_profile(profile);
 
@@ -359,7 +383,7 @@ fn product_delivery_profile_matrix_documents_current_core_dependency_shape() {
             ),
             (
                 DeliveryProfile::Sdk,
-                ProductCoreDependencyMode::NoDirectCoreDependency,
+                ProductCoreDependencyMode::ProductFullCompatibility,
             ),
         ]
     );
@@ -424,7 +448,7 @@ fn product_assembly_plan_follows_core_dependency_matrix() {
 }
 
 #[test]
-fn product_assembly_plan_keeps_plugin_runtime_disabled_until_explicit_host_binding() {
+fn product_assembly_plan_keeps_plugin_runtime_disabled_until_explicit_client_binding() {
     for profile in DeliveryProfile::all_current_product_profiles() {
         let extension_capabilities = product_assembly_plan_for_profile(*profile)
             .extension_capabilities()
@@ -643,7 +667,7 @@ fn product_assembler_rejects_executable_plugin_runtime_binding_for_non_p0_profil
                 PluginRuntimeBinding::client(Arc::new(AvailablePluginRuntimeClient)),
             ),
         )
-        .expect_err("ACP must not inherit executable P0 plugin host binding");
+        .expect_err("ACP must not inherit an executable P0 plugin runtime client");
 
     assert_eq!(
         error,
@@ -725,7 +749,6 @@ fn product_assembler_allows_no_direct_core_profiles_without_product_services() {
         DeliveryProfile::Remote,
         DeliveryProfile::Web,
         DeliveryProfile::MobileWeb,
-        DeliveryProfile::Sdk,
     ] {
         let services = FakeRuntimeServicesProvider::with_all_required()
             .build_services()
@@ -759,7 +782,8 @@ fn default_capability_assembly_keeps_service_tool_and_harness_facts_together() {
             "deep-review",
             "deep-research",
             "miniapp",
-            "canvas"
+            "canvas",
+            "voice-input"
         ]
     );
 
@@ -770,7 +794,6 @@ fn default_capability_assembly_keeps_service_tool_and_harness_facts_together() {
             RuntimeServiceCapability::FileSystem,
             RuntimeServiceCapability::Workspace,
             RuntimeServiceCapability::SessionStore,
-            RuntimeServiceCapability::Permission,
             RuntimeServiceCapability::Events,
             RuntimeServiceCapability::Clock,
             RuntimeServiceCapability::Terminal,

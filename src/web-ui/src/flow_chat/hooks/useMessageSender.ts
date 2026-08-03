@@ -10,11 +10,21 @@
 
 import { useCallback } from 'react';
 import { FlowChatManager } from '../services/FlowChatManager';
+import { flowChatSessionConfigForCurrentWorkspace } from '@/app/utils/projectSessionWorkspace';
 import { notificationService } from '@/shared/notification-system';
-import type { ContextItem, ImageContext } from '@/shared/types/context';
+import type {
+  ContextItem,
+  ImageContext,
+  SessionReferenceContext,
+} from '@/shared/types/context';
 import { createLogger } from '@/shared/utils/logger';
 import { formatContextForPrompt } from '@/shared/utils/contextPrompt';
 import { buildImagePayload } from '../utils/imagePayload';
+import {
+  composerPresentationSessionReferences,
+  type ComposerPresentation,
+} from '../utils/composerPresentation';
+import type { AgentDialogTurnExecution } from '@/infrastructure/api/service-api/AgentAPI';
 
 const log = createLogger('FlowChat');
 
@@ -31,6 +41,18 @@ interface UseMessageSenderProps {
   onExitTemplateMode?: () => void;
   /** Selected agent type (mode) */
   currentAgentType?: string;
+  /** Reconcile the composer after an explicit session-conflict retry succeeds. */
+  onSessionConflictRetrySuccess?: (submission: {
+    sessionId: string;
+    message: string;
+    contextIds: string[];
+  }) => void;
+  /** Capture composer state when the user explicitly starts a conflict retry. */
+  onSessionConflictRetryStart?: (submission: {
+    sessionId: string;
+    message: string;
+    contextIds: string[];
+  }) => void;
 }
 
 interface UseMessageSenderReturn {
@@ -39,6 +61,8 @@ interface UseMessageSenderReturn {
     message: string,
     options?: {
       displayMessage?: string;
+      composerPresentation?: ComposerPresentation | null;
+      execution?: AgentDialogTurnExecution;
     }
   ) => Promise<void>;
   /** Whether a send is in progress */
@@ -53,12 +77,16 @@ export function useMessageSender(props: UseMessageSenderProps): UseMessageSender
     onSuccess,
     onExitTemplateMode,
     currentAgentType,
+    onSessionConflictRetryStart,
+    onSessionConflictRetrySuccess,
   } = props;
 
   const sendMessage = useCallback(async (
     message: string,
     options?: {
       displayMessage?: string;
+      composerPresentation?: ComposerPresentation | null;
+      execution?: AgentDialogTurnExecution;
     }
   ) => {
     if (!message.trim()) {
@@ -90,11 +118,17 @@ export function useMessageSender(props: UseMessageSenderProps): UseMessageSender
     try {
       const flowChatManager = FlowChatManager.getInstance();
       let agentTypeForSend = currentAgentType || 'agentic';
+      if (options?.execution?.kind === 'fresh_external_subagent' && contexts.length > 0) {
+        throw new Error('External subagent command delegation does not accept composer context');
+      }
 
       if (!sessionId) {
         const agentType = currentAgentType || 'agentic';
 
-        sessionId = await flowChatManager.createChatSession({}, agentType);
+        sessionId = await flowChatManager.createChatSession(
+          flowChatSessionConfigForCurrentWorkspace(),
+          agentType,
+        );
         agentTypeForSend =
           FlowChatManager.getInstance().getFlowChatState().sessions.get(sessionId)?.mode ||
           agentType;
@@ -104,6 +138,28 @@ export function useMessageSender(props: UseMessageSenderProps): UseMessageSender
       }
 
       const imageContexts = contexts.filter(ctx => ctx.type === 'image') as ImageContext[];
+      const presentationSessionReferences = options?.composerPresentation
+        ? composerPresentationSessionReferences(options.composerPresentation)
+        : [];
+      const sessionReferenceContexts = presentationSessionReferences.length > 0
+        ? presentationSessionReferences
+        : contexts
+        .filter((context): context is SessionReferenceContext => context.type === 'session-reference')
+      const sessionReferences = sessionReferenceContexts.map((context) => ({
+          sessionId: context.sessionId,
+          workspacePath: context.workspacePath,
+          remoteConnectionId: context.remoteConnectionId,
+          remoteSshHost: context.remoteSshHost,
+        }));
+      const userMessageMetadata =
+        options?.composerPresentation || sessionReferences.length > 0
+          ? {
+              ...(options?.composerPresentation
+                ? { composerPresentation: options.composerPresentation }
+                : {}),
+              ...(sessionReferences.length > 0 ? { sessionReferences } : {}),
+            }
+          : undefined;
       let imagePayload: Awaited<ReturnType<typeof buildImagePayload>>;
       try {
         imagePayload = await buildImagePayload(imageContexts);
@@ -125,9 +181,15 @@ export function useMessageSender(props: UseMessageSenderProps): UseMessageSender
       const displayMessage = options?.displayMessage?.trim() || trimmedMessage;
 
       if (contexts.length > 0) {
-        const fullContextSection = contexts.map(formatContextForPrompt).filter(Boolean).join('\n');
+        const fullContextSection = contexts
+          .filter(context => context.type !== 'session-reference')
+          .map(formatContextForPrompt)
+          .filter(Boolean)
+          .join('\n');
 
-        fullMessage = `${fullContextSection}\n\n${aiTrimmedMessage}`;
+        fullMessage = fullContextSection
+          ? `${fullContextSection}\n\n${aiTrimmedMessage}`
+          : aiTrimmedMessage;
       }
 
       // Always pass imageContexts to the backend; the coordinator decides
@@ -138,7 +200,25 @@ export function useMessageSender(props: UseMessageSenderProps): UseMessageSender
         displayMessage,
         agentTypeForSend,
         undefined,
-        imagePayload
+        {
+          ...(imagePayload ?? {}),
+          ...(userMessageMetadata ? { userMessageMetadata } : {}),
+          ...(options?.execution ? { execution: options.execution } : {}),
+          onSessionConflictRetryStart: () => {
+            onSessionConflictRetryStart?.({
+              sessionId: sessionId!,
+              message: displayMessage,
+              contextIds: contexts.map(context => context.id),
+            });
+          },
+          onSessionConflictRetrySuccess: () => {
+            onSessionConflictRetrySuccess?.({
+              sessionId: sessionId!,
+              message: displayMessage,
+              contextIds: contexts.map(context => context.id),
+            });
+          },
+        }
       );
 
       onClearContexts();
@@ -161,7 +241,16 @@ export function useMessageSender(props: UseMessageSenderProps): UseMessageSender
       });
       throw error;
     }
-  }, [currentSessionId, contexts, onClearContexts, onSuccess, onExitTemplateMode, currentAgentType]);
+  }, [
+    currentSessionId,
+    contexts,
+    onClearContexts,
+    onSuccess,
+    onExitTemplateMode,
+    currentAgentType,
+    onSessionConflictRetryStart,
+    onSessionConflictRetrySuccess,
+  ]);
 
   return {
     sendMessage,

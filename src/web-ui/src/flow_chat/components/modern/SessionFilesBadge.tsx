@@ -750,13 +750,15 @@ export const SessionFilesBadge: React.FC<SessionFilesBadgeProps> = ({
 
   return (
     <>
-      <div
+      <div data-bf-component="session-files-badge" data-bf-part="root" data-bf-state={isExpanded ? 'expanded' : undefined}
         ref={badgeRef}
         className={`session-files-badge ${isExpanded ? 'session-files-badge--expanded' : ''}`}
       >
       <div
         ref={reviewMenuRef}
         className="session-files-badge__review-menu"
+        data-bf-component="session-files-badge"
+        data-bf-part="reviewMenu"
       >
         <button
           className={[
@@ -764,6 +766,9 @@ export const SessionFilesBadge: React.FC<SessionFilesBadgeProps> = ({
             showReviewReadyGlint && 'session-files-badge__review-btn--glint',
             activeReviewMode && 'session-files-badge__review-btn--running',
           ].filter(Boolean).join(' ')}
+          data-bf-component="session-files-badge"
+          data-bf-part="reviewTrigger"
+          data-bf-state={isReviewMenuOpen ? 'open' : undefined}
           onClick={(event) => {
             event.stopPropagation();
             if (isReviewLaunchOrActivityBlocking) return;
@@ -799,9 +804,11 @@ export const SessionFilesBadge: React.FC<SessionFilesBadgeProps> = ({
         </button>
 
         {isReviewMenuOpen && !isReviewLaunchOrActivityBlocking && (
-          <div className="session-files-badge__review-menu-popover" role="menu">
+          <div className="session-files-badge__review-menu-popover" role="menu" data-bf-component="session-files-badge" data-bf-part="reviewPopover">
             {canLaunchReview && <button
               className="session-files-badge__review-menu-item"
+              data-bf-component="session-files-badge"
+              data-bf-part="reviewItem"
               onClick={handleReviewClick}
               type="button"
               role="menuitem"
@@ -817,7 +824,7 @@ export const SessionFilesBadge: React.FC<SessionFilesBadgeProps> = ({
             {quickActions.filter(a => a.enabled).map(action => {
               const actionText = resolveQuickActionText(action, t);
               return (
-                <button
+                <button data-bf-component="session-files-badge" data-bf-part="reviewItem"
                   key={action.id}
                   className="session-files-badge__review-menu-item"
                   onClick={() => { void handleQuickActionClick(action); }}
@@ -843,6 +850,9 @@ export const SessionFilesBadge: React.FC<SessionFilesBadgeProps> = ({
       {showFileStatsSummary ? (
       <button
         className="session-files-badge__button"
+        data-bf-component="session-files-badge"
+        data-bf-part="trigger"
+        data-bf-state={isExpanded ? 'expanded' : undefined}
         onClick={() => {
           setIsExpanded((prev) => {
             const next = !prev;
@@ -861,12 +871,12 @@ export const SessionFilesBadge: React.FC<SessionFilesBadgeProps> = ({
         aria-expanded={isExpanded}
       >
         {totalStats.totalAdditions > 0 && (
-          <span className="session-files-badge__stats session-files-badge__stats--add">
+          <span className="session-files-badge__stats session-files-badge__stats--add" data-bf-component="session-files-badge" data-bf-part="stats">
             +{totalStats.totalAdditions}
           </span>
         )}
         {totalStats.totalDeletions > 0 && (
-          <span className="session-files-badge__stats session-files-badge__stats--del">
+          <span className="session-files-badge__stats session-files-badge__stats--del" data-bf-component="session-files-badge" data-bf-part="stats">
             -{totalStats.totalDeletions}
           </span>
         )}
@@ -882,8 +892,10 @@ export const SessionFilesBadge: React.FC<SessionFilesBadgeProps> = ({
         <div
           ref={popoverRef}
           className="session-files-badge__popover"
+          data-bf-component="session-files-badge"
+          data-bf-part="popover"
         >
-          <div className="session-files-badge__popover-summary">
+          <div className="session-files-badge__popover-summary" data-bf-component="session-files-badge" data-bf-part="summary">
             <span className="session-files-badge__popover-summary-count">
               {t('sessionFilesBadge.filesSummaryCount', {
                 count: fileStats.size,
@@ -904,13 +916,17 @@ export const SessionFilesBadge: React.FC<SessionFilesBadgeProps> = ({
               </span>
             )}
           </div>
-          <div className="session-files-badge__list">
+          <div className="session-files-badge__list" data-bf-component="session-files-badge" data-bf-part="list">
             {Array.from(fileStats.values()).map((stat) => (
               <div
                 key={stat.filePath}
                 className={`session-files-badge__file-item session-files-badge__file-item--${stat.operationType} ${
                   stat.error ? 'session-files-badge__file-item--error' : ''
                 }`}
+                data-bf-component="session-files-badge"
+                data-bf-part="file"
+                data-bf-operation={stat.operationType}
+                data-bf-state={stat.error ? 'error' : undefined}
                 onClick={() => !stat.error && handleFileClick(stat.filePath)}
                 title={stat.error ? stat.error : t('sessionFilesBadge.clickToViewDiff')}
               >
@@ -921,9 +937,9 @@ export const SessionFilesBadge: React.FC<SessionFilesBadgeProps> = ({
                 <span className="session-files-badge__file-name">{stat.fileName}</span>
 
                 {stat.error ? (
-                  <span className="session-files-badge__file-error">{stat.error}</span>
+                  <span className="session-files-badge__file-error" data-bf-component="session-files-badge" data-bf-part="fileError">{stat.error}</span>
                 ) : (
-                  <span className="session-files-badge__file-stats">
+                  <span className="session-files-badge__file-stats" data-bf-component="session-files-badge" data-bf-part="fileStats">
                     {stat.additions > 0 && (
                       <span className="session-files-badge__file-stat session-files-badge__file-stat--add">
                         +{stat.additions}

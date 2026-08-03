@@ -8,27 +8,96 @@
   "editProviderSubtitle": "Basic Provider Parameters",
   "editSubtitle": "Basic Model Parameters",
   "confirmDelete": "Are you sure you want to delete this configuration?",
-  "cliAuth": {
-    "sectionTitle": "Local CLI accounts",
-    "sectionDescription": "Import Codex CLI / Gemini CLI accounts already signed in on this machine and use them as models",
-    "rescan": "Re-scan",
-    "empty": "No signed-in Codex / Gemini CLI accounts detected. Sign in from the terminal first, then re-scan.",
-    "import": "Use this account",
+  "subagentModels": {
+    "title": "Subagent Models",
+    "default": {
+      "label": "Default Subagent Model",
+      "description": "Default model used by subagents when none is set individually",
+      "configureTooltip": "Sets the default model for subagents. Open Customize > Agents to configure each subagent separately",
+      "updateFailed": "Failed to update the default Subagent model"
+    },
+    "options": {
+      "inherit": "Inherit parent session",
+      "fast": "Fast model",
+      "primary": "Primary model",
+      "auto": "Automatic selection"
+    },
+    "loadFailed": "Failed to load Subagent model settings"
+  },
+  "sessionTitle": {
+    "title": "Auto Session Title",
+    "subtitle": "AI automatically generates concise titles for new conversations",
+    "enable": "Enable",
+    "loadFailed": "Failed to load session title settings",
+    "model": {
+      "label": "Model",
+      "primary": "Primary Model",
+      "fast": "Fast Model"
+    },
+    "models": {
+      "empty": "No available models. Please add models in \"Models\" first.",
+      "updateSuccess": "{{agentName}} will use {{modelName}}"
+    },
+    "messages": {
+      "saveSuccess": "Settings saved",
+      "saveFailed": "Save failed",
+      "updateFailed": "Update failed"
+    }
+  },
+  "subscriptionAuth": {
+    "sectionTitle": "Subscription accounts",
+    "sectionDescription": "Sign in to Codex, Antigravity, or OpenCode subscriptions and use them as model APIs",
+    "rescan": "Refresh status",
+    "import": "Use as model",
+    "login": "Sign in",
+    "cancel": "Cancel",
+    "loginCancelled": "Sign-in cancelled",
+    "logout": "Sign out",
     "refresh": "Refresh token",
     "refreshSuccess": "Token refreshed",
     "refreshFailed": "Refresh failed: {{error}}",
+    "loginSuccess": "Signed in",
+    "loginFailed": "Sign-in failed: {{error}}",
+    "logoutSuccess": "Signed out",
+    "logoutCleanupPending": "Signed out. Native credential cleanup is pending and will retry automatically.",
+    "logoutFailed": "Sign-out failed: {{error}}",
+    "userCodeHint": "Enter this code in the browser: {{code}}",
+    "openUrlManually": "Could not open the browser automatically. Open this URL manually: {{url}}",
     "expiresAt": "Token valid until {{time}}",
     "tokenValid": "Token ready",
-    "accountLine": "Account: {{account}}",
+    "notSignedIn": "Not signed in",
     "label": "Authentication",
     "options": {
       "apiKey": "API Key",
-      "codexCli": "Codex CLI account",
-      "geminiCli": "Gemini CLI account"
+      "codex": "Codex (ChatGPT subscription)",
+      "antigravity": "Antigravity (Google subscription)",
+      "opencode": "OpenCode Zen subscription"
     },
-    "detected": "Will use the local {{label}} ({{account}})",
-    "notDetected": "No signed-in {{kind}} account detected; sign in from the terminal first.",
-    "unknownAccount": "current login"
+    "detected": "Will use {{label}} ({{account}})",
+    "notConnected": "{{kind}} is not signed in; sign in above first",
+    "unknownAccount": "current account",
+    "secureStoreMigrationNotice": "Subscription credentials are now protected by your system credential vault. Credentials previously imported from third-party CLIs are not read; if you used that flow, sign in here once.",
+    "dismissMigrationNotice": "Got it",
+    "reauthenticationRequired": "No usable credential was found in the system vault. Sign in again once.",
+    "vaultUnavailable": "The system credential vault is locked or unavailable. Unlock it, then try again; your sign-in has not been removed.",
+    "retryVault": "Try vault again",
+    "loginPending": "Waiting for authorization in your browser",
+    "loginCancelling": "Cancelling sign-in and closing the authorization session",
+    "loginCompletedBeforeCancel": "Authorization had already completed, so this account remains signed in.",
+    "timeRemaining": "{{time}} remaining",
+    "verificationCode": "Verification code",
+    "copyCode": "Copy code",
+    "codeCopied": "Verification code copied",
+    "copyCodeFailed": "Could not copy the verification code",
+    "openAuthorization": "Open authorization page",
+    "retryLogin": "Try again",
+    "loginNeedsRetry": "This sign-in did not complete",
+    "loginFailedInline": "{{error}}",
+    "logoutConfirmTitle": "Sign out of subscription account?",
+    "logoutAffectedModels": "After signing out, {{count}} model configurations using this account cannot make model requests:",
+    "logoutNoAffectedModels": "No model configuration currently uses this subscription account.",
+    "logoutConsequence": "Model configurations will not be deleted. Sign in to the same subscription account again to resume using them.",
+    "confirmLogout": "Sign out"
   },
   "providerSelection": {
     "title": "Select Model Provider",
@@ -78,39 +147,72 @@
     },
     "minimax": {
       "name": "MiniMax",
-      "description": "MiniMax series models"
+      "description": "MiniMax series models",
+      "urlOptions": {
+        "default": "China - Anthropic Format - Default",
+        "openai": "China - OpenAI Compatible",
+        "intl": "Global - Anthropic Format",
+        "intlOpenai": "Global - OpenAI Compatible"
+      }
     },
     "moonshot": {
       "name": "Moonshot AI",
-      "description": "Moonshot Kimi series models"
+      "description": "Moonshot Kimi series models",
+      "urlOptions": {
+        "default": "China - OpenAI Format - Default",
+        "anthropic": "China - Anthropic Format",
+        "intl": "Global - OpenAI Format",
+        "intlAnthropic": "Global - Anthropic Format",
+        "kimiForCoding": "Kimi For Coding plan (models: k3 / kimi-for-coding)"
+      }
     },
     "deepseek": {
       "name": "DeepSeek",
-      "description": "DeepSeek series models"
+      "description": "DeepSeek series models",
+      "urlOptions": {
+        "default": "OpenAI Format - Default",
+        "anthropic": "Anthropic Format"
+      }
     },
     "zhipu": {
       "name": "Zhipu AI",
       "description": "Zhipu AI GLM series models",
       "urlOptions": {
-        "default": "OpenAI Format - Default",
-        "anthropic": "Anthropic Format",
-        "codingPlan": "OpenAI Format - CodingPlan"
+        "default": "China - OpenAI Format - Default",
+        "anthropic": "China - Anthropic Format",
+        "codingPlan": "China - Coding Plan",
+        "intl": "Global (Z.AI) - OpenAI Format",
+        "intlAnthropic": "Global (Z.AI) - Anthropic Format",
+        "intlCodingPlan": "Global (Z.AI) - Coding Plan"
       }
     },
     "qwen": {
       "name": "Qwen",
-      "description": "Alibaba Cloud Bailian Model Platform"
+      "description": "Alibaba Cloud Bailian Model Platform",
+      "urlOptions": {
+        "default": "China - OpenAI Format - Default",
+        "intl": "Global (International) - OpenAI Format",
+        "codingPlan": "China - Coding Plan",
+        "codingPlanAnthropic": "China - Coding Plan - Anthropic Format",
+        "intlCodingPlan": "Global - Coding Plan"
+      }
     },
     "volcengine": {
       "name": "Volcano Engine",
-      "description": "ByteDance Volcano Engine Model Platform"
+      "description": "ByteDance Volcano Engine Model Platform",
+      "urlOptions": {
+        "default": "China - Default",
+        "codingPlan": "China - Coding Plan",
+        "intl": "Global (BytePlus)"
+      }
     },
     "siliconflow": {
       "name": "SiliconFlow",
       "description": "SiliconFlow Model Platform",
       "urlOptions": {
-        "default": "OpenAI Format - Default",
-        "anthropic": "Anthropic Format"
+        "default": "China - OpenAI Format - Default",
+        "anthropic": "China - Anthropic Format",
+        "intl": "Global - OpenAI Format"
       }
     },
     "nvidia": {
@@ -236,6 +338,13 @@
     "save": "Save First Token Timeout",
     "saveSuccess": "First token timeout saved"
   },
+  "toolArgumentJsonRepair": {
+    "title": "Tool Argument JSON Repair",
+    "description": "Applies to the next model round.",
+    "label": "Repair malformed tool arguments",
+    "hint": "Only after the provider confirms a normal tool-use completion. This can change malformed JSON before normal tool validation.",
+    "saveSuccess": "Tool argument JSON repair setting saved"
+  },
   "capabilities": {
     "text_chat": "Chat",
     "image_understanding": "Vision",
@@ -272,6 +381,7 @@
     "fillModelName": "Please fill in model name",
     "duplicateModelNameUnderProvider": "This provider already has a model with this name. Use a different name or edit the existing entry.",
     "invalidBaseUrlScheme": "API URL must start with http:// or https://",
+    "contextWindowTooSmall": "Context window must be at least 32K tokens",
     "saveFailed": "Save failed",
     "deleteFailed": "Failed to delete configuration",
     "loadFailed": "Failed to load AI configuration",

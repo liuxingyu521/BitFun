@@ -1,5 +1,5 @@
 /**
- * Unified SSH authentication prompt: password or private key.
+ * Unified SSH authentication prompt.
  */
 
 import React, { useState, useEffect, useRef, useCallback } from 'react';
@@ -11,7 +11,10 @@ import { Select } from '@/component-library';
 import { IconButton } from '@/component-library';
 import { FolderOpen, Key, Loader2, Lock, Server, User } from 'lucide-react';
 import type { SSHAuthMethod } from './types';
-import { pickSshPrivateKeyPath } from './pickSshPrivateKeyPath';
+import {
+  pickSshCertificatePath,
+  pickSshPrivateKeyPath,
+} from './pickSshPrivateKeyPath';
 import './SSHAuthPromptDialog.scss';
 
 export interface SSHAuthPromptSubmitPayload {
@@ -24,8 +27,9 @@ interface SSHAuthPromptDialogProps {
   open: boolean;
   /** Shown in the header area (e.g. user@host:port or alias) */
   targetDescription: string;
-  defaultAuthMethod: 'password' | 'privateKey';
+  defaultAuthMethod: 'password' | 'privateKey' | 'agent' | 'keyboardInteractive';
   defaultKeyPath?: string;
+  defaultCertificatePath?: string;
   initialUsername: string;
   /** If false, user can edit username (e.g. SSH config without User) */
   lockUsername: boolean;
@@ -39,6 +43,7 @@ export const SSHAuthPromptDialog: React.FC<SSHAuthPromptDialogProps> = ({
   targetDescription,
   defaultAuthMethod,
   defaultKeyPath = '~/.ssh/id_rsa',
+  defaultCertificatePath = '',
   initialUsername,
   lockUsername,
   isConnecting = false,
@@ -46,11 +51,15 @@ export const SSHAuthPromptDialog: React.FC<SSHAuthPromptDialogProps> = ({
   onCancel,
 }) => {
   const { t } = useI18n('common');
-  const [authMethod, setAuthMethod] = useState<'password' | 'privateKey'>(defaultAuthMethod);
+  const [authMethod, setAuthMethod] = useState<
+    'password' | 'privateKey' | 'agent' | 'keyboardInteractive'
+  >(defaultAuthMethod);
   const [username, setUsername] = useState(initialUsername);
   const [password, setPassword] = useState('');
   const [keyPath, setKeyPath] = useState(defaultKeyPath);
   const [passphrase, setPassphrase] = useState('');
+  const [certificatePath, setCertificatePath] = useState(defaultCertificatePath);
+  const [verificationCode, setVerificationCode] = useState('');
   const passwordRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -60,24 +69,36 @@ export const SSHAuthPromptDialog: React.FC<SSHAuthPromptDialogProps> = ({
     setPassword('');
     setKeyPath(defaultKeyPath);
     setPassphrase('');
+    setCertificatePath(defaultCertificatePath);
+    setVerificationCode('');
     const focusMs = window.setTimeout(() => {
-      if (defaultAuthMethod === 'password') {
+      if (defaultAuthMethod === 'password' || defaultAuthMethod === 'keyboardInteractive') {
         passwordRef.current?.focus();
       }
     }, 100);
     return () => window.clearTimeout(focusMs);
-  }, [open, defaultAuthMethod, defaultKeyPath, initialUsername]);
+  }, [open, defaultAuthMethod, defaultKeyPath, defaultCertificatePath, initialUsername]);
 
   const authOptions = [
     { label: t('ssh.remote.password') || 'Password', value: 'password', icon: <Lock size={14} /> },
     { label: t('ssh.remote.privateKey') || 'Private Key', value: 'privateKey', icon: <Key size={14} /> },
+    { label: t('ssh.remote.sshAgent'), value: 'agent', icon: <Key size={14} /> },
+    {
+      label: t('ssh.remote.keyboardInteractive'),
+      value: 'keyboardInteractive',
+      icon: <Lock size={14} />,
+    },
   ];
 
   const canSubmit = (): boolean => {
     const u = username.trim();
     if (!u) return false;
     if (authMethod === 'password') return password.length > 0;
-    return keyPath.trim().length > 0;
+    if (authMethod === 'privateKey') return keyPath.trim().length > 0;
+    if (authMethod === 'keyboardInteractive') {
+      return password.length > 0 || verificationCode.length > 0;
+    }
+    return true;
   };
 
   const handleSubmit = () => {
@@ -86,11 +107,19 @@ export const SSHAuthPromptDialog: React.FC<SSHAuthPromptDialogProps> = ({
     let auth: SSHAuthMethod;
     if (authMethod === 'password') {
       auth = { type: 'Password', password };
-    } else {
+    } else if (authMethod === 'privateKey') {
       auth = {
         type: 'PrivateKey',
         keyPath: keyPath.trim(),
         passphrase: passphrase.trim() || undefined,
+        certificatePath: certificatePath.trim() || undefined,
+      };
+    } else if (authMethod === 'agent') {
+      auth = { type: 'Agent' };
+    } else {
+      auth = {
+        type: 'KeyboardInteractive',
+        responses: [password, verificationCode].filter(Boolean),
       };
     }
     onSubmit({ auth, username: u });
@@ -114,6 +143,14 @@ export const SSHAuthPromptDialog: React.FC<SSHAuthPromptDialogProps> = ({
     if (path) setKeyPath(path);
   }, [isConnecting, t]);
 
+  const handleBrowseCertificate = useCallback(async () => {
+    if (isConnecting) return;
+    const path = await pickSshCertificatePath({
+      title: t('ssh.remote.pickCertificateDialogTitle'),
+    });
+    if (path) setCertificatePath(path);
+  }, [isConnecting, t]);
+
   return (
     <Modal
       isOpen={open}
@@ -123,8 +160,8 @@ export const SSHAuthPromptDialog: React.FC<SSHAuthPromptDialogProps> = ({
       showCloseButton
       contentInset
     >
-      <div className="ssh-auth-prompt-dialog" onKeyDown={handleKeyDown}>
-        <div className="ssh-auth-prompt-dialog__description">
+      <div className="ssh-auth-prompt-dialog" onKeyDown={handleKeyDown} data-bf-component="ssh-remote" data-bf-part="authDialog">
+        <div className="ssh-auth-prompt-dialog__description" data-bf-component="ssh-remote" data-bf-part="authDescription">
           <div className="ssh-auth-prompt-dialog__description-icon">
             <Server size={16} />
           </div>
@@ -132,7 +169,7 @@ export const SSHAuthPromptDialog: React.FC<SSHAuthPromptDialogProps> = ({
         </div>
 
         {!lockUsername && (
-          <div className="ssh-auth-prompt-dialog__field">
+          <div className="ssh-auth-prompt-dialog__field" data-bf-component="ssh-remote" data-bf-part="authField">
             <Input
               label={t('ssh.remote.username')}
               value={username}
@@ -145,12 +182,14 @@ export const SSHAuthPromptDialog: React.FC<SSHAuthPromptDialogProps> = ({
           </div>
         )}
 
-        <div className="ssh-auth-prompt-dialog__field">
+        <div className="ssh-auth-prompt-dialog__field" data-bf-component="ssh-remote" data-bf-part="authField">
           <label className="ssh-auth-prompt-dialog__label">{t('ssh.remote.authMethod')}</label>
           <Select
             options={authOptions}
             value={authMethod}
-            onChange={(value) => setAuthMethod(value as 'password' | 'privateKey')}
+            onChange={(value) => setAuthMethod(
+              value as 'password' | 'privateKey' | 'agent' | 'keyboardInteractive',
+            )}
             size="medium"
             disabled={isConnecting}
           />
@@ -209,10 +248,62 @@ export const SSHAuthPromptDialog: React.FC<SSHAuthPromptDialogProps> = ({
                 disabled={isConnecting}
               />
             </div>
+            <div className="ssh-auth-prompt-dialog__field">
+              <Input
+                label={t('ssh.remote.certificatePath')}
+                value={certificatePath}
+                onChange={(e) => setCertificatePath(e.target.value)}
+                placeholder={t('ssh.remote.certificatePathOptional')}
+                suffix={
+                  <IconButton
+                    type="button"
+                    variant="ghost"
+                    size="small"
+                    className="ssh-auth-prompt-dialog__browse-key"
+                    tooltip={t('ssh.remote.browseCertificate')}
+                    aria-label={t('ssh.remote.browseCertificate')}
+                    disabled={isConnecting}
+                    onClick={() => void handleBrowseCertificate()}
+                  >
+                    <FolderOpen size={16} />
+                  </IconButton>
+                }
+                size="medium"
+                disabled={isConnecting}
+              />
+            </div>
           </>
         )}
 
-        <div className="ssh-auth-prompt-dialog__actions">
+        {authMethod === 'keyboardInteractive' && (
+          <>
+            <div className="ssh-auth-prompt-dialog__field">
+              <Input
+                ref={passwordRef}
+                label={t('ssh.remote.challengePassword')}
+                type="password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                prefix={<Lock size={16} />}
+                size="medium"
+                disabled={isConnecting}
+              />
+            </div>
+            <div className="ssh-auth-prompt-dialog__field">
+              <Input
+                label={t('ssh.remote.verificationCode')}
+                type="password"
+                value={verificationCode}
+                onChange={(e) => setVerificationCode(e.target.value)}
+                placeholder={t('ssh.remote.optional')}
+                size="medium"
+                disabled={isConnecting}
+              />
+            </div>
+          </>
+        )}
+
+        <div className="ssh-auth-prompt-dialog__actions" data-bf-component="ssh-remote" data-bf-part="authActions">
           <Button variant="secondary" size="small" onClick={onCancel} disabled={isConnecting}>
             {t('actions.cancel')}
           </Button>

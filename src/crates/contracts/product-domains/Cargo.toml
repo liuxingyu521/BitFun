@@ -14,6 +14,34 @@ name = "plugin_source_contracts"
 path = "tests/plugin_source_contracts.rs"
 required-features = ["plugin-source"]
 
+[[test]]
+name = "external_source_contracts"
+path = "tests/external_source_contracts.rs"
+required-features = ["external-sources"]
+
+[[test]]
+name = "external_hook_contribution_contracts"
+path = "tests/external_hook_contribution_contracts.rs"
+required-features = ["external-sources"]
+
+[[test]]
+name = "external_hook_catalog_contracts"
+path = "tests/external_hook_catalog_contracts.rs"
+required-features = ["external-sources"]
+
+[[test]]
+name = "workspace_reference_contracts"
+path = "tests/workspace_reference_contracts.rs"
+required-features = ["external-sources"]
+
+[[test]]
+name = "function_agent_contracts"
+required-features = ["function-agents"]
+
+[[test]]
+name = "miniapp_contracts"
+required-features = ["miniapp"]
+
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -21,17 +49,20 @@ dirs = { workspace = true, optional = true }
 log = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
 hex = { workspace = true, optional = true }
+hmac = { workspace = true, optional = true }
 which = { workspace = true, optional = true }
+url = { workspace = true, optional = true }
 
 [features]
 default = []
 plugin-source = ["hex", "sha2"]
-miniapp = ["dirs", "sha2", "which"]
+miniapp = ["dirs", "hex", "sha2", "which"]
 function-agents = ["log"]
-product-full = ["plugin-source", "miniapp", "function-agents"]
+external-sources = ["hex", "hmac", "sha2", "url"]
+product-full = ["plugin-source", "miniapp", "function-agents", "external-sources"]
 
 [dev-dependencies]
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt"] }
 
 [lints]
 workspace = true

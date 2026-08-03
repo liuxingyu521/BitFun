@@ -7,6 +7,8 @@ import {
   CircleDot,
   Clock3,
   Code2,
+  Copy,
+  ExternalLink,
   GitCommitHorizontal,
   GitPullRequest,
   GitPullRequestClosed,
@@ -19,6 +21,7 @@ import {
   ShieldCheck,
   Sparkles,
   Trash2,
+  Terminal,
   UserRound,
   XCircle,
 } from 'lucide-react';
@@ -40,6 +43,7 @@ import type { FlowToolItem, Session } from '@/flow_chat/types/flow-chat';
 import { findLatestCodeReviewResultState, summarizeCodeReviewResult } from '@/flow_chat/utils/reviewSessionSummary';
 import { parsePullRequestUrl, remoteMatchesPullRequestLink } from '@/shared/utils/pullRequestLinks';
 import { useContextStore } from '@/shared/stores/contextStore';
+import { quickActions } from '@/shared/services/ide-control';
 import type { PullRequestContext } from '@/shared/types/context';
 import {
   currentPullRequestReviewStatusText,
@@ -63,7 +67,7 @@ interface ReviewPlatformPanelProps {
   detailOnly?: boolean;
 }
 
-type DetailTab = 'overview' | 'ci' | 'changes' | 'commits' | 'reviews';
+type DetailTab = 'overview' | 'changes' | 'commits';
 type ListStateFilter = 'all' | 'open' | 'draft' | 'merged' | 'closed';
 type SnapshotCacheState = 'none' | 'cached' | 'refreshing';
 
@@ -158,8 +162,8 @@ function detailPageInfo(pagination: ReviewPlatformPagination, itemCount: number)
   };
 }
 
-function snapshotCacheKey(workspacePath: string, remoteId: string | null, page: number, perPage: number): string {
-  return `${workspacePath}::${remoteId ?? 'default'}::${page}::${perPage}`;
+function snapshotCacheKey(workspacePath: string, remoteId: string | null, page: number, perPage: number, mode: 'list' | 'context'): string {
+  return `${workspacePath}::${remoteId ?? 'default'}::${page}::${perPage}::${mode}`;
 }
 
 function detailCacheKey(workspacePath: string, remoteId: string, pullRequestId: string): string {
@@ -325,6 +329,8 @@ function authLabel(account: ReviewPlatformAccount | null): string {
 
 function authSourceLabel(source: ReviewPlatformAccount['authSource'] | undefined): string {
   switch (source) {
+    case 'gh_cli':
+      return 'GitHub CLI';
     case 'stored':
       return 'Saved token';
     case 'env':
@@ -337,6 +343,7 @@ function authSourceLabel(source: ReviewPlatformAccount['authSource'] | undefined
 }
 
 function authChallengeTitle(challenge: ReviewPlatformAuthChallenge): string {
+  if (challenge.platform === 'github') return 'GitHub CLI authentication required';
   switch (challenge.state) {
     case 'missing':
       return 'Token required';
@@ -653,6 +660,7 @@ export const ReviewPlatformPanel: React.FC<ReviewPlatformPanelProps> = ({
   const reviewLaunchInFlight = useRef(false);
   const [snapshot, setSnapshot] = useState<ReviewPlatformWorkspaceSnapshot>(emptySnapshot);
   const [selectedRemoteId, setSelectedRemoteId] = useState<string | null>(null);
+  const [listRemoteId, setListRemoteId] = useState<string | null>(null);
   const [selectedPrId, setSelectedPrId] = useState<string | null>(null);
   const [detail, setDetail] = useState<ReviewPlatformPullRequestDetail | null>(null);
   const [verifiedDetailKey, setVerifiedDetailKey] = useState<string | null>(null);
@@ -686,16 +694,30 @@ export const ReviewPlatformPanel: React.FC<ReviewPlatformPanelProps> = ({
   const [reviewLaunching, setReviewLaunching] = useState(false);
   const { confirmDeepReviewLaunch, deepReviewConsentDialog } = useDeepReviewConsent();
 
-  const repository = snapshot.repository;
   const account = snapshot.accounts[0] ?? null;
   const selectedRemote = useMemo(
     () => snapshot.remotes.find(remote => remote.id === selectedRemoteId) ?? snapshot.remotes[0] ?? null,
     [selectedRemoteId, snapshot.remotes],
   );
+  const repository = useMemo<ReviewPlatformRepositoryRef | null>(() => {
+    if (!snapshot.repository || !selectedRemote) return snapshot.repository;
+    return {
+      ...snapshot.repository,
+      providerId: selectedRemote.id,
+      platform: selectedRemote.platform,
+      host: selectedRemote.host,
+      owner: selectedRemote.owner,
+      name: selectedRemote.repositoryName,
+      projectPath: selectedRemote.projectPath,
+      webUrl: selectedRemote.webUrl,
+    };
+  }, [selectedRemote, snapshot.repository]);
   const authChallenge = snapshot.authChallenge ?? null;
   const selectedPrFromList = useMemo(
-    () => snapshot.pullRequests.find(pr => pr.id === selectedPrId) ?? null,
-    [selectedPrId, snapshot.pullRequests],
+    () => snapshot.pullRequests.find(pr => (
+      pr.id === selectedPrId && (!pr.providerId || pr.providerId === selectedRemoteId)
+    )) ?? null,
+    [selectedPrId, selectedRemoteId, snapshot.pullRequests],
   );
   const selectedPr = detail ?? selectedPrFromList;
   const hasDetail = detail !== null;
@@ -744,6 +766,7 @@ export const ReviewPlatformPanel: React.FC<ReviewPlatformPanelProps> = ({
     if (!workspacePath) {
       setSnapshot(emptySnapshot());
       setSelectedRemoteId(null);
+      setListRemoteId(null);
       setSelectedPrId(null);
       setDetail(null);
       setVerifiedDetailKey(null);
@@ -753,9 +776,15 @@ export const ReviewPlatformPanel: React.FC<ReviewPlatformPanelProps> = ({
       return;
     }
 
-    const requestedRemoteId = nextRemoteId !== undefined ? nextRemoteId : readRememberedRemote(workspacePath);
+    const requestedRemoteId = nextRemoteId !== undefined
+      ? nextRemoteId
+      : detailOnly
+        ? readRememberedRemote(workspacePath)
+        : null;
     const requestedPage = Math.max(1, options?.page ?? 1);
-    const requestedCacheKey = snapshotCacheKey(workspacePath, requestedRemoteId ?? null, requestedPage, PR_PAGE_SIZE);
+    const snapshotMode = detailOnly ? 'context' : 'list';
+    setListRemoteId(requestedRemoteId ?? null);
+    const requestedCacheKey = snapshotCacheKey(workspacePath, requestedRemoteId ?? null, requestedPage, PR_PAGE_SIZE, snapshotMode);
     const cached = snapshotCache.get(requestedCacheKey);
     const force = options?.force === true;
 
@@ -764,7 +793,7 @@ export const ReviewPlatformPanel: React.FC<ReviewPlatformPanelProps> = ({
       setSnapshot(cached.snapshot);
       setSelectedRemoteId(remoteId);
       setPageIndex(Math.max(0, (cached.snapshot.pagination.page || requestedPage) - 1));
-      setSelectedPrId(null);
+      setSelectedPrId(detailOnly ? null : cached.snapshot.pullRequests[0]?.id ?? null);
       setDetail(null);
       setVerifiedDetailKey(null);
       setDetailError(null);
@@ -784,21 +813,23 @@ export const ReviewPlatformPanel: React.FC<ReviewPlatformPanelProps> = ({
     setLoading(true);
     setError(null);
     try {
-      const next = await reviewPlatformAPI.getWorkspaceSnapshot(workspacePath, requestedRemoteId ?? null, requestedPage, PR_PAGE_SIZE);
+      const next = detailOnly
+        ? await reviewPlatformAPI.getWorkspaceContext(workspacePath, requestedRemoteId ?? null)
+        : await reviewPlatformAPI.getWorkspaceSnapshot(workspacePath, requestedRemoteId ?? null, requestedPage, PR_PAGE_SIZE);
       if (snapshotRequestSeq.current !== requestSeq) return;
       setSnapshot(next);
       const remoteId = next.selectedRemoteId ?? next.remotes[0]?.id ?? null;
       setSelectedRemoteId(remoteId);
       setPageIndex(Math.max(0, (next.pagination.page || requestedPage) - 1));
       rememberRemote(workspacePath, remoteId);
-      setSelectedPrId(null);
+      setSelectedPrId(detailOnly ? null : next.pullRequests[0]?.id ?? null);
       setDetail(null);
       setVerifiedDetailKey(null);
       setDetailError(null);
       const entry = { snapshot: next, fetchedAt: Date.now() };
       snapshotCache.set(requestedCacheKey, entry);
       if (remoteId) {
-        snapshotCache.set(snapshotCacheKey(workspacePath, remoteId, requestedPage, PR_PAGE_SIZE), entry);
+        snapshotCache.set(snapshotCacheKey(workspacePath, remoteId, requestedPage, PR_PAGE_SIZE, snapshotMode), entry);
       }
       setSnapshotCacheState('cached');
     } catch (err) {
@@ -814,7 +845,7 @@ export const ReviewPlatformPanel: React.FC<ReviewPlatformPanelProps> = ({
         setLoading(false);
       }
     }
-  }, [workspacePath]);
+  }, [detailOnly, workspacePath]);
 
   const loadDetail = useCallback(async (repo: ReviewPlatformRepositoryRef | null, remoteId: string, pullRequestId: string, options?: { force?: boolean }) => {
     const requestSeq = ++detailRequestSeq.current;
@@ -1015,6 +1046,7 @@ export const ReviewPlatformPanel: React.FC<ReviewPlatformPanelProps> = ({
   ]);
 
   useEffect(() => {
+    setActiveTab('overview');
     setExpandedFileKeys(new Set());
     setExpandedCiItemIds(new Set());
     setCiLogById({});
@@ -1037,14 +1069,15 @@ export const ReviewPlatformPanel: React.FC<ReviewPlatformPanelProps> = ({
 
   useEffect(() => {
     if (!hasDetail || !selectedRemoteId || !selectedPrId || (!repository && !workspacePath)) return;
-    if (activeTab === 'ci') {
-      void loadDetailSection(repository, selectedRemoteId, selectedPrId, 'ci', ciPageIndex, CI_PAGE_SIZE);
+    if (activeTab === 'overview') {
+      void (async () => {
+        await loadDetailSection(repository, selectedRemoteId, selectedPrId, 'ci', ciPageIndex, CI_PAGE_SIZE);
+        await loadDetailSection(repository, selectedRemoteId, selectedPrId, 'reviews', reviewPageIndex, REVIEW_PAGE_SIZE);
+      })();
     } else if (activeTab === 'changes') {
       void loadDetailSection(repository, selectedRemoteId, selectedPrId, 'files', changePageIndex, CHANGE_PAGE_SIZE);
     } else if (activeTab === 'commits') {
       void loadDetailSection(repository, selectedRemoteId, selectedPrId, 'commits', commitPageIndex, COMMIT_PAGE_SIZE);
-    } else if (activeTab === 'reviews') {
-      void loadDetailSection(repository, selectedRemoteId, selectedPrId, 'reviews', reviewPageIndex, REVIEW_PAGE_SIZE);
     }
   }, [
     activeTab,
@@ -1210,7 +1243,8 @@ export const ReviewPlatformPanel: React.FC<ReviewPlatformPanelProps> = ({
   }, [snapshot.pullRequests]);
 
   const headerLabel = selectedRemote ? remoteLabel(selectedRemote) : repository ? repository.projectPath : 'No repository';
-  const panelTitle = detailOnly ? 'Pull Request' : 'Pull Requests';
+  const isGithubUserList = !detailOnly && selectedRemote?.platform === 'github';
+  const panelTitle = detailOnly ? 'Pull Request' : isGithubUserList ? 'My Open Pull Requests' : 'Pull Requests';
 
   const handleRemoteChange = useCallback((value: string | number | (string | number)[]) => {
     const remoteId = Array.isArray(value) ? String(value[0] ?? '') : String(value);
@@ -1218,6 +1252,7 @@ export const ReviewPlatformPanel: React.FC<ReviewPlatformPanelProps> = ({
     setSelectedPrId(null);
     setDetail(null);
     setDetailError(null);
+    setStateFilter('all');
     setPageIndex(0);
     rememberRemote(workspacePath, remoteId || null);
     void loadSnapshot(remoteId || null, { page: 1 });
@@ -1229,8 +1264,8 @@ export const ReviewPlatformPanel: React.FC<ReviewPlatformPanelProps> = ({
     setDetail(null);
     setDetailError(null);
     setPageIndex(nextPage - 1);
-    void loadSnapshot(selectedRemoteId, { page: nextPage });
-  }, [loadSnapshot, selectedRemoteId]);
+    void loadSnapshot(listRemoteId, { page: nextPage });
+  }, [listRemoteId, loadSnapshot]);
 
   const toggleFileExpanded = useCallback((key: string) => {
     setExpandedFileKeys(prev => {
@@ -1252,7 +1287,7 @@ export const ReviewPlatformPanel: React.FC<ReviewPlatformPanelProps> = ({
   ) => {
     if (itemCount <= 0 || (page.totalPages <= 1 && !page.hasNext && page.pageIndex === 0)) return null;
     return (
-      <div className="review-platform__pagination review-platform__detail-pagination">
+      <div data-bf-component="review-platform" data-bf-part="pagination" className="review-platform__pagination review-platform__detail-pagination">
         <IconButton
           className="review-platform__icon-button"
           size="xs"
@@ -1281,7 +1316,7 @@ export const ReviewPlatformPanel: React.FC<ReviewPlatformPanelProps> = ({
   }, []);
 
   const renderDetailLoading = useCallback((message: string, refreshing = false) => (
-    <div className={`review-platform__thread-loading${refreshing ? ' review-platform__thread-loading--refreshing' : ''}`} aria-live="polite">
+    <div data-bf-component="review-platform" data-bf-part="loadingState" className={`review-platform__thread-loading${refreshing ? ' review-platform__thread-loading--refreshing' : ''}`} aria-live="polite">
       <Loader2 size={14} />
       <span>{message}</span>
     </div>
@@ -1374,14 +1409,6 @@ export const ReviewPlatformPanel: React.FC<ReviewPlatformPanelProps> = ({
       void loadCiLog(item);
     }
   }, [expandedCiItemIds, loadCiLog, selectedRemote]);
-
-  const handleOpenParentChat = useCallback(async () => {
-    if (!parentSession) {
-      notificationService.warning('Open or create a chat session before linking PR context.', { duration: 3500 });
-      return;
-    }
-    await openMainSession(parentSession.sessionId);
-  }, [parentSession]);
 
   const addPullRequestContextToChat = useCallback(async (input: {
     label: string;
@@ -1612,8 +1639,8 @@ export const ReviewPlatformPanel: React.FC<ReviewPlatformPanelProps> = ({
     snapshotCache.clear();
     detailCache.clear();
     detailPageCache.clear();
-    void loadSnapshot(remoteId, { force: true, page: currentPageIndex + 1 });
-  }, [currentPageIndex, loadSnapshot]);
+    void loadSnapshot(detailOnly ? remoteId : listRemoteId, { force: true, page: currentPageIndex + 1 });
+  }, [currentPageIndex, detailOnly, listRemoteId, loadSnapshot]);
 
   const handleOpenAuthModal = useCallback(() => {
     setAuthToken('');
@@ -1622,7 +1649,7 @@ export const ReviewPlatformPanel: React.FC<ReviewPlatformPanelProps> = ({
   }, []);
 
   const handleSaveAuthToken = useCallback(async () => {
-    if (!selectedRemote || selectedRemote.platform === 'unknown') return;
+    if (!selectedRemote || selectedRemote.platform === 'unknown' || selectedRemote.platform === 'github') return;
     const token = authToken.trim();
     if (!token) {
       setAuthError('Token is required.');
@@ -1649,6 +1676,40 @@ export const ReviewPlatformPanel: React.FC<ReviewPlatformPanelProps> = ({
     }
   }, [authToken, refreshAuthSnapshot, selectedRemote]);
 
+  const handleOpenGithubAuthTerminal = useCallback(async () => {
+    if (!selectedRemote || selectedRemote.platform !== 'github') return;
+    const command = `gh auth login --hostname ${selectedRemote.host}`;
+    setAuthSaving(true);
+    setAuthError(null);
+    try {
+      await systemAPI.setClipboard(command);
+      setAuthModalOpen(false);
+      quickActions.openTerminal(undefined, workspacePath);
+      notificationService.success('GitHub CLI login command copied. Paste it in the terminal to continue.', {
+        duration: 3500,
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Failed to open GitHub CLI authentication.';
+      setAuthError(message);
+      log.error('Failed to prepare GitHub CLI authentication', { error: err, host: selectedRemote.host });
+    } finally {
+      setAuthSaving(false);
+    }
+  }, [selectedRemote, workspacePath]);
+
+  const handleCopyGithubAuthCommand = useCallback(async () => {
+    if (!selectedRemote || selectedRemote.platform !== 'github') return;
+    setAuthError(null);
+    try {
+      await systemAPI.setClipboard(`gh auth login --hostname ${selectedRemote.host}`);
+      notificationService.success('GitHub CLI login command copied.', { duration: 2500 });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Failed to copy GitHub CLI login command.';
+      setAuthError(message);
+      log.error('Failed to copy GitHub CLI authentication command', { error: err, host: selectedRemote.host });
+    }
+  }, [selectedRemote]);
+
   const handleClearAuthToken = useCallback(async () => {
     if (!selectedRemote || selectedRemote.platform === 'unknown') return;
     setAuthSaving(true);
@@ -1672,20 +1733,20 @@ export const ReviewPlatformPanel: React.FC<ReviewPlatformPanelProps> = ({
   const renderAuthGate = useCallback((mode: 'inline' | 'detail' = 'inline') => {
     if (!authChallenge || !selectedRemote || selectedRemote.platform === 'unknown') return null;
     return (
-      <div className={`review-platform__auth-gate review-platform__auth-gate--${mode}`}>
+      <div data-bf-component="review-platform" data-bf-part="authGate" className={`review-platform__auth-gate review-platform__auth-gate--${mode}`}>
         <div className="review-platform__auth-gate-icon">
           <KeyRound size={18} />
         </div>
-        <div className="review-platform__auth-gate-copy">
+        <div className="review-platform__auth-gate-copy" data-bf-component="review-platform" data-bf-part="authCopy">
           <strong>{authChallengeTitle(authChallenge)}</strong>
           <span>{authChallenge.message}</span>
           <span>{authChallenge.host} · {authChallenge.projectPath}</span>
-          <span>Required scopes: {authChallengeScopes(authChallenge)}</span>
+          <span>{selectedRemote.platform === 'github' ? 'CLI authorization' : 'Required scopes'}: {authChallengeScopes(authChallenge)}</span>
         </div>
-        <div className="review-platform__auth-gate-actions">
+        <div className="review-platform__auth-gate-actions" data-bf-component="review-platform" data-bf-part="authActions">
           <Button className="review-platform__panel-button" size="small" variant="primary" onClick={handleOpenAuthModal} disabled={authSaving}>
             <KeyRound size={13} />
-            {authChallenge.state === 'missing' ? 'Add token' : 'Update token'}
+            {selectedRemote.platform === 'github' ? 'Authenticate' : authChallenge.state === 'missing' ? 'Add token' : 'Update token'}
           </Button>
           <Button className="review-platform__panel-button" size="small" variant="secondary" onClick={() => refreshAuthSnapshot(selectedRemote.id)} disabled={authSaving || loading}>
             <RefreshCw size={13} />
@@ -1698,8 +1759,12 @@ export const ReviewPlatformPanel: React.FC<ReviewPlatformPanelProps> = ({
 
   const handleRetryDetail = useCallback(() => {
     if ((!repository && !workspacePath) || !selectedRemoteId || !selectedPrId) return;
-    if (activeTab === 'ci') {
-      void loadDetailSection(repository, selectedRemoteId, selectedPrId, 'ci', ciPageIndex, CI_PAGE_SIZE, { force: true });
+    if (activeTab === 'overview') {
+      void (async () => {
+        await loadDetail(repository, selectedRemoteId, selectedPrId, { force: true });
+        await loadDetailSection(repository, selectedRemoteId, selectedPrId, 'ci', ciPageIndex, CI_PAGE_SIZE, { force: true });
+        await loadDetailSection(repository, selectedRemoteId, selectedPrId, 'reviews', reviewPageIndex, REVIEW_PAGE_SIZE, { force: true });
+      })();
       return;
     }
     if (activeTab === 'changes') {
@@ -1708,10 +1773,6 @@ export const ReviewPlatformPanel: React.FC<ReviewPlatformPanelProps> = ({
     }
     if (activeTab === 'commits') {
       void loadDetailSection(repository, selectedRemoteId, selectedPrId, 'commits', commitPageIndex, COMMIT_PAGE_SIZE, { force: true });
-      return;
-    }
-    if (activeTab === 'reviews') {
-      void loadDetailSection(repository, selectedRemoteId, selectedPrId, 'reviews', reviewPageIndex, REVIEW_PAGE_SIZE, { force: true });
       return;
     }
     void loadDetail(repository, selectedRemoteId, selectedPrId, { force: true });
@@ -1732,10 +1793,15 @@ export const ReviewPlatformPanel: React.FC<ReviewPlatformPanelProps> = ({
   const handleRefreshDetail = useCallback(async () => {
     if ((!repository && !workspacePath) || !selectedRemoteId || !selectedPrId) return;
     await loadDetail(repository, selectedRemoteId, selectedPrId, { force: true });
-    if (activeTab === 'ci') {
+    if (activeTab === 'overview') {
       await loadDetailSection(repository, selectedRemoteId, selectedPrId, 'ci', ciPageIndex, CI_PAGE_SIZE, { force: true });
+      await loadDetailSection(repository, selectedRemoteId, selectedPrId, 'reviews', reviewPageIndex, REVIEW_PAGE_SIZE, { force: true });
+    } else if (activeTab === 'changes') {
+      await loadDetailSection(repository, selectedRemoteId, selectedPrId, 'files', changePageIndex, CHANGE_PAGE_SIZE, { force: true });
+    } else if (activeTab === 'commits') {
+      await loadDetailSection(repository, selectedRemoteId, selectedPrId, 'commits', commitPageIndex, COMMIT_PAGE_SIZE, { force: true });
     }
-  }, [activeTab, ciPageIndex, loadDetail, loadDetailSection, repository, selectedPrId, selectedRemoteId, workspacePath]);
+  }, [activeTab, changePageIndex, ciPageIndex, commitPageIndex, loadDetail, loadDetailSection, repository, reviewPageIndex, selectedPrId, selectedRemoteId, workspacePath]);
 
   const remoteStatus = selectedRemote
     ? `${providerLabel(selectedRemote)} · ${authLabel(account)}`
@@ -1747,7 +1813,11 @@ export const ReviewPlatformPanel: React.FC<ReviewPlatformPanelProps> = ({
   const emptyStateMessage = snapshot.message
     || account?.message
     || selectedRemote?.message
-    || (snapshot.remotes.length ? 'No pull requests match the current filter.' : 'No supported remotes were detected.');
+    || (snapshot.remotes.length
+      ? isGithubUserList && !query.trim()
+        ? 'No open pull requests authored by the current GitHub CLI account.'
+        : 'No pull requests match the current filter.'
+      : 'No supported remotes were detected.');
   const loadingLabel = loading
     ? snapshotCacheState === 'refreshing'
       ? 'Refreshing cached pull requests...'
@@ -1755,7 +1825,16 @@ export const ReviewPlatformPanel: React.FC<ReviewPlatformPanelProps> = ({
     : snapshotCacheState === 'cached'
       ? 'Cached pull requests'
       : null;
-  const parentSessionLabel = parentSession ? getSessionTitle(parentSession, 'Current chat') : 'No chat session linked';
+  const checksStatusText = !displayPr || displayPr.checks.total === 0
+    ? 'No checks'
+    : displayPr.checks.failed > 0
+      ? `${displayPr.checks.failed} failed`
+      : displayPr.checks.pending > 0
+        ? `${displayPr.checks.pending} pending`
+        : 'All checks passed';
+  const commentsText = reviewItemCount > 0
+    ? `${reviewItemCount} comment${reviewItemCount === 1 ? '' : 's'}`
+    : 'No comments';
   const reviewStatusText = latestCurrentReview
     ? currentPullRequestReviewStatusText(latestCurrentReview)
     : latestStaleReview
@@ -1779,18 +1858,18 @@ export const ReviewPlatformPanel: React.FC<ReviewPlatformPanelProps> = ({
   };
 
   return (
-    <div className={`review-platform${detailOnly ? ' review-platform--detail-only' : ''}`}>
+    <div data-bf-component="review-platform" data-bf-part="root" data-bf-layout={detailOnly ? 'detail' : 'full'} className={`review-platform${detailOnly ? ' review-platform--detail-only' : ''}`}>
       {!detailOnly && (
-        <div className="review-platform__topbar">
-          <div className="review-platform__brand">
+        <div className="review-platform__topbar" data-bf-component="review-platform" data-bf-part="chrome">
+          <div className="review-platform__brand" data-bf-component="review-platform" data-bf-part="brand">
             <span className="review-platform__brand-icon"><GitPullRequest size={17} /></span>
             <div className="review-platform__brand-copy">
-              <span className="review-platform__title">{panelTitle}</span>
-              <span className="review-platform__subtitle">{headerLabel}</span>
+              <span className="review-platform__title" data-bf-component="review-platform" data-bf-part="title">{panelTitle}</span>
+              <span className="review-platform__subtitle" data-bf-component="review-platform" data-bf-part="subtitle">{headerLabel}</span>
             </div>
           </div>
 
-          <div className="review-platform__topbar-actions">
+          <div className="review-platform__topbar-actions" data-bf-component="review-platform" data-bf-part="actions">
             <div className="review-platform__remote-select">
               <Select
                 size="small"
@@ -1814,7 +1893,7 @@ export const ReviewPlatformPanel: React.FC<ReviewPlatformPanelProps> = ({
               className="review-platform__icon-button"
               size="xs"
               variant="ghost"
-              tooltip={account?.authSource === 'stored' ? 'Update token' : 'Add token'}
+              tooltip={selectedRemote?.platform === 'github' ? 'GitHub CLI authentication' : account?.authSource === 'stored' ? 'Update token' : 'Add token'}
               disabled={!selectedRemote || selectedRemote.platform === 'unknown' || loading || authSaving}
               onClick={handleOpenAuthModal}
             >
@@ -1837,7 +1916,7 @@ export const ReviewPlatformPanel: React.FC<ReviewPlatformPanelProps> = ({
               size="xs"
               variant="ghost"
               tooltip="Refresh"
-              onClick={() => void loadSnapshot(selectedRemoteId, { force: true, page: currentPageIndex + 1 })}
+              onClick={() => void loadSnapshot(listRemoteId, { force: true, page: currentPageIndex + 1 })}
               isLoading={loading}
             >
               <RefreshCw size={14} />
@@ -1847,10 +1926,10 @@ export const ReviewPlatformPanel: React.FC<ReviewPlatformPanelProps> = ({
       )}
 
       {!detailOnly && (
-      <div className="review-platform__subbar">
-        <div className="review-platform__status-line">
+      <div className="review-platform__subbar" data-bf-component="review-platform" data-bf-part="statusBar">
+        <div className="review-platform__status-line" data-bf-component="review-platform" data-bf-part="statusLine">
           <span><CircleDot size={12} /> {summary.open} open on page</span>
-          <span><GitPullRequestClosed size={12} /> {summary.merged} merged on page</span>
+          {!isGithubUserList && <span><GitPullRequestClosed size={12} /> {summary.merged} merged on page</span>}
           <span><Sparkles size={12} /> {summary.reviewRequired} review on page</span>
           <span><Link2 size={12} /> {remoteStatus}</span>
           {loadingLabel && (
@@ -1865,10 +1944,10 @@ export const ReviewPlatformPanel: React.FC<ReviewPlatformPanelProps> = ({
 
       {authChallenge && !detailOnly && renderAuthGate('inline')}
 
-      <div className="review-platform__body">
+      <div className="review-platform__body" data-bf-component="review-platform" data-bf-part="body">
         {!detailOnly && (
-        <aside className="review-platform__list" aria-label="Pull request list">
-          <div className="review-platform__list-toolbar">
+        <aside className="review-platform__list" data-bf-component="review-platform" data-bf-part="listPane" aria-label="Pull request list">
+          <div className="review-platform__list-toolbar" data-bf-component="review-platform" data-bf-part="listToolbar">
             <Input
               inputSize="small"
               value={query}
@@ -1877,59 +1956,71 @@ export const ReviewPlatformPanel: React.FC<ReviewPlatformPanelProps> = ({
               prefix={<Search size={14} />}
               suffix={query ? <IconButton className="review-platform__icon-button" size="xs" variant="ghost" onClick={() => setQuery('')}><XCircle size={14} /></IconButton> : undefined}
             />
-            <div className="review-platform__state-filters">
-              {(['all', 'open', 'draft', 'merged', 'closed'] as ListStateFilter[]).map(state => (
-                <button
-                  key={state}
-                  type="button"
-                  className={`review-platform__state-chip${stateFilter === state ? ' is-active' : ''}`}
-                  onClick={() => setStateFilter(state)}
-                >
-                  {state === 'all' ? 'All' : stateLabel(state)}
-                </button>
-              ))}
-            </div>
+            {!isGithubUserList && (
+              <div className="review-platform__state-filters" data-bf-component="review-platform" data-bf-part="filters">
+                {(['all', 'open', 'draft', 'merged', 'closed'] as ListStateFilter[]).map(state => (
+                  <button
+                    key={state}
+                    type="button"
+                    className={`review-platform__state-chip${stateFilter === state ? ' is-active' : ''}`}
+                    onClick={() => setStateFilter(state)}
+                  >
+                    {state === 'all' ? 'All' : stateLabel(state)}
+                  </button>
+                ))}
+              </div>
+            )}
           </div>
 
-          <div className="review-platform__list-scroll">
+          <div className="review-platform__list-scroll" data-bf-component="review-platform" data-bf-part="listScroll">
             {loading && (
-              <div className="review-platform__empty-state">Loading pull requests...</div>
+              <div className="review-platform__empty-state" data-bf-component="review-platform" data-bf-part="emptyState">Loading pull requests...</div>
             )}
             {error && (
-              <div className="review-platform__error-state">
+              <div className="review-platform__error-state" data-bf-component="review-platform" data-bf-part="errorState">
                 <XCircle size={16} />
                 <span>{error}</span>
-                <Button className="review-platform__panel-button" size="small" variant="secondary" onClick={() => void loadSnapshot(selectedRemoteId, { force: true, page: currentPageIndex + 1 })}>
+                <Button className="review-platform__panel-button" size="small" variant="secondary" onClick={() => void loadSnapshot(listRemoteId, { force: true, page: currentPageIndex + 1 })}>
                   Retry
                 </Button>
               </div>
             )}
             {!loading && !error && !authChallenge && !visiblePullRequests.length && (
-              <div className="review-platform__empty-state">
+              <div className="review-platform__empty-state" data-bf-component="review-platform" data-bf-part="emptyState">
                 <GitPullRequest size={18} />
                 <span>{emptyStateMessage}</span>
               </div>
             )}
             {!loading && !error && visiblePullRequests.map(pr => (
               (() => {
+                const pullRequestRemote = pr.providerId
+                  ? snapshot.remotes.find(remote => remote.id === pr.providerId)
+                  : selectedRemote;
                 return (
-                  <button
-                    key={pr.id}
+                  <button data-bf-component="review-platform" data-bf-part="listItem"
+                    data-bf-state={selectedPrId === pr.id && (!pr.providerId || pr.providerId === selectedRemoteId) ? 'selected' : ''}
+                    key={`${pr.providerId ?? selectedRemoteId ?? 'remote'}:${pr.id}`}
                     type="button"
-                    className={`review-platform__pr-row${selectedPrId === pr.id ? ' is-selected' : ''}`}
-                    onClick={() => setSelectedPrId(pr.id)}
+                    className={`review-platform__pr-row${selectedPrId === pr.id && (!pr.providerId || pr.providerId === selectedRemoteId) ? ' is-selected' : ''}`}
+                    onClick={() => {
+                      if (pr.providerId && pr.providerId !== selectedRemoteId) {
+                        setSelectedRemoteId(pr.providerId);
+                        rememberRemote(workspacePath, pr.providerId);
+                      }
+                      setSelectedPrId(pr.id);
+                    }}
                   >
                     <span className="review-platform__pr-icon">{getPrIcon(pr)}</span>
-                    <span className="review-platform__pr-main">
-                      <span className="review-platform__pr-title">{pr.title}</span>
-                      <span className="review-platform__pr-meta">
-                        #{pr.number} · {pr.sourceBranch} → {pr.targetBranch}
+                    <span className="review-platform__pr-main" data-bf-component="review-platform" data-bf-part="listItemMain">
+                      <span className="review-platform__pr-title" data-bf-component="review-platform" data-bf-part="listItemTitle">{pr.title}</span>
+                      <span className="review-platform__pr-meta" data-bf-component="review-platform" data-bf-part="listItemMeta">
+                        {pullRequestRemote?.projectPath ? `${pullRequestRemote.projectPath} · ` : ''}#{pr.number} · {pr.sourceBranch} → {pr.targetBranch}
                       </span>
                       <span className="review-platform__pr-meta review-platform__pr-meta--secondary">
                         {pr.author} · {formatRelativeTime(pr.updatedAt)}
                       </span>
                     </span>
-                    <span className="review-platform__pr-stats">
+                    <span className="review-platform__pr-stats" data-bf-component="review-platform" data-bf-part="listItemStats">
                       <span className={`review-platform__decision review-platform__decision--${pr.reviewDecision}`}>
                         {decisionLabel(pr.reviewDecision)}
                       </span>
@@ -1945,7 +2036,7 @@ export const ReviewPlatformPanel: React.FC<ReviewPlatformPanelProps> = ({
             ))}
           </div>
           {!loading && !error && (totalPages > 1 || pagination.hasNext) && (
-            <div className="review-platform__pagination">
+            <div className="review-platform__pagination" data-bf-component="review-platform" data-bf-part="pagination">
               <IconButton
                 className="review-platform__icon-button"
                 size="xs"
@@ -1974,7 +2065,7 @@ export const ReviewPlatformPanel: React.FC<ReviewPlatformPanelProps> = ({
         </aside>
         )}
 
-        <main className="review-platform__detail">
+        <main className="review-platform__detail" data-bf-component="review-platform" data-bf-part="detailPane">
           {!selectedPr && detailOnly && (loading || detailLoading) && (
             <div className="review-platform__detail-empty">
               <Loader2 size={20} className="review-platform__loading-inline review-platform__loading-inline--icon" />
@@ -1999,7 +2090,38 @@ export const ReviewPlatformPanel: React.FC<ReviewPlatformPanelProps> = ({
                 {selectedRemote && selectedRemote.platform !== 'unknown' && (
                   <Button className="review-platform__panel-button" size="small" variant="secondary" onClick={handleOpenAuthModal} disabled={authSaving}>
                     <KeyRound size={13} />
-                    {account?.authSource === 'stored' ? 'Update token' : 'Add token'}
+                    {selectedRemote.platform === 'github' ? 'Authenticate' : account?.authSource === 'stored' ? 'Update token' : 'Add token'}
+                  </Button>
+                )}
+              </div>
+            </div>
+          )}
+
+          {!selectedPr && detailOnly && !loading && !detailLoading && !authChallenge && !detailError && !error && (
+            <div className="review-platform__detail-empty">
+              <GitPullRequest size={24} />
+              <span>
+                {snapshot.message
+                  || 'This pull request could not be resolved from the remotes of the current workspace.'}
+              </span>
+              <div className="review-platform__detail-empty-actions">
+                <Button
+                  className="review-platform__panel-button"
+                  size="small"
+                  variant="secondary"
+                  onClick={() => void loadSnapshot(undefined, { force: true })}
+                >
+                  Retry
+                </Button>
+                {initialPullRequestUrl && (
+                  <Button
+                    className="review-platform__panel-button"
+                    size="small"
+                    variant="secondary"
+                    onClick={handleOpenExternal}
+                  >
+                    <ExternalLink size={13} />
+                    Open in browser
                   </Button>
                 )}
               </div>
@@ -2015,37 +2137,21 @@ export const ReviewPlatformPanel: React.FC<ReviewPlatformPanelProps> = ({
 
           {selectedPr && (
             <>
-              <div className="review-platform__detail-header">
-                <div className="review-platform__detail-title-block">
+              <div className="review-platform__detail-header" data-bf-component="review-platform" data-bf-part="detailHeader">
+                <div className="review-platform__detail-title-block" data-bf-component="review-platform" data-bf-part="detailTitle">
                   <div className="review-platform__detail-title-row">
                     {getPrIcon(selectedPr)}
                     <h3>{selectedPr.title}</h3>
+                    <span className={`review-platform__detail-state review-platform__detail-state--${displayPr?.state ?? selectedPr.state}`} data-bf-component="review-platform" data-bf-part="detailState">
+                      {stateLabel(displayPr?.state ?? selectedPr.state)}
+                    </span>
                   </div>
-                  <div className="review-platform__detail-meta">
+                  <div className="review-platform__detail-meta" data-bf-component="review-platform" data-bf-part="detailMeta">
                     <span>#{selectedPr.number}</span>
-                    <span><UserRound size={12} /> {selectedPr.author}</span>
                     <span><Clock3 size={12} /> {formatAbsoluteTime(selectedPr.updatedAt) || formatRelativeTime(selectedPr.updatedAt)}</span>
-                    <span><Code2 size={12} /> {selectedPr.sourceBranch} → {selectedPr.targetBranch}</span>
                   </div>
                 </div>
-                <div className="review-platform__detail-actions">
-                  <IconButton
-                    className="review-platform__icon-button"
-                    size="xs"
-                    variant="ghost"
-                    tooltip="Refresh pull request"
-                    disabled={detailLoading}
-                    onClick={handleRefreshDetail}
-                    isLoading={detailLoading}
-                  >
-                    <RefreshCw size={14} />
-                  </IconButton>
-                  {detailOnly && selectedRemote && selectedRemote.platform !== 'unknown' && (
-                    <Button className="review-platform__panel-button" size="small" variant="secondary" onClick={handleOpenAuthModal} disabled={authSaving}>
-                      <KeyRound size={13} />
-                      {account?.authSource === 'stored' ? 'Update token' : 'Token'}
-                    </Button>
-                  )}
+                <div className="review-platform__detail-actions" data-bf-component="review-platform" data-bf-part="detailActions">
                   <Tooltip content={!parentSession ? 'Open or create a chat first' : 'Start Review'}>
                     <span>
                       <Button
@@ -2068,61 +2174,77 @@ export const ReviewPlatformPanel: React.FC<ReviewPlatformPanelProps> = ({
                       </Button>
                     </span>
                   </Tooltip>
-                  <Button className="review-platform__panel-button" size="small" variant="secondary" onClick={handleFillPrContext} disabled={!selectedPr}>
-                    <MessageSquareText size={13} />
-                    Add context
-                  </Button>
                   <Button className="review-platform__panel-button" size="small" variant="secondary" onClick={handleOpenExternal} disabled={!selectedPr.webUrl && !initialPullRequestUrl}>
                     <Link2 size={13} />
                     Open
                   </Button>
-                </div>
-              </div>
-
-              <div className="review-platform__summary-strip">
-                <div className="review-platform__summary-card">
-                  <span className="review-platform__summary-label">Files</span>
-                  <strong>{displayPr?.changedFiles ?? selectedPr.changedFiles}</strong>
-                </div>
-                <div className="review-platform__summary-card">
-                  <span className="review-platform__summary-label">Additions</span>
-                  <strong className="review-platform__additions">+{displayPr?.additions ?? selectedPr.additions}</strong>
-                </div>
-                <div className="review-platform__summary-card">
-                  <span className="review-platform__summary-label">Deletions</span>
-                  <strong className="review-platform__deletions">-{displayPr?.deletions ?? selectedPr.deletions}</strong>
-                </div>
-                <div className="review-platform__summary-card">
-                  <span className="review-platform__summary-label">Checks</span>
-                  <strong>{checksText}</strong>
-                </div>
-              </div>
-
-              <section className="review-platform__agent-link-panel" aria-label="Conversation and review agents">
-                <div className="review-platform__agent-link-main">
-                  <span className="review-platform__agent-link-label">Conversation link</span>
-                  <strong>{parentSessionLabel}</strong>
-                  <span>
-                    {reviewStatusText}
-                  </span>
-                </div>
-                <div className="review-platform__agent-link-actions">
-                  <Button className="review-platform__panel-button" size="small" variant="ghost" onClick={handleOpenParentChat} disabled={!parentSession}>
-                    <MessageSquareText size={13} />
-                    Open chat
-                  </Button>
-                  <Button className="review-platform__panel-button" size="small" variant="ghost" onClick={handleFillPrContext} disabled={!parentSession || !selectedPr}>
-                    <Code2 size={13} />
-                    Insert context
-                  </Button>
-                  {(latestCurrentReview || latestStaleReview || latestUnknownReview) && (
-                    <Button className="review-platform__panel-button" size="small" variant="ghost" onClick={handleOpenLatestReview}>
-                      <Sparkles size={13} />
-                      Open Review
-                    </Button>
+                  {detailOnly && selectedRemote && selectedRemote.platform !== 'unknown' && (
+                    <IconButton
+                      className="review-platform__icon-button"
+                      size="xs"
+                      variant="ghost"
+                      tooltip={selectedRemote.platform === 'github' ? 'GitHub CLI authentication' : account?.authSource === 'stored' ? 'Update token' : 'Add token'}
+                      onClick={handleOpenAuthModal}
+                      disabled={authSaving}
+                    >
+                      <KeyRound size={14} />
+                    </IconButton>
                   )}
+                  <IconButton
+                    className="review-platform__icon-button"
+                    size="xs"
+                    variant="ghost"
+                    tooltip="Refresh pull request"
+                    disabled={detailLoading}
+                    onClick={handleRefreshDetail}
+                    isLoading={detailLoading}
+                  >
+                    <RefreshCw size={14} />
+                  </IconButton>
                 </div>
-              </section>
+              </div>
+
+              <div className="review-platform__fact-list" data-bf-component="review-platform" data-bf-part="facts">
+                <div className="review-platform__fact-row">
+                  <span className="review-platform__fact-label"><Code2 size={14} /> Branches</span>
+                  <div className="review-platform__fact-value review-platform__fact-value--branch">
+                    <strong>{displayPr?.sourceBranch ?? selectedPr.sourceBranch}</strong>
+                    <ChevronRight size={13} />
+                    <strong>{displayPr?.targetBranch ?? selectedPr.targetBranch}</strong>
+                    <span>{displayPr?.changedFiles ?? selectedPr.changedFiles} files</span>
+                    <span className="review-platform__additions">+{displayPr?.additions ?? selectedPr.additions}</span>
+                    <span className="review-platform__deletions">-{displayPr?.deletions ?? selectedPr.deletions}</span>
+                  </div>
+                </div>
+                <div className="review-platform__fact-row">
+                  <span className="review-platform__fact-label"><UserRound size={14} /> Author</span>
+                  <div className="review-platform__fact-value">
+                    <strong>{displayPr?.author ?? selectedPr.author}</strong>
+                  </div>
+                </div>
+                <div className="review-platform__fact-row">
+                  <span className="review-platform__fact-label"><MessageSquareText size={14} /> Comments</span>
+                  <div className="review-platform__fact-value">{commentsText}</div>
+                </div>
+                <div className="review-platform__fact-row">
+                  <span className="review-platform__fact-label"><CheckCircle2 size={14} /> Checks</span>
+                  <div className="review-platform__fact-value">
+                    <strong>{checksStatusText}</strong>
+                    {displayPr && displayPr.checks.total > 0 && <span>{checksText}</span>}
+                  </div>
+                </div>
+                <div className="review-platform__fact-row">
+                  <span className="review-platform__fact-label"><Sparkles size={14} /> BitFun Review</span>
+                  <div className="review-platform__fact-value review-platform__fact-value--review">
+                    <span>{reviewStatusText}</span>
+                    {(latestCurrentReview || latestStaleReview || latestUnknownReview) && (
+                      <Button className="review-platform__panel-button" size="small" variant="ghost" onClick={handleOpenLatestReview}>
+                        Open Review
+                      </Button>
+                    )}
+                  </div>
+                </div>
+              </div>
 
               <Tabs
                 activeKey={activeTab}
@@ -2132,10 +2254,10 @@ export const ReviewPlatformPanel: React.FC<ReviewPlatformPanelProps> = ({
                 className="review-platform__tabs"
               >
                 <TabPane tabKey="overview" label="Overview">
-                  <section className="review-platform__tab-content">
-                    <div className="review-platform__body-markdown">
-                      <div className="review-platform__card-heading">
-                        <span>Overview</span>
+                  <div className="review-platform__tab-content review-platform__overview-scroll" data-bf-component="review-platform" data-bf-part="tabContent">
+                    <section className="review-platform__detail-section" data-bf-component="review-platform" data-bf-part="section">
+                      <div className="review-platform__detail-section-heading" data-bf-component="review-platform" data-bf-part="sectionHeading">
+                        <span>Description</span>
                         <Button className="review-platform__panel-button" size="small" variant="ghost" onClick={handleFillPrContext} disabled={!selectedPr}>
                           <MessageSquareText size={13} />
                           Add to chat
@@ -2149,174 +2271,172 @@ export const ReviewPlatformPanel: React.FC<ReviewPlatformPanelProps> = ({
                             Retry
                           </Button>
                         </div>
-                      ) : detail?.body ? (
-                        <MarkdownRenderer content={detail.body} basePath={workspacePath} />
+                      ) : detail ? (
+                        <div className="review-platform__body-markdown review-platform__body-markdown--plain">
+                          {detail.body
+                            ? <MarkdownRenderer content={detail.body} basePath={workspacePath} />
+                            : <span className="review-platform__section-empty">No description was provided.</span>}
+                        </div>
                       ) : (
                         renderDetailLoading('Loading pull request summary...')
                       )}
-                    </div>
-                    <div className="review-platform__capability-row">
-                      <span className="review-platform__capability-chip">State: {stateLabel(displayPr?.state ?? selectedPr.state)}</span>
-                      <span className={`review-platform__decision review-platform__decision--${displayPr?.reviewDecision ?? selectedPr.reviewDecision}`}>
-                        {decisionLabel(displayPr?.reviewDecision ?? selectedPr.reviewDecision)}
-                      </span>
-                      <span className="review-platform__capability-chip">
-                        {selectedRemote ? providerLabel(selectedRemote) : 'Unknown provider'}
-                      </span>
-                    </div>
-                    <div className="review-platform__summary-grid">
-                      <span><CheckCircle2 size={13} /> {checksText} checks</span>
-                      <span><MessageSquareText size={13} /> {reviewItemCount} review items</span>
-                      <span><UserRound size={13} /> {displayPr?.author ?? selectedPr.author}</span>
-                      <span><Clock3 size={13} /> {formatAbsoluteTime(displayPr?.updatedAt ?? selectedPr.updatedAt)}</span>
-                    </div>
-                  </section>
-                </TabPane>
+                    </section>
 
-                <TabPane tabKey="ci" label="CI">
-                  <section className="review-platform__tab-content review-platform__ci-list">
-                    <div className="review-platform__section-heading">
-                      <span>CI</span>
-                      <span className="review-platform__section-count">
-                        {ciTotal ? `${ciTotal} items · ${checksText}` : checksText}
-                      </span>
-                      <Button className="review-platform__panel-button" size="small" variant="ghost" onClick={handleAddCiPageContext} disabled={!selectedPr || !detail || detailLoading}>
-                        <MessageSquareText size={13} />
-                        Add page
-                      </Button>
-                    </div>
-                    {detailError && (
-                      <div className="review-platform__detail-error">
-                        <XCircle size={14} />
-                        <span>{detailError}</span>
-                        <Button className="review-platform__panel-button" size="small" variant="secondary" onClick={handleRetryDetail}>
-                          Retry
-                        </Button>
+                    <section className="review-platform__detail-section review-platform__ci-list" data-bf-component="review-platform" data-bf-part="section">
+                      <div className="review-platform__detail-section-heading" data-bf-component="review-platform" data-bf-part="sectionHeading">
+                        <span>Checks</span>
+                        <div className="review-platform__detail-section-actions" data-bf-component="review-platform" data-bf-part="sectionActions">
+                          <span className="review-platform__section-count">
+                            {ciTotal ? `${ciTotal} items · ${checksText}` : checksStatusText}
+                          </span>
+                          <Button className="review-platform__panel-button" size="small" variant="ghost" onClick={handleAddCiPageContext} disabled={!selectedPr || !detail || detailLoading}>
+                            <MessageSquareText size={13} />
+                            Add page
+                          </Button>
+                        </div>
                       </div>
-                    )}
-                    {detailLoading && renderDetailLoading(pagedCiItems.length ? 'Refreshing CI...' : 'Loading CI...', pagedCiItems.length > 0)}
-                    {pagedCiItems.map(item => {
-                      const tone = ciItemTone(item);
-                      const isCiExpanded = expandedCiItemIds.has(item.id);
-                      const ciLog = ciLogById[item.id];
-                      const ciLogLoading = ciLogLoadingIds.has(item.id);
-                      const ciLogError = ciLogErrorById[item.id];
-                      const logAvailable = canLoadCiLog(selectedRemote, item);
-                      const expandable = canExpandCiItem(selectedRemote, item);
-                      return (
-                        <article key={item.id} className={`review-platform__ci-item review-platform__ci-item--${tone}`}>
-                          <div className="review-platform__ci-head">
-                            <div className="review-platform__ci-main">
-                              <strong>{item.name}</strong>
-                              <span>
-                                {[item.detail, item.stage].filter(Boolean).join(' · ') || (item.webUrl ? 'Provider details available' : 'No extra details provided')}
-                              </span>
-                            </div>
-                            <div className="review-platform__ci-actions">
-                              {ciLog && logAvailable && (
-                                <span className="review-platform__ci-log-chip">
-                                  {ciLog.log ? (ciLog.truncated ? 'Errors truncated' : 'Errors loaded') : 'No errors'}
+                      {detailLoading && renderDetailLoading(pagedCiItems.length ? 'Refreshing checks...' : 'Loading checks...', pagedCiItems.length > 0)}
+                      {pagedCiItems.map(item => {
+                        const tone = ciItemTone(item);
+                        const isCiExpanded = expandedCiItemIds.has(item.id);
+                        const ciLog = ciLogById[item.id];
+                        const ciLogLoading = ciLogLoadingIds.has(item.id);
+                        const ciLogError = ciLogErrorById[item.id];
+                        const logAvailable = canLoadCiLog(selectedRemote, item);
+                        const expandable = canExpandCiItem(selectedRemote, item);
+                        return (
+                          <article data-bf-component="review-platform" data-bf-part="ciItem" key={item.id} className={`review-platform__ci-item review-platform__ci-item--${tone}`}>
+                            <div className="review-platform__ci-head" data-bf-component="review-platform" data-bf-part="ciHead">
+                              <div className="review-platform__ci-main">
+                                <strong>{item.name}</strong>
+                                <span>{[item.detail, item.stage].filter(Boolean).join(' · ')}</span>
+                              </div>
+                              <div className="review-platform__ci-actions">
+                                <span className={`review-platform__ci-status review-platform__ci-status--${tone}`} data-bf-component="review-platform" data-bf-part="ciStatus">
+                                  {ciItemStatusText(item)}
                                 </span>
-                              )}
-                              <span className={`review-platform__ci-status review-platform__ci-status--${tone}`}>
-                                {ciItemStatusText(item)}
-                              </span>
-                              {expandable && (
+                                {expandable && (
+                                  <IconButton
+                                    className="review-platform__icon-button review-platform__ci-action"
+                                    size="xs"
+                                    variant="ghost"
+                                    tooltip={isCiExpanded ? 'Collapse details' : 'Expand details'}
+                                    onClick={() => toggleCiExpanded(item)}
+                                    disabled={ciLogLoading}
+                                    aria-busy={ciLogLoading}
+                                  >
+                                    {isCiExpanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+                                  </IconButton>
+                                )}
                                 <IconButton
                                   className="review-platform__icon-button review-platform__ci-action"
                                   size="xs"
                                   variant="ghost"
-                                  tooltip={isCiExpanded ? 'Collapse details' : 'Expand details'}
-                                  onClick={() => toggleCiExpanded(item)}
-                                  disabled={ciLogLoading}
-                                  aria-busy={ciLogLoading}
+                                  tooltip="Add this result to chat"
+                                  onClick={() => void handleAddCiItemContext(item)}
+                                  disabled={!selectedPr}
                                 >
-                                  {isCiExpanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+                                  <MessageSquareText size={13} />
                                 </IconButton>
-                              )}
-                              <IconButton
-                                className="review-platform__icon-button review-platform__ci-action"
-                                size="xs"
-                                variant="ghost"
-                                tooltip="Add this result to chat"
-                                onClick={() => void handleAddCiItemContext(item)}
-                                disabled={!selectedPr}
-                              >
-                                <MessageSquareText size={13} />
-                              </IconButton>
-                              {item.webUrl && (
-                                <IconButton
-                                  className="review-platform__icon-button review-platform__ci-action"
-                                  size="xs"
-                                  variant="ghost"
-                                  tooltip="Open result in provider"
-                                  onClick={() => void handleOpenCiUrl(item.webUrl)}
-                                >
-                                  <Link2 size={12} />
-                                </IconButton>
-                              )}
-                            </div>
-                          </div>
-                          {(item.startedAt || item.finishedAt) && (
-                            <div className="review-platform__ci-meta">
-                              {item.startedAt && <span>Started: {formatAbsoluteTime(item.startedAt) || item.startedAt}</span>}
-                              {item.finishedAt && <span>Finished: {formatAbsoluteTime(item.finishedAt) || item.finishedAt}</span>}
-                            </div>
-                          )}
-                          {isCiExpanded && (
-                            <div className="review-platform__ci-log-panel">
-                              <div className="review-platform__ci-detail-grid">
-                                {item.stage && (
-                                  <div>
-                                    <span>Stage</span>
-                                    <strong>{item.stage}</strong>
-                                  </div>
-                                )}
-                                {item.detail && (
-                                  <div>
-                                    <span>Detail</span>
-                                    <strong>{item.detail}</strong>
-                                  </div>
-                                )}
                                 {item.webUrl && (
-                                  <div>
-                                    <span>URL</span>
-                                    <strong>{item.webUrl}</strong>
-                                  </div>
+                                  <IconButton
+                                    className="review-platform__icon-button review-platform__ci-action"
+                                    size="xs"
+                                    variant="ghost"
+                                    tooltip="Open result in provider"
+                                    onClick={() => void handleOpenCiUrl(item.webUrl)}
+                                  >
+                                    <Link2 size={12} />
+                                  </IconButton>
                                 )}
                               </div>
-                              {ciLogLoading && renderDetailLoading('Loading CI details...')}
-                              {!ciLogLoading && ciLogError && logAvailable && (
-                                <div className="review-platform__detail-error">
-                                  <XCircle size={14} />
-                                  <span>{ciLogError}</span>
-                                  <Button className="review-platform__panel-button" size="small" variant="secondary" onClick={() => void loadCiLog(item)}>
-                                    Retry
-                                  </Button>
-                                </div>
-                              )}
-                              {!ciLogLoading && !ciLogError && (ciLog?.log || item.log) && (
-                                <pre className="review-platform__ci-log-block">{ciLog?.log || item.log}</pre>
-                              )}
-                              {!ciLogLoading && !ciLogError && ciLog && !ciLog.log && !item.log && ciLog.message && (
-                                <div className="review-platform__ci-log-empty">
-                                  {ciLog.message}
-                                </div>
-                              )}
                             </div>
-                          )}
-                        </article>
-                      );
-                    })}
-                    {!detailLoading && detail && ciItems.length === 0 && (
-                      <div className="review-platform__empty-state">No CI entries were returned by this provider.</div>
-                    )}
-                    {renderDetailPagination('CI', ciPage, ciTotal, setCiPageIndex)}
-                  </section>
+                            {isCiExpanded && (
+                              <div className="review-platform__ci-log-panel" data-bf-component="review-platform" data-bf-part="ciLog">
+                                <div className="review-platform__ci-detail-grid">
+                                  {item.stage && <div><span>Stage</span><strong>{item.stage}</strong></div>}
+                                  {item.detail && <div><span>Detail</span><strong>{item.detail}</strong></div>}
+                                  {item.webUrl && <div><span>URL</span><strong>{item.webUrl}</strong></div>}
+                                </div>
+                                {ciLogLoading && renderDetailLoading('Loading check details...')}
+                                {!ciLogLoading && ciLogError && logAvailable && (
+                                  <div className="review-platform__detail-error">
+                                    <XCircle size={14} />
+                                    <span>{ciLogError}</span>
+                                    <Button className="review-platform__panel-button" size="small" variant="secondary" onClick={() => void loadCiLog(item)}>Retry</Button>
+                                  </div>
+                                )}
+                                {!ciLogLoading && !ciLogError && (ciLog?.log || item.log) && <pre className="review-platform__ci-log-block">{ciLog?.log || item.log}</pre>}
+                                {!ciLogLoading && !ciLogError && ciLog && !ciLog.log && !item.log && ciLog.message && <div className="review-platform__ci-log-empty">{ciLog.message}</div>}
+                              </div>
+                            )}
+                          </article>
+                        );
+                      })}
+                      {!detailLoading && detail && ciItems.length === 0 && <div className="review-platform__empty-state">No checks were reported.</div>}
+                      {renderDetailPagination('Checks', ciPage, ciTotal, setCiPageIndex)}
+                    </section>
+
+                    <section className="review-platform__detail-section review-platform__threads" data-bf-component="review-platform" data-bf-part="section">
+                      <div className="review-platform__detail-section-heading" data-bf-component="review-platform" data-bf-part="sectionHeading">
+                        <span>Comments</span>
+                        <div className="review-platform__detail-section-actions" data-bf-component="review-platform" data-bf-part="sectionActions">
+                          <span className="review-platform__section-count">{reviewItemCount}</span>
+                          <Button className="review-platform__panel-button" size="small" variant="ghost" onClick={handleAddReviewsContext} disabled={!selectedPr || !detail}>
+                            <MessageSquareText size={13} />
+                            Add to chat
+                          </Button>
+                        </div>
+                      </div>
+                      {detailLoading && renderDetailLoading(reviewThreads.length ? 'Refreshing comments...' : 'Loading comments...', reviewThreads.length > 0)}
+                      {pagedReviewThreads.map(thread => {
+                        const parent = thread.replyToProviderCommentId
+                          ? reviewThreadByCommentId.get(thread.replyToProviderCommentId)
+                          : null;
+                        return (
+                          <article data-bf-component="review-platform" data-bf-part="thread"
+                            key={thread.id}
+                            className={[
+                              'review-platform__thread',
+                              thread.resolved ? 'is-resolved' : '',
+                              `review-platform__thread--${thread.kind}`,
+                              parent ? 'review-platform__thread--reply' : '',
+                            ].filter(Boolean).join(' ')}
+                          >
+                            <div className="review-platform__thread-head" data-bf-component="review-platform" data-bf-part="threadHead">
+                              <div className="review-platform__thread-tags">
+                                <span className={`review-platform__thread-tag review-platform__thread-tag--${thread.kind}`}>
+                                  {thread.kind === 'review' ? 'Review' : 'Comment'}
+                                </span>
+                                <span className={`review-platform__thread-tag review-platform__thread-tag--${thread.resolved ? 'resolved' : 'open'}`}>
+                                  {thread.resolved ? 'Resolved' : 'Open'}
+                                </span>
+                              </div>
+                              <span>{formatRelativeTime(thread.updatedAt) || formatAbsoluteTime(thread.updatedAt)}</span>
+                            </div>
+                            <div className="review-platform__thread-meta"><strong>{thread.author}</strong></div>
+                            {parent && (
+                              <div className="review-platform__thread-reply-block">
+                                <div className="review-platform__thread-reply-header">
+                                  <span className="review-platform__thread-reply-label">Reply to</span>
+                                  <span className="review-platform__thread-reply-author">@{parent.author}</span>
+                                </div>
+                                <div className="review-platform__thread-reply-body"><MarkdownRenderer content={parent.body} basePath={workspacePath} /></div>
+                              </div>
+                            )}
+                            <div className="review-platform__thread-body" data-bf-component="review-platform" data-bf-part="threadBody"><MarkdownRenderer content={thread.body} basePath={workspacePath} /></div>
+                            {thread.filePath && <span className="review-platform__thread-anchor">{thread.filePath}{thread.line ? `:${thread.line}` : ''}</span>}
+                          </article>
+                        );
+                      })}
+                      {!detailLoading && detail && reviewThreads.length === 0 && <div className="review-platform__empty-state">No comments yet.</div>}
+                      {renderDetailPagination('Comments', reviewPage, reviewThreads.length, setReviewPageIndex)}
+                    </section>
+                  </div>
                 </TabPane>
 
                 <TabPane tabKey="changes" label="Changes">
-                  <section className="review-platform__tab-content review-platform__file-list">
+                  <section className="review-platform__tab-content review-platform__file-list" data-bf-component="review-platform" data-bf-part="fileList">
                     {detailError && (
                       <div className="review-platform__detail-error">
                         <XCircle size={14} />
@@ -2331,22 +2451,24 @@ export const ReviewPlatformPanel: React.FC<ReviewPlatformPanelProps> = ({
                       const key = fileKey(file);
                       const isExpanded = expandedFileKeys.has(key);
                       return (
-                        <article key={key} className="review-platform__file-card">
-                          <div className="review-platform__file-row">
+                        <article data-bf-component="review-platform" data-bf-part="fileCard" key={key} className="review-platform__file-card">
+                          <div className="review-platform__file-row" data-bf-component="review-platform" data-bf-part="fileRow">
                             <button
                               type="button"
                               className="review-platform__file-main"
+                              data-bf-component="review-platform"
+                              data-bf-part="fileMain"
                               aria-expanded={isExpanded}
                               onClick={() => toggleFileExpanded(key)}
                             >
                               <span className="review-platform__file-toggle">
                                 {isExpanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
                               </span>
-                              <span className={`review-platform__file-status review-platform__file-status--${file.status}`}>
+                              <span className={`review-platform__file-status review-platform__file-status--${file.status}`} data-bf-component="review-platform" data-bf-part="fileStatus">
                                 {file.status}
                               </span>
-                              <span className="review-platform__file-path">{file.path}</span>
-                              <span className="review-platform__file-delta">
+                              <span className="review-platform__file-path" data-bf-component="review-platform" data-bf-part="filePath">{file.path}</span>
+                              <span className="review-platform__file-delta" data-bf-component="review-platform" data-bf-part="fileDelta">
                                 <span className="review-platform__additions">+{file.additions}</span>
                                 <span className="review-platform__deletions">-{file.deletions}</span>
                               </span>
@@ -2358,7 +2480,7 @@ export const ReviewPlatformPanel: React.FC<ReviewPlatformPanelProps> = ({
                           </div>
                           {isExpanded && (
                             file.patch ? (
-                              <pre className="review-platform__diff-block" aria-label={`Diff for ${file.path}`}>
+                              <pre className="review-platform__diff-block" data-bf-component="review-platform" data-bf-part="diff" aria-label={`Diff for ${file.path}`}>
                                 {file.patch.split('\n').map((line, index) => (
                                   <span key={`${file.path}-${index}`} className={diffLineClass(line)}>
                                     {line || ' '}
@@ -2415,82 +2537,6 @@ export const ReviewPlatformPanel: React.FC<ReviewPlatformPanelProps> = ({
                   </section>
                 </TabPane>
 
-                <TabPane tabKey="reviews" label="Reviews">
-                  <section className="review-platform__tab-content review-platform__threads">
-                    <div className="review-platform__section-heading">
-                      <span>Reviews</span>
-                      <span className="review-platform__section-count">{reviewItemCount} items</span>
-                      <Button className="review-platform__panel-button" size="small" variant="ghost" onClick={handleAddReviewsContext} disabled={!selectedPr || !detail}>
-                        <MessageSquareText size={13} />
-                        Add to chat
-                      </Button>
-                    </div>
-                    {detailError && (
-                      <div className="review-platform__detail-error">
-                        <XCircle size={14} />
-                        <span>{detailError}</span>
-                        <Button className="review-platform__panel-button" size="small" variant="secondary" onClick={handleRetryDetail}>
-                          Retry
-                        </Button>
-                      </div>
-                    )}
-                    {detailLoading && renderDetailLoading(reviewThreads.length ? 'Refreshing reviews...' : 'Loading reviews...', reviewThreads.length > 0)}
-                    {pagedReviewThreads.map(thread => {
-                      const parent = thread.replyToProviderCommentId
-                        ? reviewThreadByCommentId.get(thread.replyToProviderCommentId)
-                        : null;
-                      return (
-                        <article
-                          key={thread.id}
-                          className={[
-                            'review-platform__thread',
-                            thread.resolved ? 'is-resolved' : '',
-                            `review-platform__thread--${thread.kind}`,
-                            parent ? 'review-platform__thread--reply' : '',
-                          ].filter(Boolean).join(' ')}
-                        >
-                          <div className="review-platform__thread-head">
-                            <div className="review-platform__thread-tags">
-                              <span className={`review-platform__thread-tag review-platform__thread-tag--${thread.kind}`}>
-                                {thread.kind === 'review' ? 'Review' : 'Comment'}
-                              </span>
-                              <span className={`review-platform__thread-tag review-platform__thread-tag--${thread.resolved ? 'resolved' : 'open'}`}>
-                                {thread.resolved ? 'Resolved' : 'Open'}
-                              </span>
-                            </div>
-                            <span>{formatRelativeTime(thread.updatedAt) || formatAbsoluteTime(thread.updatedAt)}</span>
-                          </div>
-                          <div className="review-platform__thread-meta">
-                            <strong>{thread.author}</strong>
-                          </div>
-                          {parent && (
-                            <div className="review-platform__thread-reply-block">
-                              <div className="review-platform__thread-reply-header">
-                                <span className="review-platform__thread-reply-label">Reply to</span>
-                                <span className="review-platform__thread-reply-author">@{parent.author}</span>
-                              </div>
-                              <div className="review-platform__thread-reply-body">
-                                <MarkdownRenderer content={parent.body} basePath={workspacePath} />
-                              </div>
-                            </div>
-                          )}
-                          <div className="review-platform__thread-body">
-                            <MarkdownRenderer content={thread.body} basePath={workspacePath} />
-                          </div>
-                          {thread.filePath && (
-                            <span className="review-platform__thread-anchor">
-                              {thread.filePath}{thread.line ? `:${thread.line}` : ''}
-                            </span>
-                          )}
-                        </article>
-                      );
-                    })}
-                    {!detailLoading && detail && reviewThreads.length === 0 && (
-                      <div className="review-platform__empty-state">No reviews or comments were returned by this provider.</div>
-                    )}
-                    {renderDetailPagination('Reviews', reviewPage, reviewThreads.length, setReviewPageIndex)}
-                  </section>
-                </TabPane>
               </Tabs>
             </>
           )}
@@ -2504,7 +2550,7 @@ export const ReviewPlatformPanel: React.FC<ReviewPlatformPanelProps> = ({
             setAuthError(null);
           }
         }}
-        title={`${selectedRemote ? providerLabel(selectedRemote) : 'Provider'} token`}
+        title={selectedRemote?.platform === 'github' ? 'GitHub CLI authentication' : `${selectedRemote ? providerLabel(selectedRemote) : 'Provider'} token`}
         size="small"
         contentInset
       >
@@ -2519,20 +2565,28 @@ export const ReviewPlatformPanel: React.FC<ReviewPlatformPanelProps> = ({
             <span>{selectedRemote?.host ?? 'No remote'}</span>
             <strong>{selectedRemote?.projectPath ?? ''}</strong>
           </div>
-          <Input
-            type="password"
-            autoComplete="off"
-            autoFocus
-            label="Token"
-            value={authToken}
-            disabled={authSaving}
-            error={Boolean(authError)}
-            errorMessage={authError ?? undefined}
-            onChange={event => {
-              setAuthToken(event.target.value);
-              if (authError) setAuthError(null);
-            }}
-          />
+          {selectedRemote?.platform === 'github' ? (
+            <div className="review-platform__gh-auth">
+              <span>Run this command in the integrated terminal, finish the GitHub CLI flow, then retry.</span>
+              <code>{`gh auth login --hostname ${selectedRemote.host}`}</code>
+              {authError && <span className="review-platform__gh-auth-error">{authError}</span>}
+            </div>
+          ) : (
+            <Input
+              type="password"
+              autoComplete="off"
+              autoFocus
+              label="Token"
+              value={authToken}
+              disabled={authSaving}
+              error={Boolean(authError)}
+              errorMessage={authError ?? undefined}
+              onChange={event => {
+                setAuthToken(event.target.value);
+                if (authError) setAuthError(null);
+              }}
+            />
+          )}
           <div className="review-platform__auth-actions">
             <Button
               type="button"
@@ -2547,16 +2601,43 @@ export const ReviewPlatformPanel: React.FC<ReviewPlatformPanelProps> = ({
             >
               Cancel
             </Button>
-            <Button
-              type="submit"
-              className="review-platform__panel-button"
-              size="small"
-              variant="primary"
-              isLoading={authSaving}
-              disabled={!authToken.trim()}
-            >
-              Save
-            </Button>
+            {selectedRemote?.platform === 'github' ? (
+              <>
+                <Button
+                  type="button"
+                  className="review-platform__panel-button"
+                  size="small"
+                  variant="secondary"
+                  disabled={authSaving}
+                  onClick={() => void handleCopyGithubAuthCommand()}
+                >
+                  <Copy size={13} />
+                  Copy
+                </Button>
+                <Button
+                  type="button"
+                  className="review-platform__panel-button"
+                  size="small"
+                  variant="primary"
+                  isLoading={authSaving}
+                  onClick={() => void handleOpenGithubAuthTerminal()}
+                >
+                  <Terminal size={13} />
+                  Open terminal
+                </Button>
+              </>
+            ) : (
+              <Button
+                type="submit"
+                className="review-platform__panel-button"
+                size="small"
+                variant="primary"
+                isLoading={authSaving}
+                disabled={!authToken.trim()}
+              >
+                Save
+              </Button>
+            )}
           </div>
         </form>
       </Modal>

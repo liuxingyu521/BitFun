@@ -18,6 +18,10 @@ vi.mock('../../../infrastructure/config/components/AcpAgentsConfig', () => ({
   default: () => <div data-testid="acp-agents-config" />,
 }));
 
+vi.mock('../../../infrastructure/config/components/ExternalSourcesConfig', () => ({
+  default: () => <div data-testid="external-sources-config" />,
+}));
+
 vi.mock('../../../infrastructure/config/components/EditorConfig', () => ({
   default: () => <div data-testid="editor-config" />,
 }));
@@ -36,6 +40,10 @@ vi.mock('../../../infrastructure/config/components/ReviewConfig', () => ({
 
 vi.mock('../../../infrastructure/config/components/QuickActionsConfig', () => ({
   default: () => <div data-testid="quick-actions-config" />,
+}));
+
+vi.mock('../../../infrastructure/config/components/VoiceInputConfig', () => ({
+  default: () => <div data-testid="voice-input-config" />,
 }));
 
 vi.mock('../../../infrastructure/config/components/SessionConfig', () => ({
@@ -67,13 +75,31 @@ describe('SettingsScene lazy tab routing', () => {
       root.unmount();
     });
     container.remove();
+    vi.useRealTimers();
   });
 
-  async function renderActiveTab(tab: 'mcp-tools' | 'acp-agents') {
+  /**
+   * The scene holds its very first paint until the active tab's lazy chunk and
+   * i18n namespaces are in memory, so a cold entry cannot flash a skeleton and a
+   * frame of raw i18n keys. Both land off a macrotask, past what act() flushes.
+   */
+  async function waitForPanelContent(testId: string) {
+    for (let attempt = 0; attempt < 50; attempt += 1) {
+      if (container.querySelector(`[data-testid="${testId}"]`)) return;
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      });
+    }
+  }
+
+  async function renderActiveTab(
+    tab: 'mcp-tools' | 'acp-agents' | 'external-sources' | 'voice-input'
+  ) {
     useSettingsStore.setState({ activeTab: tab });
     await act(async () => {
       root.render(<SettingsScene />);
     });
+    await waitForPanelContent(`${tab}-config`);
   }
 
   it('renders the lazy MCP tools config tab', async () => {
@@ -86,5 +112,36 @@ describe('SettingsScene lazy tab routing', () => {
     await renderActiveTab('acp-agents');
 
     expect(container.querySelector('[data-testid="acp-agents-config"]')).not.toBeNull();
+  });
+
+  it('renders the lazy external sources config tab', async () => {
+    await renderActiveTab('external-sources');
+
+    expect(container.querySelector('[data-testid="external-sources-config"]')).not.toBeNull();
+  });
+
+  it('renders the lazy voice input config tab', async () => {
+    await renderActiveTab('voice-input');
+
+    expect(container.querySelector('[data-testid="voice-input-config"]')).not.toBeNull();
+  });
+
+  it('switches settings pages immediately without retaining the outgoing panel', async () => {
+    await act(async () => {
+      root.render(<SettingsScene />);
+    });
+    await waitForPanelContent('basics-config');
+
+    /** Only the cold first paint waits for resources; later switches are synchronous. */
+    await act(async () => {
+      useSettingsStore.setState({ activeTab: 'appearance' });
+      await Promise.resolve();
+    });
+
+    const scene = container.querySelector('[data-testid="settings-scene"]');
+    expect(scene?.getAttribute('data-settings-tab')).toBe('appearance');
+    expect(container.querySelector('[data-testid="appearance-config"]')).not.toBeNull();
+    expect(container.querySelector('[data-testid="basics-config"]')).toBeNull();
+    expect(container.querySelectorAll('[data-testid="settings-scene-content"]')).toHaveLength(1);
   });
 });

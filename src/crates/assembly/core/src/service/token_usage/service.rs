@@ -6,7 +6,7 @@ use super::types::{
 };
 use crate::infrastructure::PathManager;
 use anyhow::Result;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -35,7 +35,8 @@ impl TokenUsageService {
     #[allow(clippy::too_many_arguments)]
     pub async fn record_usage(
         &self,
-        model_id: String,
+        model_config_id: String,
+        effective_model_name: String,
         session_id: String,
         turn_id: String,
         input_tokens: u32,
@@ -46,7 +47,8 @@ impl TokenUsageService {
     ) -> Result<()> {
         self.inner
             .record_usage(
-                model_id,
+                model_config_id,
+                effective_model_name,
                 session_id,
                 turn_id,
                 input_tokens,
@@ -86,6 +88,17 @@ impl TokenUsageService {
     pub async fn query_records(&self, query: TokenUsageQuery) -> Result<Vec<TokenUsageRecord>> {
         self.inner
             .query_records(query)
+            .await
+            .map_err(anyhow::Error::msg)
+    }
+
+    pub(crate) async fn query_records_for_sessions(
+        &self,
+        query: TokenUsageQuery,
+        session_ids: &HashSet<String>,
+    ) -> Result<Vec<TokenUsageRecord>> {
+        self.inner
+            .query_records_for_sessions(query, session_ids)
             .await
             .map_err(anyhow::Error::msg)
     }

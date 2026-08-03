@@ -27,22 +27,22 @@ use bitfun_services_integrations::remote_connect::{
     resolve_remote_execution_image_contexts, resolve_remote_file_chunk_range,
     resolve_remote_workspace_path, should_send_remote_model_catalog, submit_remote_dialog,
     ActiveTurnSnapshot, ChatImageAttachment, ChatMessage, ChatMessageItem, DeviceIdentity,
-    ImageAttachment, KeyPair, PairingProtocol, PairingState, QrGenerator, QrPayload, RelayMessage,
-    RemoteAssistantWorkspaceFacts, RemoteCancelDecision, RemoteCancelRuntimeHost,
-    RemoteCancelTaskRequest, RemoteChatHistoryRound, RemoteChatHistoryTextItem,
-    RemoteChatHistoryThinkingItem, RemoteChatHistoryToolCall, RemoteChatHistoryToolItem,
-    RemoteChatHistoryTurn, RemoteCommand, RemoteCommandRuntimeHost, RemoteConnectSubmissionSource,
-    RemoteDefaultModelsConfig, RemoteDialogQueuePriority, RemoteDialogResolvedSubmission,
-    RemoteDialogRuntimeHost, RemoteDialogSchedulerOutcomeFact, RemoteDialogSubmissionPolicy,
-    RemoteDialogSubmissionRequest, RemoteDialogSubmitOutcome, RemoteDialogWorkspaceBinding,
-    RemoteImageContext, RemoteImageContextAdapter, RemoteModelCapabilityFact, RemoteModelCatalog,
-    RemoteModelCatalogFacts, RemoteModelConfig, RemoteModelFacts, RemoteReasoningModeFact,
-    RemoteRecentWorkspaceFacts, RemoteResponse, RemoteSessionMetadata, RemoteSessionStateTracker,
-    RemoteSessionTrackerHost, RemoteSessionTrackerRegistry, RemoteSessionWorkspaceIdentity,
-    RemoteTerminalPrewarmRequest, RemoteToolStatus, RemoteWorkspaceFacts, RemoteWorkspaceFileChunk,
-    RemoteWorkspaceFileContent, RemoteWorkspaceFileInfo, RemoteWorkspaceFileRuntimeHost,
-    RemoteWorkspaceKind, RemoteWorkspaceUpdate, TrackerEvent, REMOTE_FILE_MAX_CHUNK_BYTES,
-    REMOTE_FILE_MAX_READ_BYTES,
+    ImageAttachment, KeyPair, PairingChallenge, PairingProtocol, PairingResponse, PairingState,
+    QrGenerator, QrPayload, RelayMessage, RemoteAssistantWorkspaceFacts, RemoteCancelDecision,
+    RemoteCancelRuntimeHost, RemoteCancelTaskRequest, RemoteChatHistoryRound,
+    RemoteChatHistoryTextItem, RemoteChatHistoryThinkingItem, RemoteChatHistoryToolCall,
+    RemoteChatHistoryToolItem, RemoteChatHistoryTurn, RemoteCommand, RemoteCommandRuntimeHost,
+    RemoteConnectSubmissionSource, RemoteDefaultModelsConfig, RemoteDialogQueuePriority,
+    RemoteDialogResolvedSubmission, RemoteDialogRuntimeHost, RemoteDialogSchedulerOutcomeFact,
+    RemoteDialogSubmissionPolicy, RemoteDialogSubmissionRequest, RemoteDialogSubmitOutcome,
+    RemoteDialogWorkspaceBinding, RemoteImageContext, RemoteImageContextAdapter,
+    RemoteModelCapabilityFact, RemoteModelCatalog, RemoteModelCatalogFacts, RemoteModelConfig,
+    RemoteModelFacts, RemoteReasoningModeFact, RemoteRecentWorkspaceFacts, RemoteResponse,
+    RemoteSessionMetadata, RemoteSessionStateTracker, RemoteSessionTrackerHost,
+    RemoteSessionTrackerRegistry, RemoteSessionWorkspaceIdentity, RemoteTerminalPrewarmRequest,
+    RemoteToolStatus, RemoteWorkspaceFacts, RemoteWorkspaceFileChunk, RemoteWorkspaceFileContent,
+    RemoteWorkspaceFileInfo, RemoteWorkspaceFileRuntimeHost, RemoteWorkspaceKind,
+    RemoteWorkspaceUpdate, TrackerEvent, REMOTE_FILE_MAX_CHUNK_BYTES, REMOTE_FILE_MAX_READ_BYTES,
 };
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -95,10 +95,46 @@ fn remote_connect_qr_and_relay_primitives_live_in_services_owner() {
         version: 1,
     };
 
-    let url = QrGenerator::build_url(&payload, "https://mobile.example.com/", "zh-CN");
+    let url = QrGenerator::build_url(&payload, "https://mobile.example.com/", "zh-CN", None);
     assert!(url.starts_with("https://mobile.example.com/#/pair?"));
     assert!(url.contains("relay=wss%3A%2F%2Frelay.example.com%2Fsocket"));
     assert!(url.contains("lang=zh-CN"));
+    assert!(!url.contains("auth=account"));
+
+    let account_url = QrGenerator::build_url(
+        &payload,
+        "https://mobile.example.com/",
+        "zh-CN",
+        Some("alice"),
+    );
+    assert!(account_url.contains("auth=account"));
+    assert!(account_url.contains("user=alice"));
+
+    let auth_only_url =
+        QrGenerator::build_url(&payload, "https://mobile.example.com/", "zh-CN", Some(""));
+    assert!(auth_only_url.contains("auth=account"));
+    assert!(!auth_only_url.contains("user="));
+
+    let with_password = PairingProtocol::answer_challenge_with_password(
+        &PairingChallenge {
+            challenge: "abc".to_string(),
+            timestamp: 1,
+        },
+        &DeviceIdentity {
+            device_id: "m1".to_string(),
+            device_name: "Phone".to_string(),
+            mac_address: "00:00:00:00:00:00".to_string(),
+        },
+        Some("install-1".to_string()),
+        Some("alice".to_string()),
+        Some("secret".to_string()),
+    );
+    let json = serde_json::to_value(&with_password).expect("serialize pairing response");
+    assert_eq!(json["user_id"], "alice");
+    assert_eq!(json["password"], "secret");
+    let parsed: PairingResponse =
+        serde_json::from_value(json).expect("deserialize pairing response");
+    assert_eq!(parsed.password.as_deref(), Some("secret"));
 
     let message = RelayMessage::CreateRoom {
         room_id: Some(payload.room_id),
@@ -423,13 +459,16 @@ fn remote_chat_history_assembly_preserves_message_shape_and_item_order() {
 }
 
 #[test]
-fn remote_chat_history_assembly_skips_in_progress_assistant_history() {
+fn remote_chat_history_assembly_preserves_in_progress_assistant_history() {
     let turn = remote_history_contract_turn(true);
 
     let messages = build_remote_chat_messages(vec![turn]);
 
-    assert_eq!(messages.len(), 1);
+    assert_eq!(messages.len(), 2);
     assert_eq!(messages[0].role, "user");
+    assert_eq!(messages[1].role, "assistant");
+    assert_eq!(messages[1].content, "visible text");
+    assert_eq!(messages[1].tools.as_ref().unwrap()[0].status, "running");
 }
 
 #[test]
@@ -849,7 +888,7 @@ impl RemoteCommandRuntimeHost for RecordingCommandHost {
     async fn handle_interaction_command(&self, _command: &RemoteCommand) -> RemoteResponse {
         self.events.lock().unwrap().push("interaction".to_string());
         RemoteResponse::InteractionAccepted {
-            action: "confirm_tool".to_string(),
+            action: "cancel_tool".to_string(),
             target_id: "tool-1".to_string(),
         }
     }
@@ -982,9 +1021,9 @@ async fn remote_connect_command_owner_preserves_cancel_and_group_routing() {
 
     let interaction = handle_remote_command(
         &host,
-        &RemoteCommand::ConfirmTool {
+        &RemoteCommand::CancelTool {
             tool_id: "tool-1".to_string(),
-            updated_input: None,
+            reason: None,
         },
         RemoteConnectSubmissionSource::Relay,
     )
@@ -1081,7 +1120,6 @@ async fn remote_connect_dialog_runtime_owns_restore_prewarm_and_submit_order() {
         submitted.policy.queue_priority,
         RemoteDialogQueuePriority::Normal
     );
-    assert!(submitted.policy.skip_tool_confirmation);
 }
 
 #[tokio::test]
@@ -1381,13 +1419,28 @@ fn make_temp_remote_workspace() -> (PathBuf, PathBuf, PathBuf) {
 #[test]
 fn remote_connect_file_path_resolution_stays_within_workspace_root() {
     let (base, workspace, report) = make_temp_remote_workspace();
+    let secret = base.join("secret.md");
+    std::fs::write(&secret, b"outside workspace").expect("write outside file");
 
     let resolved =
         resolve_remote_workspace_path("computer://artifacts/report.md", Some(&workspace))
             .expect("workspace-relative file resolves");
     assert_eq!(resolved, report.canonicalize().expect("canonical report"));
 
+    let absolute_resolved =
+        resolve_remote_workspace_path(report.to_str().expect("UTF-8 test path"), Some(&workspace))
+            .expect("absolute path within workspace resolves");
+    assert_eq!(
+        absolute_resolved,
+        report.canonicalize().expect("canonical report")
+    );
+
     assert!(resolve_remote_workspace_path("../secret.md", Some(&workspace)).is_none());
+    assert!(resolve_remote_workspace_path(
+        secret.to_str().expect("UTF-8 test path"),
+        Some(&workspace)
+    )
+    .is_none());
     assert!(resolve_remote_workspace_path("artifacts/report.md", None).is_none());
 
     std::fs::remove_dir_all(base).expect("cleanup remote workspace");
@@ -1584,9 +1637,9 @@ fn remote_connect_execution_response_helpers_preserve_wire_shape() {
         }
     );
     assert_eq!(
-        remote_interaction_accepted_response("confirm_tool", "tool-1", Ok(())),
+        remote_interaction_accepted_response("cancel_tool", "tool-1", Ok(())),
         RemoteResponse::InteractionAccepted {
-            action: "confirm_tool".to_string(),
+            action: "cancel_tool".to_string(),
             target_id: "tool-1".to_string(),
         }
     );
@@ -1638,6 +1691,8 @@ fn remote_connect_workspace_response_helpers_own_wire_shape() {
             name: workspace.name.clone(),
             last_opened: "2026-05-25T00:00:00Z".to_string(),
             kind: workspace.kind,
+            remote_connection_id: workspace.remote_connection_id.clone(),
+            remote_ssh_host: workspace.remote_ssh_host.clone(),
         },
     ]))
     .expect("serialize recent workspaces");
@@ -1647,6 +1702,11 @@ fn remote_connect_workspace_response_helpers_own_wire_shape() {
         recent_json["workspaces"][0]["last_opened"],
         "2026-05-25T00:00:00Z"
     );
+    assert_eq!(
+        recent_json["workspaces"][0]["remote_connection_id"],
+        "ssh-1"
+    );
+    assert_eq!(recent_json["workspaces"][0]["remote_ssh_host"], "dev-host");
 
     let assistant_json = serde_json::to_value(remote_assistant_list_response(vec![
         RemoteAssistantWorkspaceFacts {
@@ -1666,11 +1726,15 @@ fn remote_connect_workspace_response_helpers_own_wire_shape() {
         remote_workspace_updated_response(Ok(RemoteWorkspaceUpdate {
             path: "D:/workspace/project".to_string(),
             name: "project".to_string(),
+            remote_connection_id: None,
+            remote_ssh_host: None,
         })),
         RemoteResponse::WorkspaceUpdated {
             success: true,
             path: Some("D:/workspace/project".to_string()),
             project_name: Some("project".to_string()),
+            remote_connection_id: None,
+            remote_ssh_host: None,
             error: None,
         }
     );
@@ -1946,6 +2010,26 @@ fn remote_connect_command_wire_shape_lives_in_owner_contract() {
     assert_eq!(poll["since_version"], 7);
     assert_eq!(poll["known_msg_count"], 3);
     assert_eq!(poll["known_model_catalog_version"], 11);
+
+    let get_identity = serde_json::to_value(RemoteCommand::GetDelegatedIdentity)
+        .expect("serialize get delegated identity command");
+    assert_eq!(get_identity["cmd"], "get_delegated_identity");
+    let parsed: RemoteCommand = serde_json::from_str(r#"{"cmd":"get_delegated_identity"}"#)
+        .expect("parse get delegated identity command");
+    assert_eq!(parsed, RemoteCommand::GetDelegatedIdentity);
+
+    let identity = serde_json::to_value(RemoteResponse::DelegateIdentity {
+        token: "token-1".to_string(),
+        user_id: "user-1".to_string(),
+        master_key: "bWFzdGVyLWtleQ==".to_string(),
+        device_id: "device-1".to_string(),
+    })
+    .expect("serialize delegate identity response");
+    assert_eq!(identity["resp"], "delegate_identity");
+    assert_eq!(identity["token"], "token-1");
+    assert_eq!(identity["user_id"], "user-1");
+    assert_eq!(identity["master_key"], "bWFzdGVyLWtleQ==");
+    assert_eq!(identity["device_id"], "device-1");
 }
 
 #[test]
@@ -2175,7 +2259,8 @@ fn remote_connect_tracker_preserves_streaming_snapshot_contract() {
         round_id: "round-1".to_string(),
         round_group_id: None,
         round_index: 3,
-        model_id: None,
+        model_config_id: "model-config".to_string(),
+        effective_model_name: "provider-model".to_string(),
     });
     tracker.handle_agentic_event(&AgenticEvent::ThinkingChunk {
         session_id: "session-1".to_string(),
@@ -2225,6 +2310,8 @@ fn remote_connect_tracker_keeps_subagent_items_out_of_parent_accumulators() {
         parent_dialog_turn_id: "parent-turn".to_string(),
         parent_tool_call_id: "task-1".to_string(),
         agent_type: None,
+        model_id: None,
+        focused_review_display_label: None,
     });
     tracker.handle_agentic_event(&AgenticEvent::TextChunk {
         session_id: "child-session".to_string(),
@@ -2264,9 +2351,15 @@ async fn remote_connect_tracker_broadcasts_tool_and_turn_events() {
         attempt_id: None,
         attempt_index: None,
         tool_event: ToolEventData::Started {
-            tool_id: "tool-1".to_string(),
-            tool_name: "AskUserQuestion".to_string(),
-            params: serde_json::json!({ "questions": [] }),
+            identity: bitfun_events::ToolEventIdentity::resolved(
+                "tool-1",
+                bitfun_agent_tools::CALL_DEFERRED_TOOL_NAME,
+                "AskUserQuestion",
+            ),
+            params: serde_json::json!({
+                "tool_name": "AskUserQuestion",
+                "args": { "questions": [] }
+            }),
             timeout_seconds: None,
         },
     });
@@ -2283,7 +2376,7 @@ async fn remote_connect_tracker_broadcasts_tool_and_turn_events() {
         } => {
             assert_eq!(tool_id, "tool-1");
             assert_eq!(tool_name, "AskUserQuestion");
-            assert!(params.is_some());
+            assert_eq!(params, Some(serde_json::json!({ "questions": [] })));
         }
         other => panic!("unexpected event: {other:?}"),
     }

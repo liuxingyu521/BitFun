@@ -9,6 +9,7 @@ use crate::agentic::tools::workspace_paths::posix_style_path_is_absolute;
 use crate::service_agent_runtime::CoreServiceAgentRuntime;
 use crate::util::errors::{BitFunError, BitFunResult};
 use async_trait::async_trait;
+use bitfun_core_types::SessionExecutionTarget;
 use bitfun_runtime_ports::{
     AgentDialogPrependedReminder, AgentDialogTurnRequest, AgentSessionCreateRequest,
     AgentSessionListRequest, AgentSessionReplyRoute, AgentSessionSummary,
@@ -24,6 +25,9 @@ pub struct SessionMessageTool;
 #[derive(Debug, Clone)]
 struct SessionMessageWorkspaceTarget {
     workspace_path: String,
+    project_workspace_path: String,
+    execution_target: Option<SessionExecutionTarget>,
+    workspace_id: Option<String>,
     remote_connection_id: Option<String>,
     remote_ssh_host: Option<String>,
 }
@@ -40,24 +44,23 @@ impl SessionMessageTool {
     }
 
     fn validate_session_id(session_id: &str) -> Result<(), String> {
-        if session_id.is_empty() {
-            return Err("session_id cannot be empty".to_string());
-        }
-        if session_id == "." || session_id == ".." {
-            return Err("session_id cannot be '.' or '..'".to_string());
-        }
-        if session_id.contains('/') || session_id.contains('\\') {
-            return Err("session_id cannot contain path separators".to_string());
-        }
-        if !session_id
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+        bitfun_core_types::validate_session_id(session_id)
+    }
+
+    fn forwarded_user_input_metadata(context: &ToolUseContext) -> serde_json::Map<String, Value> {
+        use bitfun_agent_runtime::user_questions::USER_INPUT_AVAILABLE_CONTEXT_KEY;
+
+        let mut metadata = serde_json::Map::new();
+        if let Some(value @ (Value::Bool(_) | Value::String(_))) =
+            context.custom_data.get(USER_INPUT_AVAILABLE_CONTEXT_KEY)
         {
-            return Err(
-                "session_id can only contain ASCII letters, numbers, '-' and '_'".to_string(),
-            );
+            let is_boolean_fact = matches!(value, Value::Bool(_))
+                || matches!(value, Value::String(text) if matches!(text.as_str(), "true" | "false"));
+            if is_boolean_fact {
+                metadata.insert(USER_INPUT_AVAILABLE_CONTEXT_KEY.to_string(), value.clone());
+            }
         }
-        Ok(())
+        metadata
     }
 
     fn resolve_workspace(&self, workspace: &str, context: &ToolUseContext) -> BitFunResult<String> {
@@ -174,18 +177,32 @@ impl SessionMessageTool {
         workspace_path: String,
         context: &ToolUseContext,
     ) -> SessionMessageWorkspaceTarget {
-        let remote_connection_id = context
-            .workspace
-            .as_ref()
-            .and_then(|workspace| workspace.connection_id().map(ToOwned::to_owned));
-        let remote_ssh_host = context
-            .workspace
-            .as_ref()
+        let binding = context.workspace.as_ref();
+        let inherits_current_target = binding.is_some_and(|binding| {
+            normalize_path(&binding.root_path_string()) == normalize_path(&workspace_path)
+        });
+        let remote_connection_id =
+            binding.and_then(|workspace| workspace.connection_id().map(ToOwned::to_owned));
+        let remote_ssh_host = binding
             .filter(|workspace| workspace.is_remote())
             .map(|workspace| workspace.session_identity.hostname.clone())
             .filter(|value| !value.trim().is_empty());
+        let project_workspace_path = if inherits_current_target {
+            binding
+                .map(|workspace| normalize_path(&workspace.project_root_path_string()))
+                .unwrap_or_else(|| workspace_path.clone())
+        } else {
+            workspace_path.clone()
+        };
         SessionMessageWorkspaceTarget {
             workspace_path,
+            project_workspace_path,
+            execution_target: binding
+                .filter(|_| inherits_current_target)
+                .and_then(|workspace| workspace.execution_target.clone()),
+            workspace_id: binding
+                .filter(|_| inherits_current_target)
+                .and_then(|workspace| workspace.workspace_id.clone()),
             remote_connection_id,
             remote_ssh_host,
         }
@@ -195,8 +212,15 @@ impl SessionMessageTool {
         &self,
         binding: AgentSessionWorkspaceBinding,
     ) -> SessionMessageWorkspaceTarget {
+        let project_workspace_path = binding
+            .project_workspace_path
+            .clone()
+            .unwrap_or_else(|| binding.workspace_path.clone());
         SessionMessageWorkspaceTarget {
             workspace_path: binding.workspace_path,
+            project_workspace_path,
+            execution_target: binding.execution_target,
+            workspace_id: binding.workspace_id,
             remote_connection_id: binding.remote_connection_id,
             remote_ssh_host: binding.remote_ssh_host,
         }
@@ -299,7 +323,7 @@ Allowed agent types when creating a session:
     }
 
     fn default_exposure(&self) -> ToolExposure {
-        ToolExposure::Collapsed
+        ToolExposure::Deferred
     }
 
     fn input_schema(&self) -> Value {
@@ -334,10 +358,6 @@ Allowed agent types when creating a session:
     }
 
     fn is_readonly(&self) -> bool {
-        false
-    }
-
-    fn needs_permissions(&self, _input: Option<&Value>) -> bool {
         false
     }
 
@@ -570,7 +590,7 @@ Allowed agent types when creating a session:
 
                 let visible_sessions = runtime
                     .list_sessions(AgentSessionListRequest {
-                        workspace_path: workspace_target.workspace_path.clone(),
+                        workspace_path: workspace_target.project_workspace_path.clone(),
                         remote_connection_id: workspace_target.remote_connection_id.clone(),
                         remote_ssh_host: workspace_target.remote_ssh_host.clone(),
                     })
@@ -637,8 +657,14 @@ Allowed agent types when creating a session:
                         session_name,
                         agent_type: agent_type.clone(),
                         workspace_path: Some(workspace_target.workspace_path.clone()),
+                        project_workspace_path: Some(
+                            workspace_target.project_workspace_path.clone(),
+                        ),
+                        execution_target: workspace_target.execution_target.clone(),
+                        workspace_id: workspace_target.workspace_id.clone(),
                         remote_connection_id: workspace_target.remote_connection_id.clone(),
                         remote_ssh_host: workspace_target.remote_ssh_host.clone(),
+                        model_id: None,
                         metadata,
                     })
                     .await
@@ -663,6 +689,7 @@ Allowed agent types when creating a session:
                 message: forwarded_message,
                 original_message: Some(params.message.clone()),
                 turn_id: None,
+                execution: Default::default(),
                 agent_type: target_agent_type.clone(),
                 workspace_path: Some(workspace_target.workspace_path.clone()),
                 remote_connection_id: workspace_target.remote_connection_id.clone(),
@@ -676,7 +703,7 @@ Allowed agent types when creating a session:
                 }),
                 prepended_reminders: prepended_messages,
                 attachments: Vec::new(),
-                metadata: serde_json::Map::new(),
+                metadata: Self::forwarded_user_input_metadata(context),
             })
             .await
             .map_err(|error| {
@@ -711,6 +738,10 @@ Allowed agent types when creating a session:
 mod tests {
     use super::*;
     use crate::agentic::tools::framework::ToolUseContext;
+    use crate::agentic::WorkspaceBinding;
+    use bitfun_core_types::{
+        SessionExecutionTarget, SessionExecutionTargetKind, WorktreeLifecycle,
+    };
     use serde_json::json;
     use std::collections::HashMap;
     use std::fs;
@@ -724,7 +755,7 @@ mod tests {
             session_id: None,
             dialog_turn_id: None,
             workspace: None,
-            unlocked_collapsed_tools: Vec::new(),
+            loaded_deferred_tool_specs: Vec::new(),
             primary_model_facts: tool_runtime::context::PrimaryModelFacts::default(),
             custom_data: HashMap::new(),
             computer_use_host: None,
@@ -769,9 +800,39 @@ mod tests {
     ) -> SessionMessageWorkspaceTarget {
         SessionMessageWorkspaceTarget {
             workspace_path: workspace_path.to_string(),
+            project_workspace_path: workspace_path.to_string(),
+            execution_target: None,
+            workspace_id: None,
             remote_connection_id: remote_connection_id.map(ToOwned::to_owned),
             remote_ssh_host: remote_ssh_host.map(ToOwned::to_owned),
         }
+    }
+
+    #[test]
+    fn creating_in_current_worktree_inherits_project_scope_and_target() {
+        let worktree_path = PathBuf::from("/worktrees/wt-1");
+        let project_path = PathBuf::from("/repo");
+        let execution_target = SessionExecutionTarget {
+            kind: SessionExecutionTargetKind::ManagedWorktree,
+            worktree_id: Some("wt-1".to_string()),
+            root_path: "/worktrees/wt-1".to_string(),
+            base_ref: Some("HEAD".to_string()),
+            base_commit: Some("0123456789abcdef".to_string()),
+            branch: None,
+            lifecycle: Some(WorktreeLifecycle::Managed),
+        };
+        let binding = WorkspaceBinding::new(None, worktree_path)
+            .with_project_root_path(project_path.clone())
+            .with_execution_target(Some(execution_target.clone()));
+        let mut context = empty_context();
+        context.workspace = Some(binding);
+
+        let target = SessionMessageTool::new()
+            .workspace_target_from_context("/worktrees/wt-1".to_string(), &context);
+
+        assert_eq!(target.workspace_path, "/worktrees/wt-1");
+        assert_eq!(PathBuf::from(target.project_workspace_path), project_path);
+        assert_eq!(target.execution_target, Some(execution_target));
     }
 
     #[test]
@@ -811,6 +872,24 @@ mod tests {
     }
 
     #[test]
+    fn session_message_forwards_noninteractive_user_input_fact() {
+        use bitfun_agent_runtime::user_questions::USER_INPUT_AVAILABLE_CONTEXT_KEY;
+
+        let mut context = empty_context();
+        context.custom_data.insert(
+            USER_INPUT_AVAILABLE_CONTEXT_KEY.to_string(),
+            Value::Bool(false),
+        );
+
+        let metadata = SessionMessageTool::forwarded_user_input_metadata(&context);
+
+        assert_eq!(
+            metadata.get(USER_INPUT_AVAILABLE_CONTEXT_KEY),
+            Some(&Value::Bool(false))
+        );
+    }
+
+    #[test]
     fn target_agent_type_uses_resolved_agent_type() {
         assert_eq!(
             SessionMessageTool::target_agent_type_from_resolution(Some("agentic".to_string()))
@@ -825,6 +904,10 @@ mod tests {
             session_id: "worker_1".to_string(),
             session_name: "Worker".to_string(),
             agent_type: "agentic".to_string(),
+            model_id: None,
+            last_user_dialog_agent_type: None,
+            last_submitted_agent_type: None,
+            turn_count: 0,
             created_at_ms: 1,
             last_active_at_ms: 2,
         }];
@@ -841,6 +924,10 @@ mod tests {
             session_id: "worker_1".to_string(),
             session_name: "Worker".to_string(),
             agent_type: " ".to_string(),
+            model_id: None,
+            last_user_dialog_agent_type: None,
+            last_submitted_agent_type: None,
+            turn_count: 0,
             created_at_ms: 1,
             last_active_at_ms: 2,
         }];

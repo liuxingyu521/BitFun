@@ -1,18 +1,13 @@
 {
   "personalizationPage": {
     "title": "个性化",
-    "subtitle": "会话标题自动生成、Agent 伙伴"
+    "subtitle": "个性化配置你的 BitFun"
   },
   "permissionsPage": {
     "title": "权限管理",
-    "subtitle": "加速工作区搜索、工具执行、Computer use、浏览器控制与调试模式"
+    "subtitle": "加速工作区搜索、工具执行、工具定义加载、Computer use、浏览器控制与调试模式"
   },
   "features": {
-    "sessionTitle": {
-      "title": "会话标题自动生成",
-      "subtitle": "新对话时 AI 自动生成简洁标题",
-      "warning": "会话标题将使用用户消息的前 20 个字符"
-    },
     "agentCompanion": {
       "title": "Agent 伙伴",
       "subtitle": "控制 BitFun 伙伴的显示方式。",
@@ -24,13 +19,13 @@
       "displayDesktop": "悬浮桌面宠物",
       "displayDesktopDesc": "在软件外显示为置顶的无边框小窗口，可拖动。",
       "petLabel": "伙伴形象",
-      "petDescription": "选择预置形象，或导入从 petdex.crafter.run 下载的 Petdex zip。",
+      "petDescription": "选择预置形象，或导入从 petdex.dev 下载的 Petdex zip。",
       "petPlaceholder": "选择伙伴形象",
       "groupPreset": "预置",
       "groupImported": "已导入",
       "import": "导入",
       "importing": "导入中",
-      "importHint": "可以去 https://petdex.crafter.run/zh 下载形象 zip 后导入。",
+      "importHint": "可以去 https://petdex.dev/ 下载形象 zip 后导入。",
       "importDialogTitle": "选择 Petdex 形象 zip",
       "importFailed": "导入 Agent 伙伴形象失败",
       "delete": "删除已导入形象",
@@ -50,11 +45,87 @@
     "sectionTitle": "工具执行行为",
     "sectionDescription": "本会话中 AI 调用工具时的确认与超时策略。"
   },
+  "permissionPolicy": {
+    "sectionTitle": "工具权限",
+    "sectionDescription": "设置默认工具访问策略和权限询问的处理方式。",
+    "mode": "权限模式",
+    "ask": "需要确认",
+    "askDescription": "外部访问，修改文件和执行命令需要确认。",
+    "fullAccess": "完全访问",
+    "fullAccessDescription": "默认允许工具执行，无需确认。",
+    "fullAccessWarningTitle": "启用完全访问？",
+    "fullAccessWarningMessage": "完全访问会默认允许工具执行，不再逐次确认。",
+    "fullAccessConfirm": "启用完全访问",
+    "cancel": "取消",
+    "autoApprove": "自动批准",
+    "autoApproveDescription": "自动批准需要确认的请求。",
+    "showInChatInput": "显示权限模式选择器",
+    "showInChatInputDescription": "在聊天输入框下方显示权限模式选择器。隐藏它不会更改当前权限模式。",
+    "globalRules": "全局规则",
+    "globalRulesDescription": "定义用户级规则；它们在所选模式之后、项目和 Agent 规则之前应用。",
+    "manageGlobalRules": "管理规则",
+    "globalRulesDialogTitle": "全局工具权限规则",
+    "globalRulesDialogDescription": "这些用户级规则会应用于所有工作区。后续项目和 Agent 规则可以覆盖它们；产品强制限制始终优先。",
+    "globalRulesTitle": "自定义全局规则",
+    "globalRulesEmpty": "尚未配置自定义全局规则。当前权限模式仍会生效。",
+    "addGlobalRule": "添加规则",
+    "globalRulesEffect": "效果",
+    "globalRulesAction": "操作",
+    "globalRulesResource": "资源",
+    "globalRulesResourcePlaceholder": "例如，workspace/*",
+    "moveGlobalRuleUp": "上移规则",
+    "moveGlobalRuleDown": "下移规则",
+    "removeGlobalRule": "删除规则",
+    "discardGlobalRules": "放弃更改",
+    "saveGlobalRules": "保存规则",
+    "globalRulesEffects": { "allow": "允许", "ask": "询问", "deny": "拒绝" }
+  },
+  "projectPermissions": {
+    "description": "“始终允许”会保存为当前项目的记忆授权；静态项目规则会在工具执行前直接应用。",
+    "grantsTitle": "记忆授权",
+    "grantsEmpty": "当前项目没有记忆授权。",
+    "removeGrant": "撤销授权",
+    "removeGrantTitle": "撤销记忆授权？",
+    "removeGrantMessage": "撤销对 {{resource}} 的 {{action}} 记忆授权？下次匹配的请求将再次询问。",
+    "removeGrantConfirm": "撤销授权",
+    "removeGrantSuccess": "已撤销记忆授权",
+    "removeGrantFailed": "撤销记忆授权失败",
+    "clearGrants": "全部清除",
+    "clearGrantsTitle": "清除全部记忆授权？",
+    "clearGrantsMessage": "清除当前项目的全部记忆授权？下次匹配的请求将再次询问。",
+    "clearGrantsConfirm": "清除全部授权",
+    "clearGrantsSuccess": "已清除记忆授权",
+    "clearGrantsFailed": "清除记忆授权失败",
+    "grantsLoadFailed": "加载记忆授权失败",
+    "rulesTitle": "静态项目规则",
+    "rulesEmpty": "尚未配置静态项目规则。",
+    "rulesLoadFailed": "加载静态项目规则失败",
+    "addRule": "添加规则",
+    "effect": "效果",
+    "action": "操作",
+    "resource": "资源",
+    "actionPlaceholder": "例如 read 或 bash",
+    "resourcePlaceholder": "例如 src/*",
+    "moveRuleUp": "上移规则",
+    "moveRuleDown": "下移规则",
+    "removeRule": "删除规则",
+    "saveRules": "保存规则",
+    "rulesSaveSuccess": "已保存静态项目规则",
+    "rulesSaveFailed": "保存静态项目规则失败",
+    "rulesConflict": "规则文件已在外部变更，请重新打开项目权限后再保存。",
+    "cancel": "取消",
+    "effects": { "allow": "允许", "ask": "询问", "deny": "拒绝" }
+  },
+  "deferredToolLoading": {
+    "sectionTitle": "工具延迟加载",
+    "sectionDescription": "仅在需要时加载部分工具的完整 Schema（包括部分内置工具及所有 MCP 工具）。",
+    "warning": "当前会在每次请求中发送启用工具的完整 Schema；如果配置了大量 MCP 工具会占用较多 Token。"
+  },
   "computerUse": {
     "sectionTitle": "Computer use（桌面自动化）",
     "sectionDescription": "在 BitFun 桌面端允许助理截取屏幕并控制键鼠；需多模态模型理解画面。",
     "enable": "启用 Computer use",
-    "enableDesc": "关闭时，任何会话模式都不会启用 ComputerUse 工具。",
+    "enableDesc": "关闭时，任何会话模式都不会启用 ComputerUse 工具；浏览器控制（ControlHub）目前不受此开关约束。",
     "accessibility": "辅助功能",
     "accessibilityDesc": "macOS 上用于让 BitFun 读取屏幕上的界面元素并向其他应用发送鼠标/键盘操作；Windows 无需单独授权，Linux 需要 X11 会话。",
     "screenCapture": "屏幕录制",
@@ -96,17 +167,8 @@
     "createLauncherDesc": "创建带调试端口的浏览器快捷方式。",
     "tabs": "个标签页"
   },
-  "model": {
-    "label": "模型",
-    "primary": "主力模型",
-    "fast": "快速模型"
-  },
   "common": {
     "enable": "启用"
-  },
-  "models": {
-    "empty": "暂无可用模型，请先在「模型」中添加模型。",
-    "updateSuccess": "{{agentName}} 将使用 {{modelName}}"
   },
   "loading": {
     "text": "加载配置中..."

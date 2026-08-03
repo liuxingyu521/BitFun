@@ -1,0 +1,195 @@
+const SEARCH_HIGHLIGHT_CURRENT_NAME = 'bitfun-flowchat-search-current';
+const SEARCH_HIGHLIGHT_MATCH_NAME = 'bitfun-flowchat-search-match';
+
+type HighlightRegistryLike = {
+  set: (name: string, highlight: unknown) => void;
+  delete: (name: string) => void;
+};
+
+type HighlightConstructorLike = new (...ranges: Range[]) => unknown;
+
+interface FoldedTextOffset {
+  start: number;
+  end: number;
+}
+
+function isSearchableTextNode(node: Node): node is Text {
+  if (node.nodeType !== Node.TEXT_NODE || !node.textContent) {
+    return false;
+  }
+
+  const parent = node.parentElement;
+  if (!parent) {
+    return false;
+  }
+
+  return !parent.closest('script, style, [aria-hidden="true"]');
+}
+
+function foldTextWithOriginalOffsets(text: string): {
+  text: string;
+  offsets: FoldedTextOffset[];
+} {
+  // Built from the same per-character foldings the offsets are built from.
+  // Lowercasing the whole string separately is not guaranteed to produce the
+  // same length as concatenating per-character results, and any divergence
+  // leaves holes in `offsets` — the lookup then returns undefined and a real
+  // match is silently dropped.
+  const foldedParts: string[] = [];
+  const offsets: FoldedTextOffset[] = [];
+  let originalOffset = 0;
+  let foldedOffset = 0;
+
+  for (const character of text) {
+    const start = originalOffset;
+    originalOffset += character.length;
+    const folded = character.toLowerCase();
+    foldedParts.push(folded);
+
+    for (let index = 0; index < folded.length; index += 1) {
+      offsets[foldedOffset + index] = {
+        start,
+        end: originalOffset,
+      };
+    }
+    foldedOffset += folded.length;
+  }
+
+  return {
+    text: foldedParts.join(''),
+    offsets,
+  };
+}
+
+/**
+ * Finds every non-overlapping case-insensitive occurrence of the query, even
+ * when Markdown splits it across adjacent text nodes (for example, around
+ * inline emphasis or code spans). Ranges are returned in document order.
+ */
+export function findFlowChatSearchTextRanges(root: HTMLElement, query: string): Range[] {
+  const trimmedQuery = query.trim();
+  if (!trimmedQuery) {
+    return [];
+  }
+
+  const ownerDocument = root.ownerDocument;
+  const walker = ownerDocument.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  const textNodes: Array<{ node: Text; start: number; end: number }> = [];
+  let combinedText = '';
+  let currentNode = walker.nextNode();
+
+  while (currentNode) {
+    if (isSearchableTextNode(currentNode)) {
+      const start = combinedText.length;
+      combinedText += currentNode.textContent;
+      textNodes.push({
+        node: currentNode,
+        start,
+        end: combinedText.length,
+      });
+    }
+    currentNode = walker.nextNode();
+  }
+
+  const folded = foldTextWithOriginalOffsets(combinedText);
+  const foldedQuery = trimmedQuery.toLowerCase();
+  const ranges: Range[] = [];
+  let searchFrom = 0;
+
+  for (;;) {
+    const foldedMatchStart = folded.text.indexOf(foldedQuery, searchFrom);
+    if (foldedMatchStart < 0) {
+      return ranges;
+    }
+    searchFrom = foldedMatchStart + foldedQuery.length;
+
+    const foldedMatchEnd = foldedMatchStart + foldedQuery.length;
+    const matchStart = folded.offsets[foldedMatchStart]?.start;
+    const matchEnd = folded.offsets[foldedMatchEnd - 1]?.end;
+    if (matchStart === undefined || matchEnd === undefined) {
+      continue;
+    }
+
+    const startEntry = textNodes.find(entry => matchStart >= entry.start && matchStart < entry.end);
+    const endEntry = textNodes.find(entry => matchEnd > entry.start && matchEnd <= entry.end);
+    if (!startEntry || !endEntry) {
+      continue;
+    }
+
+    const range = ownerDocument.createRange();
+    range.setStart(startEntry.node, matchStart - startEntry.start);
+    range.setEnd(endEntry.node, matchEnd - endEntry.start);
+    ranges.push(range);
+  }
+}
+
+export function findFlowChatSearchTextRange(root: HTMLElement, query: string): Range | null {
+  return findFlowChatSearchTextRanges(root, query)[0] ?? null;
+}
+
+/**
+ * Highlights the current occurrence and, more faintly, every other occurrence
+ * in the same text root. Passing `null` clears both highlight registries.
+ */
+export function setFlowChatSearchHighlight(
+  currentRange: Range | null,
+  otherRanges: readonly Range[] = [],
+): void {
+  const cssWithHighlights = globalThis.CSS as (typeof CSS & {
+    highlights?: HighlightRegistryLike;
+  }) | undefined;
+  const HighlightConstructor = (globalThis as typeof globalThis & {
+    Highlight?: HighlightConstructorLike;
+  }).Highlight;
+
+  if (!cssWithHighlights?.highlights) {
+    return;
+  }
+
+  cssWithHighlights.highlights.delete(SEARCH_HIGHLIGHT_CURRENT_NAME);
+  cssWithHighlights.highlights.delete(SEARCH_HIGHLIGHT_MATCH_NAME);
+  if (!HighlightConstructor) {
+    return;
+  }
+  if (currentRange) {
+    cssWithHighlights.highlights.set(
+      SEARCH_HIGHLIGHT_CURRENT_NAME,
+      new HighlightConstructor(currentRange),
+    );
+  }
+  if (otherRanges.length > 0) {
+    cssWithHighlights.highlights.set(
+      SEARCH_HIGHLIGHT_MATCH_NAME,
+      new HighlightConstructor(...otherRanges),
+    );
+  }
+}
+
+export function findElementWithDataValue(
+  root: HTMLElement,
+  attributeName: 'data-flow-item-id' | 'data-tool-card-id',
+  value: string,
+): HTMLElement | null {
+  return Array.from(root.querySelectorAll<HTMLElement>(`[${attributeName}]`))
+    .find(element => element.getAttribute(attributeName) === value) ?? null;
+}
+
+export function getFlowChatSearchTextRoot(
+  wrapper: HTMLElement,
+  flowItemId?: string,
+): HTMLElement {
+  if (flowItemId) {
+    const flowItem = findElementWithDataValue(wrapper, 'data-flow-item-id', flowItemId);
+    if (flowItem) {
+      return flowItem;
+    }
+
+    const thinkingItem = findElementWithDataValue(wrapper, 'data-tool-card-id', flowItemId);
+    const thinkingText = thinkingItem?.querySelector<HTMLElement>('.thinking-markdown');
+    if (thinkingText) {
+      return thinkingText;
+    }
+  }
+
+  return wrapper.querySelector<HTMLElement>('.user-message-item__content') ?? wrapper;
+}

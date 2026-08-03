@@ -23,7 +23,9 @@ dist-ssr
 # Build outputs - Rust/Tauri
 target/
 **/target/
-Cargo.lock
+# The deployable Rust services use the workspace lockfile for reproducible
+# container builds.
+!Cargo.lock
 
 # Monaco Editor - copied from node_modules
 public/monaco-editor/
@@ -67,6 +69,8 @@ tests/e2e/reports/
 
 # Eval job artifacts
 .eval/
+.tmp/
+tmp/
 Cross.toml
 
 # BitFun sandbox data - auto managed
@@ -81,3 +85,4 @@ ASSETS_LICENSES.md
 external/
 /.bitfun/search/flashgrep-index/
 .agents/
+/.flashgrep-index-engine/

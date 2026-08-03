@@ -61,6 +61,7 @@ pub struct BotStrings {
     pub item_switch_assistant: &'static str,
     pub item_switch_workspace: &'static str,
     pub item_settings: &'static str,
+    pub item_devices: &'static str,
     pub item_back: &'static str,
     pub item_help: &'static str,
     pub item_switch_to_expert: &'static str,
@@ -103,6 +104,7 @@ pub struct BotStrings {
 
     pub resume_no_sessions: &'static str,
     pub resume_page_label: &'static str,
+    pub resume_untitled: &'static str,
     pub resume_msg_count_zero: &'static str,
     pub resume_msg_count_one: &'static str,
     pub resume_msg_count_many_fmt: &'static str,
@@ -168,6 +170,22 @@ pub struct BotStrings {
     pub auto_push_intro_many_fmt: &'static str,
     pub auto_push_skip_too_large_fmt: &'static str,
     pub auto_push_failed_fmt: &'static str,
+
+    // ── Multi-device control ─────────────────────────────────────
+    pub devices_title: &'static str,
+    pub devices_account_required: &'static str,
+    pub devices_empty: &'static str,
+    pub devices_status_online: &'static str,
+    pub devices_status_offline: &'static str,
+    pub devices_list_failed_prefix: &'static str,
+    pub devices_send_ok: &'static str,
+    pub devices_send_failed_prefix: &'static str,
+    pub devices_local: &'static str,
+    pub devices_pick_to_switch: &'static str,
+    pub devices_switched_to: &'static str,
+    pub devices_switched_local: &'static str,
+    pub devices_remote_prefix: &'static str,
+    pub devices_msg_sent: &'static str,
 }
 
 const STRINGS_ZH: BotStrings = BotStrings {
@@ -204,6 +222,7 @@ const STRINGS_ZH: BotStrings = BotStrings {
     item_switch_assistant: "切换助理",
     item_switch_workspace: "切换工作区",
     item_settings: "设置",
+    item_devices: "设备",
     item_back: "返回",
     item_help: "帮助",
     item_switch_to_expert: "切换到专业模式",
@@ -223,7 +242,7 @@ const STRINGS_ZH: BotStrings = BotStrings {
     footer_reply_or_menu: "回复编号，或发送 /menu 返回主菜单",
     footer_reply_workspace: "回复工作区编号，或发送 0 返回",
     footer_reply_assistant: "回复助理编号，或发送 0 返回",
-    footer_reply_session_or_next: "回复会话编号；发送 0 查看下一页或返回",
+    footer_reply_session_or_next: "回复会话编号；发送 0 查看下一页，或发送 /menu 返回",
     footer_reply_session: "回复会话编号，或发送 0 返回",
     footer_reply_model: "回复模型编号，或发送 0 返回",
     footer_question_single: "回复单个选项编号；发送 /menu 退出",
@@ -243,6 +262,7 @@ const STRINGS_ZH: BotStrings = BotStrings {
 
     resume_no_sessions: "当前还没有会话，可以发送 /new 直接新建。",
     resume_page_label: "会话历史",
+    resume_untitled: "未命名会话",
     resume_msg_count_zero: "无消息",
     resume_msg_count_one: "1 条消息",
     resume_msg_count_many_fmt: "{n} 条消息",
@@ -308,6 +328,21 @@ const STRINGS_ZH: BotStrings = BotStrings {
     auto_push_intro_many_fmt: "正在为你发送 {n} 个文件……",
     auto_push_skip_too_large_fmt: "已跳过「{name}」：{size} 超过 {limit} 上限，请改用桌面端获取。",
     auto_push_failed_fmt: "发送「{name}」失败：{err}",
+
+    devices_title: "多设备控制",
+    devices_account_required: "所连接的桌面端尚未登录 BitFun 账号，无法使用多设备控制。请在桌面端的账号登录对话框中登录，机器人会自动继承账号身份。",
+    devices_empty: "当前账号下没有其它设备。",
+    devices_status_online: "在线",
+    devices_status_offline: "离线",
+    devices_list_failed_prefix: "获取设备列表失败：",
+    devices_send_ok: "消息已发送到目标设备。",
+    devices_send_failed_prefix: "发送到设备失败：",
+    devices_local: "本地设备",
+    devices_pick_to_switch: "回复序号切换设备，之后所有操作在该设备上执行；发送 0 返回",
+    devices_switched_to: "已切换到远程设备",
+    devices_switched_local: "已切换回本地设备",
+    devices_remote_prefix: "远程设备",
+    devices_msg_sent: "消息已发送，远程 agent 正在执行",
 };
 
 const STRINGS_ZH_TW: BotStrings = BotStrings {
@@ -344,6 +379,7 @@ const STRINGS_ZH_TW: BotStrings = BotStrings {
     item_switch_assistant: "切換助理",
     item_switch_workspace: "切換工作區",
     item_settings: "設置",
+    item_devices: "裝置",
     item_back: "返回",
     item_help: "幫助",
     item_switch_to_expert: "切換到專業模式",
@@ -363,7 +399,7 @@ const STRINGS_ZH_TW: BotStrings = BotStrings {
     footer_reply_or_menu: "回覆編號，或發送 /menu 返回主菜單",
     footer_reply_workspace: "回覆工作區編號，或發送 0 返回",
     footer_reply_assistant: "回覆助理編號，或發送 0 返回",
-    footer_reply_session_or_next: "回覆會話編號；發送 0 查看下一頁或返回",
+    footer_reply_session_or_next: "回覆會話編號；發送 0 查看下一頁，或發送 /menu 返回",
     footer_reply_session: "回覆會話編號，或發送 0 返回",
     footer_reply_model: "回覆模型編號，或發送 0 返回",
     footer_question_single: "回覆單個選項編號；發送 /menu 退出",
@@ -383,6 +419,7 @@ const STRINGS_ZH_TW: BotStrings = BotStrings {
 
     resume_no_sessions: "當前還沒有會話，可以發送 /new 直接新建。",
     resume_page_label: "會話歷史",
+    resume_untitled: "未命名會話",
     resume_msg_count_zero: "無消息",
     resume_msg_count_one: "1 條消息",
     resume_msg_count_many_fmt: "{n} 條消息",
@@ -448,6 +485,21 @@ const STRINGS_ZH_TW: BotStrings = BotStrings {
     auto_push_intro_many_fmt: "正在為你發送 {n} 個文件……",
     auto_push_skip_too_large_fmt: "已跳過「{name}」：{size} 超過 {limit} 上限，請改用桌面端獲取。",
     auto_push_failed_fmt: "發送「{name}」失敗：{err}",
+
+    devices_title: "多裝置控制",
+    devices_account_required: "所連接的桌面端尚未登入 BitFun 帳號，無法使用多裝置控制。請在桌面端的帳號登入對話框中登入，機器人會自動繼承帳號身份。",
+    devices_empty: "目前帳號下沒有其它裝置。",
+    devices_status_online: "線上",
+    devices_status_offline: "離線",
+    devices_list_failed_prefix: "取得裝置清單失敗：",
+    devices_send_ok: "訊息已傳送到目標裝置。",
+    devices_send_failed_prefix: "傳送到裝置失敗：",
+    devices_local: "本地裝置",
+    devices_pick_to_switch: "回覆序號切換裝置，之後所有操作在該裝置上執行；發送 0 返回",
+    devices_switched_to: "已切換到遠端裝置",
+    devices_switched_local: "已切換回本地裝置",
+    devices_remote_prefix: "遠端裝置",
+    devices_msg_sent: "訊息已傳送，遠端 agent 正在執行",
 };
 
 const STRINGS_EN: BotStrings = BotStrings {
@@ -484,6 +536,7 @@ Open Remote Connect in BitFun Desktop and send the 6-digit pairing code here to 
     item_switch_assistant: "Switch Assistant",
     item_switch_workspace: "Switch Workspace",
     item_settings: "Settings",
+    item_devices: "Devices",
     item_back: "Back",
     item_help: "Help",
     item_switch_to_expert: "Switch to Expert Mode",
@@ -503,7 +556,8 @@ Open Remote Connect in BitFun Desktop and send the 6-digit pairing code here to 
     footer_reply_or_menu: "Reply with a number, or send /menu to return.",
     footer_reply_workspace: "Reply with a workspace number, or 0 to go back.",
     footer_reply_assistant: "Reply with an assistant number, or 0 to go back.",
-    footer_reply_session_or_next: "Reply with a session number; send 0 for next page or to go back.",
+    footer_reply_session_or_next:
+        "Reply with a session number; send 0 for the next page, or /menu to return.",
     footer_reply_session: "Reply with a session number, or 0 to go back.",
     footer_reply_model: "Reply with a model number, or 0 to go back.",
     footer_question_single: "Reply with one option number; send /menu to exit.",
@@ -523,6 +577,7 @@ Open Remote Connect in BitFun Desktop and send the 6-digit pairing code here to 
 
     resume_no_sessions: "No sessions yet. Send /new to create one.",
     resume_page_label: "Sessions",
+    resume_untitled: "Untitled session",
     resume_msg_count_zero: "no messages",
     resume_msg_count_one: "1 message",
     resume_msg_count_many_fmt: "{n} messages",
@@ -588,6 +643,22 @@ Open Remote Connect in BitFun Desktop and send the 6-digit pairing code here to 
     auto_push_intro_many_fmt: "Sending {n} files for you…",
     auto_push_skip_too_large_fmt: "Skipping \"{name}\": {size} exceeds the {limit} limit. Please grab it from BitFun Desktop instead.",
     auto_push_failed_fmt: "Failed to send \"{name}\": {err}",
+
+    devices_title: "Multi-device Control",
+    devices_account_required: "The paired desktop is not logged into a BitFun account, so multi-device control is unavailable. Log in via the desktop's Account Login dialog and the bot will inherit the account identity.",
+    devices_empty: "No other devices in this account.",
+    devices_status_online: "online",
+    devices_status_offline: "offline",
+    devices_list_failed_prefix: "Failed to list devices: ",
+    devices_send_ok: "Message sent to the target device.",
+    devices_send_failed_prefix: "Failed to send to device: ",
+    devices_local: "Local device",
+    devices_pick_to_switch:
+        "Reply with a number to switch — all subsequent commands run on that device; send 0 to return",
+    devices_switched_to: "Switched to remote device",
+    devices_switched_local: "Switched back to local device",
+    devices_remote_prefix: "Remote device",
+    devices_msg_sent: "Message sent, remote agent is working",
 };
 
 pub fn strings_for(language: BotLanguage) -> &'static BotStrings {

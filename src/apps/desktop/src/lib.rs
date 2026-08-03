@@ -1,13 +1,35 @@
+#![recursion_limit = "256"]
 #![allow(non_snake_case)]
 //! BitFun Desktop - Tauri-based desktop application with TransportAdapter architecture
+//!
+//! The reqwest HTTP/2 and MCP transport type graph exceeds rustc's default
+//! trait-evaluation recursion budget when desktop tasks require `Send`.
+//!
+//! Concretely, dropping the limit back to 128 fails with `overflow evaluating
+//! the requirement Vec<slab::Entry<h2::…::Slot<h2::…::recv::Event>>>: Send`.
+//! The chain runs ~15 frames through h2's own internals (`Slab` → `Buffer` →
+//! `Recv` → `Actions` → `Inner` → `Arc<Mutex<_>>` → `RecvStream` → hyper's
+//! `Incoming`), into the MCP remote transport, then out through roughly ten
+//! nested `async fn` bodies from `agentic::coordination::scheduler` to the
+//! `tokio::spawn` in `api::remote_connect_api`.
+//!
+//! Most of that depth is in third-party types, so `Box::pin`-ing one of our own
+//! futures does not collapse it; only erasing a mid-chain future to
+//! `Pin<Box<dyn Future + Send>>` would, at the cost of an allocation and dynamic
+//! dispatch on the dialog-turn path. Raising the budget is the mechanism rustc
+//! itself suggests, costs nothing at runtime, and is re-checked whenever this
+//! attribute is touched.
 
 pub mod api;
+pub mod appearance;
 pub mod computer_use;
 pub mod crash_diagnostics;
+mod embedded_relay_host;
 pub mod logging;
 pub mod macos_menubar;
+pub mod runtime;
+pub mod sleep_prevention;
 pub mod startup_trace;
-pub mod theme;
 pub mod tray;
 
 use bitfun_core::agentic::tools::computer_use_capability::set_computer_use_desktop_available;
@@ -26,6 +48,7 @@ use std::sync::{
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::Emitter;
 use tauri::Manager;
+use tauri_plugin_window_state::{AppHandleExt, StateFlags, WindowExt};
 
 // Re-export API
 pub use api::*;
@@ -41,6 +64,8 @@ use api::custom_agent_api::{
     update_custom_agent,
 };
 use api::diff_api::*;
+use api::external_hooks_api::*;
+use api::external_sources_api::*;
 use api::git_agent_api::*;
 use api::git_api::*;
 use api::i18n_api::*;
@@ -53,6 +78,7 @@ use api::search_api::*;
 use api::session_api::*;
 use api::skill_api::*;
 use api::snapshot_service::*;
+use api::speech_api::*;
 use api::startchat_agent_api::*;
 use api::storage_commands::*;
 use api::subagent_api::*;
@@ -85,7 +111,17 @@ static MAIN_WINDOW_HIDDEN_ON_MACOS: AtomicBool = AtomicBool::new(false);
 static MAIN_WINDOW_CLOSE_PENDING_ON_MACOS: AtomicBool = AtomicBool::new(false);
 
 const MAIN_WINDOW_CLOSE_REQUESTED_EVENT: &str = "bitfun_main_window_close_requested";
+const BROWSER_WEBVIEW_PAGE_LOAD_EVENT: &str = "browser-webview-page-load";
 const CRON_DESKTOP_START_FALLBACK_DELAY: Duration = Duration::from_secs(120);
+pub(crate) const MAIN_WINDOW_DEFAULT_WIDTH: f64 = 1200.0;
+pub(crate) const MAIN_WINDOW_DEFAULT_HEIGHT: f64 = 800.0;
+pub(crate) const MAIN_WINDOW_MIN_WIDTH: f64 = 800.0;
+pub(crate) const MAIN_WINDOW_MIN_HEIGHT: f64 = 600.0;
+
+// Toolbar mode temporarily morphs the main window into a compact floating
+// surface. Its geometry must never replace the normal main-window geometry
+// restored on the next process start.
+static MAIN_WINDOW_USES_TRANSIENT_GEOMETRY: AtomicBool = AtomicBool::new(false);
 
 #[cfg(target_os = "macos")]
 const MAIN_WINDOW_CLOSE_FALLBACK_HIDE_MS: u64 = 2_500;
@@ -246,6 +282,133 @@ fn handle_secondary_launch(app: &tauri::AppHandle) {
     }
 }
 
+fn main_window_state_flags() -> StateFlags {
+    StateFlags::SIZE | StateFlags::POSITION | StateFlags::MAXIMIZED | StateFlags::FULLSCREEN
+}
+
+fn persist_main_window_state(app: &tauri::AppHandle) -> Result<(), String> {
+    app.save_window_state(main_window_state_flags())
+        .map_err(|error| error.to_string())
+}
+
+pub(crate) fn save_main_window_state(app: &tauri::AppHandle) {
+    if MAIN_WINDOW_USES_TRANSIENT_GEOMETRY.load(Ordering::SeqCst) {
+        log::debug!("Skipped saving transient main window geometry");
+        return;
+    }
+
+    if let Err(error) = persist_main_window_state(app) {
+        log::warn!("Failed to save main window state: {}", error);
+    }
+}
+
+pub(crate) fn set_main_window_transient_geometry(
+    app: &tauri::AppHandle,
+    transient: bool,
+) -> Result<(), String> {
+    if transient {
+        if MAIN_WINDOW_USES_TRANSIENT_GEOMETRY.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+
+        // Capture the latest normal bounds before toolbar mode starts resizing
+        // the shared native window.
+        persist_main_window_state(app).map_err(|error| {
+            format!(
+                "Failed to save main window state before transient geometry: {}",
+                error
+            )
+        })?;
+        MAIN_WINDOW_USES_TRANSIENT_GEOMETRY.store(true, Ordering::SeqCst);
+        return Ok(());
+    }
+
+    MAIN_WINDOW_USES_TRANSIENT_GEOMETRY.store(false, Ordering::SeqCst);
+    persist_main_window_state(app).map_err(|error| {
+        format!(
+            "Failed to save restored main window state after transient geometry: {}",
+            error
+        )
+    })
+}
+
+fn has_standard_main_window_size(width: f64, height: f64) -> bool {
+    width >= MAIN_WINDOW_MIN_WIDTH && height >= MAIN_WINDOW_MIN_HEIGHT
+}
+
+pub(crate) fn restore_main_window_state(window: &tauri::WebviewWindow) {
+    if let Err(error) = window.restore_state(main_window_state_flags()) {
+        log::warn!("Failed to restore main window state: {}", error);
+    }
+
+    let is_maximized = window.is_maximized().unwrap_or(false);
+    let is_fullscreen = window.is_fullscreen().unwrap_or(false);
+    if !is_maximized && !is_fullscreen {
+        match (window.inner_size(), window.scale_factor()) {
+            (Ok(size), Ok(scale_factor)) => {
+                let logical_size = size.to_logical::<f64>(scale_factor);
+                if !has_standard_main_window_size(logical_size.width, logical_size.height) {
+                    log::info!(
+                        "Resetting undersized main window state: width={}, height={}",
+                        logical_size.width,
+                        logical_size.height
+                    );
+
+                    let resize_result = window.set_size(tauri::LogicalSize::new(
+                        MAIN_WINDOW_DEFAULT_WIDTH,
+                        MAIN_WINDOW_DEFAULT_HEIGHT,
+                    ));
+                    let center_result = window.center();
+                    let resize_succeeded = match resize_result {
+                        Ok(()) => true,
+                        Err(error) => {
+                            log::warn!("Failed to reset main window size: {}", error);
+                            false
+                        }
+                    };
+                    if let Err(error) = center_result {
+                        log::warn!("Failed to center reset main window: {}", error);
+                    }
+                    if resize_succeeded {
+                        if let Err(error) = persist_main_window_state(window.app_handle()) {
+                            log::warn!("Failed to persist repaired main window state: {}", error);
+                        }
+                    }
+                }
+            }
+            (Err(error), _) => {
+                log::warn!("Failed to read restored main window size: {}", error);
+            }
+            (_, Err(error)) => {
+                log::warn!("Failed to read main window scale factor: {}", error);
+            }
+        }
+    }
+
+    if let Err(error) = window.set_min_size(Some(tauri::LogicalSize::new(
+        MAIN_WINDOW_MIN_WIDTH,
+        MAIN_WINDOW_MIN_HEIGHT,
+    ))) {
+        log::warn!("Failed to set main window minimum size: {}", error);
+    }
+}
+
+#[cfg(test)]
+mod main_window_geometry_tests {
+    use super::has_standard_main_window_size;
+
+    #[test]
+    fn floating_toolbar_sizes_are_not_valid_main_window_sizes() {
+        assert!(!has_standard_main_window_size(440.0, 680.0));
+        assert!(!has_standard_main_window_size(700.0, 140.0));
+    }
+
+    #[test]
+    fn default_client_size_is_a_valid_main_window_size() {
+        assert!(has_standard_main_window_size(1200.0, 800.0));
+    }
+}
+
 #[tauri::command]
 async fn webdriver_bridge_result(request: WebdriverBridgeResultRequest) -> Result<(), String> {
     log::debug!("webdriver_bridge_result command invoked");
@@ -280,7 +443,6 @@ pub async fn run() {
     // Install the rustls ring CryptoProvider as the process-level default early,
     // so that all subsequent TLS operations (relay_client, reqwest, tokio-tungstenite)
     // reuse the same provider instead of each attempting their own install_default().
-    // This is a no-op on non-Windows platforms where tokio-tungstenite handles it.
     bitfun_core::service::remote_connect::ensure_rustls_crypto_provider();
 
     eprintln!("=== BitFun Desktop Starting ===");
@@ -293,48 +455,77 @@ pub async fn run() {
     startup_timings.record_elapsed("initialize_global_config", step_started);
     startup_trace.record_elapsed_step("native_pre_tauri", "initialize_global_config", step_started);
 
-    // Initialize global I18nService so bot/remote-connect language is always in sync.
-    {
+    // The three steps below only depend on the global config service (initialized
+    // above) and write to disjoint global singletons, so they can run concurrently:
+    // - initialize_global_i18n_service: reads config, sets the global i18n singleton
+    // - resolve_runtime_log_level: reads config, returns a value
+    // - AIClientFactory::initialize_global: reads config, sets GLOBAL_AI_CLIENT_FACTORY
+    let (
+        i18n_duration_ms,
+        (startup_log_level, log_level_duration_ms),
+        (ai_factory_result, ai_factory_duration_ms),
+    ) = {
         use bitfun_core::service::config::get_global_config_service;
         use bitfun_core::service::i18n::initialize_global_i18n_service;
-        let step_started = Instant::now();
-        match get_global_config_service().await {
-            Ok(config_service) => {
-                if let Err(e) = initialize_global_i18n_service(Some(config_service)).await {
-                    log::error!("Failed to initialize global I18nService: {}", e);
+
+        // Initialize global I18nService so bot/remote-connect language is always in sync.
+        let i18n_task = async {
+            let step_started = Instant::now();
+            match get_global_config_service().await {
+                Ok(config_service) => {
+                    if let Err(e) = initialize_global_i18n_service(Some(config_service)).await {
+                        log::error!("Failed to initialize global I18nService: {}", e);
+                    }
+                }
+                Err(e) => {
+                    log::error!("Failed to get config service for I18nService init: {}", e);
                 }
             }
-            Err(e) => {
-                log::error!("Failed to get config service for I18nService init: {}", e);
-            }
-        }
-        startup_timings.record_elapsed("initialize_global_i18n_service", step_started);
-        startup_trace.record_elapsed_step(
-            "native_pre_tauri",
-            "initialize_global_i18n_service",
-            step_started,
-        );
-    }
+            elapsed_ms(step_started)
+        };
 
-    let step_started = Instant::now();
-    let startup_log_level = resolve_runtime_log_level(log_config.level).await;
-    startup_trace.record_elapsed_step(
+        let log_level_task = async {
+            let step_started = Instant::now();
+            let level = resolve_runtime_log_level(log_config.level).await;
+            (level, elapsed_ms(step_started))
+        };
+
+        let ai_factory_task = async {
+            let step_started = Instant::now();
+            let result = AIClientFactory::initialize_global().await;
+            (result, elapsed_ms(step_started))
+        };
+
+        tokio::join!(i18n_task, log_level_task, ai_factory_task)
+    };
+
+    startup_timings.push_duration("initialize_global_i18n_service", i18n_duration_ms);
+    startup_trace.record_step(
+        "native_step_end",
+        "native_pre_tauri",
+        "initialize_global_i18n_service",
+        i18n_duration_ms,
+    );
+    startup_trace.record_step(
+        "native_step_end",
         "native_pre_tauri",
         "resolve_runtime_log_level",
-        step_started,
+        log_level_duration_ms,
     );
-
-    let step_started = Instant::now();
-    if let Err(e) = AIClientFactory::initialize_global().await {
+    startup_timings.push_duration(
+        "initialize_global_ai_client_factory",
+        ai_factory_duration_ms,
+    );
+    startup_trace.record_step(
+        "native_step_end",
+        "native_pre_tauri",
+        "initialize_global_ai_client_factory",
+        ai_factory_duration_ms,
+    );
+    if let Err(e) = ai_factory_result {
         log::error!("Failed to initialize global AIClientFactory: {}", e);
         return;
     }
-    startup_timings.record_elapsed("initialize_global_ai_client_factory", step_started);
-    startup_trace.record_elapsed_step(
-        "native_pre_tauri",
-        "initialize_global_ai_client_factory",
-        step_started,
-    );
 
     let step_started = Instant::now();
     let (coordinator, scheduler, event_queue, event_router, ai_client_factory, token_usage_service) =
@@ -383,6 +574,28 @@ pub async fn run() {
     startup_timings.record_elapsed("initialize_app_state", step_started);
     startup_trace.record_elapsed_step("native_pre_tauri", "initialize_app_state", step_started);
 
+    let step_started = Instant::now();
+    let desktop_runtime = match runtime::DesktopRuntimeContext::build(
+        coordinator.clone(),
+        scheduler.clone(),
+        app_state.token_usage_service.clone(),
+        app_state.workspace_service.clone(),
+        app_state.ssh_manager.clone(),
+        app_state.acp_client_service.clone(),
+    ) {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            log::error!("Failed to initialize Desktop Agent Runtime: {}", error);
+            return;
+        }
+    };
+    startup_timings.record_elapsed("initialize_desktop_agent_runtime", step_started);
+    startup_trace.record_elapsed_step(
+        "native_pre_tauri",
+        "initialize_desktop_agent_runtime",
+        step_started,
+    );
+
     let coordinator_state = CoordinatorState {
         coordinator: coordinator.clone(),
     };
@@ -421,7 +634,20 @@ pub async fn run() {
         )
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(
+            tauri_plugin_window_state::Builder::default()
+                // Restore explicitly after the main window is built, and save
+                // explicitly at normal-geometry boundaries. Empty automatic
+                // flags keep toolbar-mode resize/move events out of the
+                // plugin cache and prevent its exit hook from overwriting the
+                // last normal main-window geometry.
+                .with_state_flags(StateFlags::empty())
+                .with_filter(|label| label == "main")
+                .build(),
+        )
         .manage(app_state)
+        .manage(sleep_prevention::SleepPreventionState::default())
+        .manage(desktop_runtime)
         .manage(coordinator_state)
         .manage(scheduler_state)
         .manage(path_manager)
@@ -429,6 +655,26 @@ pub async fn run() {
         .manage(scheduler)
         .manage(terminal_state)
         .manage(startup_trace.clone())
+        .on_page_load(|webview, payload| {
+            let label = webview.label();
+            if label.starts_with("embedded-browser-view-")
+                || label.starts_with("embedded-browser-panel-view-")
+            {
+                let event = match payload.event() {
+                    tauri::webview::PageLoadEvent::Started => "started",
+                    tauri::webview::PageLoadEvent::Finished => "finished",
+                };
+                let _ = webview.emit_to(
+                    "main",
+                    BROWSER_WEBVIEW_PAGE_LOAD_EVENT,
+                    serde_json::json!({
+                        "label": label,
+                        "event": event,
+                        "url": payload.url(),
+                    }),
+                );
+            }
+        })
         .setup(move |app| {
             let setup_started = Instant::now();
             startup_trace.record_phase("tauri_setup_start", "native_setup");
@@ -619,14 +865,33 @@ pub async fn run() {
                 let app_state: tauri::State<'_, api::app_state::AppState> = app.state();
                 let startup_trace_state: tauri::State<'_, startup_trace::DesktopStartupTrace> =
                     app.state();
+                // Cap how long a slow-disk workspace snapshot may delay window creation;
+                // on timeout the frontend falls back to the existing
+                // `initialize_workspace_startup_state` command path.
+                const WORKSPACE_STARTUP_SNAPSHOT_TIMEOUT: std::time::Duration =
+                    std::time::Duration::from_secs(4);
                 tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current().block_on(
-                        prepare_workspace_startup_bootstrap_snapshot(
-                            &app_state,
-                            &app_handle,
-                            &startup_trace_state,
-                        ),
-                    )
+                    tokio::runtime::Handle::current().block_on(async {
+                        match tokio::time::timeout(
+                            WORKSPACE_STARTUP_SNAPSHOT_TIMEOUT,
+                            prepare_workspace_startup_bootstrap_snapshot(
+                                &app_state,
+                                &app_handle,
+                                &startup_trace_state,
+                            ),
+                        )
+                        .await
+                        {
+                            Ok(snapshot) => snapshot,
+                            Err(_) => {
+                                log::warn!(
+                                    "Workspace startup bootstrap snapshot timed out after {:?}; frontend will fall back to the initialize_workspace_startup_state command",
+                                    WORKSPACE_STARTUP_SNAPSHOT_TIMEOUT
+                                );
+                                None
+                            }
+                        }
+                    })
                 })
                 .and_then(|snapshot| {
                     serde_json::to_value(snapshot)
@@ -642,7 +907,7 @@ pub async fn run() {
             };
             let window_started = Instant::now();
             startup_trace.record_phase("main_window_create_start", "native_window");
-            theme::create_main_window(
+            appearance::create_main_window(
                 &app_handle,
                 &startup_trace_id,
                 &startup_trace,
@@ -726,6 +991,7 @@ pub async fn run() {
             // paired bots start listening immediately on app startup.
             let step_started = Instant::now();
             api::remote_connect_api::init_on_startup();
+            api::remote_connect_api::init_auto_sync();
             startup_trace.record_elapsed_step(
                 "native_setup",
                 "remote_connect_init_on_startup",
@@ -760,6 +1026,8 @@ pub async fn run() {
 
             let step_started = Instant::now();
             init_services(app_handle.clone(), startup_log_level);
+            api::remote_connect_api::set_account_app_handle(app_handle.clone());
+            sleep_prevention::spawn_config_listener(app_handle.clone());
             startup_trace.record_elapsed_step("native_setup", "init_services", step_started);
 
             let step_started = Instant::now();
@@ -788,6 +1056,12 @@ pub async fn run() {
         })
         .on_window_event({
             move |window, event| {
+                if window.label() == "main"
+                    && matches!(event, tauri::WindowEvent::CloseRequested { .. })
+                {
+                    save_main_window_state(window.app_handle());
+                }
+
                 if let tauri::WindowEvent::CloseRequested { api: _api, .. } = event {
                     if window.label() == "main" {
                         #[cfg(target_os = "macos")]
@@ -843,10 +1117,11 @@ pub async fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
-            theme::show_main_window,
+            appearance::show_main_window,
             hide_main_window_after_close_request,
             api::agentic_api::create_session,
             api::agentic_api::update_session_model,
+            api::agentic_api::reload_session_context,
             api::agentic_api::update_session_title,
             api::agentic_api::ensure_coordinator_session,
             api::agentic_api::start_dialog_turn,
@@ -870,6 +1145,7 @@ pub async fn run() {
             api::agentic_api::delete_session,
             api::agentic_api::restore_session,
             api::agentic_api::restore_session_view,
+            api::agentic_api::load_session_turn_window,
             api::agentic_api::restore_session_with_turns,
             api::agentic_api::reset_memory,
             api::agentic_api::get_memory_paths,
@@ -877,8 +1153,16 @@ pub async fn run() {
             webdriver_bridge_result,
             get_startup_native_trace,
             api::agentic_api::list_sessions,
-            api::agentic_api::confirm_tool_execution,
-            api::agentic_api::reject_tool_execution,
+            api::agentic_api::list_pending_permission_requests,
+            api::agentic_api::subscribe_permission_requests,
+            api::agentic_api::respond_permission,
+            api::agentic_api::respond_permission_batch,
+            api::agentic_api::list_project_permission_grants,
+            api::agentic_api::remove_project_permission_grant,
+            api::agentic_api::clear_project_permission_grants,
+            api::agentic_api::list_project_permission_audit,
+            api::agentic_api::get_project_permission_rules,
+            api::agentic_api::save_project_permission_rules,
             api::agentic_api::cancel_tool,
             api::agentic_api::generate_session_title,
             api::agentic_api::get_available_modes,
@@ -887,6 +1171,31 @@ pub async fn run() {
             api::btw_api::btw_cancel,
             api::editor_ai_api::editor_ai_stream,
             api::editor_ai_api::editor_ai_cancel,
+            get_external_hook_catalog,
+            get_external_hook_import_snapshot,
+            plan_external_hook_import_command,
+            apply_external_hook_import_command,
+            mutate_external_hook_import_command,
+            get_external_source_snapshot,
+            get_workspace_reference_snapshot,
+            plan_external_mcp_import_command,
+            apply_external_mcp_import_command,
+            reveal_external_source_location,
+            get_external_source_control_snapshot,
+            apply_external_source_control_action_command,
+            update_external_integration_policy_command,
+            set_external_source_enabled_command,
+            set_external_source_conflict_choice_command,
+            get_native_prompt_command_conflicts_command,
+            set_native_prompt_command_conflict_choice_command,
+            expand_external_prompt_command_command,
+            set_external_tool_target_decision_command,
+            set_external_tool_conflict_choice_command,
+            set_external_subagent_activation_command,
+            set_external_subagent_model_binding_command,
+            choose_external_subagent_conflict_command,
+            set_external_mcp_server_decision_command,
+            choose_external_mcp_conflict_command,
             api::context_upload_api::upload_image_contexts,
             get_all_tools_info,
             get_readonly_tools_info,
@@ -902,18 +1211,20 @@ pub async fn run() {
             test_ai_connection,
             test_ai_config_connection,
             list_ai_models_by_config,
-            discover_cli_credentials,
-            refresh_cli_credential,
+            list_subscription_accounts,
+            start_subscription_login,
+            get_subscription_login_status,
+            cancel_subscription_login,
+            logout_subscription_account,
+            refresh_subscription_account,
             initialize_ai,
-            set_agent_model,
-            get_agent_models,
             refresh_model_client,
             get_app_state,
             update_app_status,
             update_workspace_info,
-            theme::show_agent_companion_desktop_pet,
-            theme::hide_agent_companion_desktop_pet,
-            theme::resize_agent_companion_desktop_pet,
+            appearance::show_agent_companion_desktop_pet,
+            appearance::hide_agent_companion_desktop_pet,
+            appearance::resize_agent_companion_desktop_pet,
             list_agent_companion_pets,
             import_agent_companion_pet_package,
             delete_agent_companion_pet_package,
@@ -968,7 +1279,17 @@ pub async fn run() {
             get_global_config_health,
             get_runtime_logging_info,
             export_diagnostics_bundle,
+            append_flow_chat_diagnostics,
             get_runtime_capabilities,
+            speech_list_models,
+            speech_download_model,
+            speech_cancel_model_download,
+            speech_delete_model,
+            speech_verify_model,
+            speech_start_input_session,
+            speech_append_audio_chunk,
+            speech_finish_input_session,
+            speech_cancel_input_session,
             get_agent_profile_configs,
             get_agent_profile_config,
             set_agent_profile_config,
@@ -989,10 +1310,12 @@ pub async fn run() {
             list_agent_tool_names,
             update_subagent_config,
             get_skill_configs,
+            get_global_skill_settings,
             get_mode_skill_configs,
             list_skill_market,
             search_skill_market,
             download_skill_market,
+            set_global_skill_disabled,
             set_mode_skill_disabled,
             replace_mode_skill_selection,
             reset_mode_skill_selection,
@@ -1004,6 +1327,7 @@ pub async fn run() {
             git_resolve_revision,
             git_get_repository,
             review_platform_get_workspace_snapshot,
+            review_platform_get_workspace_context,
             review_platform_get_pull_request_detail,
             review_platform_get_pull_request_review_target,
             review_platform_get_issue,
@@ -1035,6 +1359,14 @@ pub async fn run() {
             git_list_worktrees,
             git_add_worktree,
             git_remove_worktree,
+            api::worktree_api::worktree_list,
+            api::worktree_api::worktree_list_projects,
+            api::worktree_api::worktree_create,
+            api::worktree_api::worktree_create_branch,
+            api::worktree_api::worktree_promote,
+            api::worktree_api::worktree_remove,
+            api::worktree_api::worktree_recreate,
+            api::worktree_api::worktree_bind_session,
             generate_commit_message,
             quick_commit_message,
             save_git_repo_history,
@@ -1079,7 +1411,9 @@ pub async fn run() {
             initialize_project_storage,
             // Session persistence API
             list_persisted_sessions,
+            search_referenceable_sessions,
             list_persisted_sessions_page,
+            get_session_lineage,
             load_session_turns,
             get_session_usage_report,
             save_session_turn,
@@ -1132,6 +1466,7 @@ pub async fn run() {
             get_acp_session_options,
             get_acp_session_commands,
             set_acp_session_model,
+            set_acp_session_config_option,
             lsp_initialize,
             lsp_start_server_for_file,
             lsp_stop_server,
@@ -1224,7 +1559,10 @@ pub async fn run() {
             api::system_api::minimize_to_tray,
             api::system_api::initialize_tray_after_startup,
             api::system_api::startup_window_control,
+            api::system_api::set_main_window_transient_geometry,
             api::system_api::toggle_main_window_fullscreen,
+            sleep_prevention::get_prevent_sleep_enabled,
+            sleep_prevention::set_prevent_sleep_enabled,
             check_command_exists,
             check_commands_exist,
             run_system_command,
@@ -1251,6 +1589,48 @@ pub async fn run() {
             api::remote_connect_api::remote_connect_weixin_qr_poll,
             api::remote_connect_api::remote_connect_get_bot_verbose_mode,
             api::remote_connect_api::remote_connect_set_bot_verbose_mode,
+            // Account API
+            api::remote_connect_api::account_login,
+            api::remote_connect_api::account_finalize_login,
+            api::remote_connect_api::account_cancel_pending_login,
+            api::remote_connect_api::account_status,
+            api::remote_connect_api::account_logout,
+            api::remote_connect_api::account_connect_devices,
+            api::remote_connect_api::account_online_devices,
+            api::remote_connect_api::account_send_session_to_device,
+            api::remote_connect_api::account_sync_session,
+            api::remote_connect_api::account_fetch_synced_sessions,
+            api::remote_connect_api::account_delete_synced_session,
+            api::remote_connect_api::account_sync_settings,
+            api::remote_connect_api::account_fetch_settings,
+            api::remote_connect_api::account_export_local_session,
+            api::remote_connect_api::account_export_all_sessions,
+            api::remote_connect_api::account_import_remote_sessions,
+            api::remote_connect_api::account_fetch_session_turns,
+            api::remote_connect_api::account_execute_on_device,
+            api::remote_connect_api::account_auto_sync,
+            api::remote_connect_api::account_get_credential_hint,
+            api::remote_connect_api::account_token_expired,
+            api::remote_connect_api::account_list_devices,
+            api::remote_connect_api::account_delete_device,
+            api::remote_connect_api::account_device_rpc,
+            api::remote_connect_api::account_delegate_to_paired,
+            // BitFun Page API
+            api::pages_api::page_publish,
+            api::pages_api::page_save_version,
+            api::pages_api::page_list,
+            api::pages_api::page_list_versions,
+            api::pages_api::page_create_open_link,
+            api::pages_api::page_deploy,
+            api::pages_api::page_delete_version,
+            api::pages_api::page_update,
+            api::pages_api::page_unpublish,
+            api::pages_api::page_delete,
+            api::peer_host_invoke::peer_host_invoke_complete,
+            api::peer_host_invoke::peer_control_attach,
+            api::peer_host_invoke::peer_control_detach,
+            api::peer_host_invoke::peer_mode_ping,
+            api::peer_host_invoke::peer_controller_set_active,
             // MiniApp API
             api::miniapp_api::list_miniapps,
             api::miniapp_api::get_miniapp,
@@ -1291,10 +1671,28 @@ pub async fn run() {
             api::miniapp_api::miniapp_draft_worker_stop,
             api::miniapp_api::miniapp_get_customization_metadata,
             api::miniapp_api::miniapp_decline_builtin_update,
+            api::miniapp_market_api::miniapp_market_browse,
+            api::miniapp_market_api::miniapp_market_get_listing,
+            api::miniapp_market_api::miniapp_market_auth_start,
+            api::miniapp_market_api::miniapp_market_auth_poll,
+            api::miniapp_market_api::miniapp_market_capture_window,
+            api::miniapp_market_api::miniapp_market_me,
+            api::miniapp_market_api::miniapp_market_logout,
+            api::miniapp_market_api::miniapp_market_set_rating,
+            api::miniapp_market_api::miniapp_market_set_favorite,
+            api::miniapp_market_api::miniapp_market_list_submissions,
+            api::miniapp_market_api::miniapp_market_withdraw_submission,
+            api::miniapp_market_api::miniapp_market_installed_status,
+            api::miniapp_market_api::miniapp_market_installed_origins,
+            api::miniapp_market_api::miniapp_market_install,
+            api::miniapp_market_api::miniapp_market_import_package,
+            api::miniapp_market_api::miniapp_market_inspect_package,
+            api::miniapp_market_api::miniapp_market_submit_installed,
             api::miniapp_api::miniapp_ai_complete,
             api::miniapp_api::miniapp_ai_chat,
             api::miniapp_api::miniapp_ai_cancel,
             api::miniapp_api::miniapp_ai_list_models,
+            api::miniapp_agent_api::miniapp_agent_ensure_session,
             api::miniapp_agent_api::miniapp_agent_run,
             api::miniapp_agent_api::miniapp_agent_cancel,
             api::miniapp_agent_api::miniapp_agent_turn_text,
@@ -1302,6 +1700,10 @@ pub async fn run() {
             api::miniapp_export_api::miniapp_render_slide_page,
             // Browser API (embedded webview)
             api::browser_api::browser_webview_eval,
+            api::browser_api::browser_webview_create,
+            api::browser_api::browser_webview_navigate,
+            api::browser_api::browser_webview_reload,
+            api::browser_api::browser_webview_set_bounds,
             api::browser_api::browser_get_url,
             // Browser Control API (CDP-based user browser control)
             api::browser_control_api::browser_control_list_browsers,
@@ -1321,6 +1723,8 @@ pub async fn run() {
             api::ssh_api::ssh_delete_connection,
             api::ssh_api::ssh_has_stored_password,
             api::ssh_api::ssh_connect,
+            api::ssh_api::ssh_test_connection,
+            api::ssh_api::ssh_list_docker_containers,
             api::ssh_api::ssh_disconnect,
             api::ssh_api::ssh_disconnect_all,
             api::ssh_api::ssh_is_connected,
@@ -1343,6 +1747,32 @@ pub async fn run() {
             api::ssh_api::remote_close_workspace,
             api::ssh_api::remote_remove_workspace,
             api::ssh_api::remote_get_workspace_info,
+            // Detached task dispatch (controller-side SSH transport)
+            api::dispatch_api::dispatch_list_targets,
+            api::dispatch_api::dispatch_probe_target,
+            api::dispatch_api::dispatch_install_cli_start,
+            api::dispatch_api::dispatch_install_cli_poll,
+            api::dispatch_api::dispatch_install_cli_cancel,
+            api::dispatch_api::dispatch_sync_model_config,
+            api::dispatch_api::dispatch_submit,
+            api::dispatch_api::dispatch_status,
+            api::dispatch_api::dispatch_cancel,
+            api::dispatch_api::dispatch_sync_result,
+            api::dispatch_api::dispatch_list_jobs,
+            api::dispatch_api::dispatch_answer,
+            api::dispatch_api::dispatch_append,
+            api::dispatch_api::dispatch_continue,
+            api::dispatch_api::dispatch_query,
+            api::dispatch_api::dispatch_load_transcript,
+            api::dispatch_api::dispatch_save_transcript,
+            // Relay self-deploy API
+            api::relay_deploy_api::relay_deploy_preflight,
+            api::relay_deploy_api::relay_deploy_install_docker,
+            api::relay_deploy_api::relay_deploy_start,
+            api::relay_deploy_api::relay_deploy_poll,
+            api::relay_deploy_api::relay_deploy_cancel,
+            api::relay_deploy_api::relay_deploy_register,
+            api::relay_deploy_api::relay_deploy_verify,
             // Announcement / feature-demo / tips API
             api::announcement_api::get_pending_announcements,
             api::announcement_api::mark_announcement_seen,
@@ -1363,6 +1793,7 @@ pub async fn run() {
             app.run(|_app_handle, event| match event {
                 tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit => {
                     crash_diagnostics::mark_clean_shutdown("tauri_run_exit");
+                    save_main_window_state(_app_handle);
                     perform_process_exit_cleanup();
                 }
                 #[cfg(target_os = "macos")]
@@ -1415,16 +1846,22 @@ async fn init_agentic_system() -> anyhow::Result<(
 
     let tool_registry = tools::registry::get_global_tool_registry();
     let tool_state_manager = Arc::new(tools::pipeline::ToolStateManager::new(event_queue.clone()));
+    let permission_request_manager =
+        bitfun_core::product_runtime::core_permission_request_manager()
+            .map_err(anyhow::Error::msg)?;
 
     let computer_use_host: ComputerUseHostRef =
         Arc::new(computer_use::DesktopComputerUseHost::new());
     set_computer_use_desktop_available(true);
 
-    let tool_pipeline = Arc::new(tools::pipeline::ToolPipeline::new(
-        tool_registry,
-        tool_state_manager,
-        Some(computer_use_host),
-    ));
+    let tool_pipeline = Arc::new(
+        tools::pipeline::ToolPipeline::new(
+            tool_registry,
+            tool_state_manager,
+            Some(computer_use_host),
+        )
+        .with_permission_request_manager(permission_request_manager),
+    );
 
     let stream_processor = Arc::new(execution::StreamProcessor::new(event_queue.clone()));
     let round_executor = Arc::new(execution::RoundExecutor::new(
@@ -1458,12 +1895,19 @@ async fn init_agentic_system() -> anyhow::Result<(
         exec_config,
     ));
 
+    let runtime_ownership = Arc::new(
+        bitfun_core::runtime_ownership::CoreRuntimeOwnership::embedded(
+            path_manager.as_ref(),
+            "desktop",
+        ),
+    );
     let coordinator = Arc::new(coordination::ConversationCoordinator::new(
         session_manager.clone(),
         execution_engine,
         tool_pipeline,
         event_queue.clone(),
         event_router.clone(),
+        runtime_ownership,
     ));
     coordinator.set_terminal_port(
         bitfun_core::product_runtime::CoreRuntimeServicesProvider::terminal_port(),
@@ -1497,6 +1941,7 @@ async fn init_agentic_system() -> anyhow::Result<(
     coordinator.set_scheduler_notifier(scheduler.outcome_sender());
     coordinator.set_round_injection_source(scheduler.round_injection_monitor());
     coordination::set_global_scheduler(scheduler.clone());
+    api::remote_connect_api::set_dialog_scheduler(scheduler.clone());
 
     let cron_service = bitfun_core::service::cron::CronService::new(
         path_manager.clone(),
@@ -1688,8 +2133,20 @@ fn start_event_loop_with_transport(
                         log::warn!("Internal event routing failed: {:?}", e);
                     }
 
-                    if let Err(e) = transport.emit_event("", envelope.event).await {
+                    let event_for_fanout = envelope.event.clone();
+                    if let Err(e) = transport.emit_event(envelope.event).await {
                         log::error!("Failed to emit event: {:?}", e);
+                    }
+
+                    if !api::peer_host_invoke::attached_controllers().is_empty() {
+                        if let Some(projected) =
+                            bitfun_events::project_agentic_frontend_event(event_for_fanout)
+                        {
+                            api::remote_connect_api::fanout_peer_device_event(
+                                projected.event_name,
+                                projected.payload,
+                            );
+                        }
                     }
                 }
             }
@@ -1798,7 +2255,9 @@ fn create_event_emitter(
     transport: Arc<TauriTransportAdapter>,
 ) -> Arc<dyn bitfun_core::infrastructure::events::EventEmitter> {
     use bitfun_core::infrastructure::events::TransportEmitter;
-    Arc::new(TransportEmitter::new(transport))
+    let inner: Arc<dyn bitfun_core::infrastructure::events::EventEmitter> =
+        Arc::new(TransportEmitter::new(transport));
+    api::remote_connect_api::wrap_peer_aware_emitter(inner)
 }
 
 fn spawn_workspace_search_feature_listener(app_handle: tauri::AppHandle) {

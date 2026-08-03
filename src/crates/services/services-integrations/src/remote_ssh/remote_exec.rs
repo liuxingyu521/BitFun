@@ -4,6 +4,7 @@
 //! workspaces while keeping tool-owned command sessions separate from UI
 //! terminal sessions.
 
+use crate::remote_ssh::transport::{ssh_exit_code_for_signal, SSH_EXIT_STATUS_AFTER_EOF_GRACE};
 use crate::remote_ssh::SSHConnectionManager;
 use anyhow::{anyhow, Context};
 use rand::Rng;
@@ -11,6 +12,8 @@ use russh::client::Msg;
 use russh::{Channel, ChannelMsg, Sig};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use terminal_core::{spawn_pty, PtyEvent, ShellConfig, ShellType};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, Mutex, Notify};
 use tokio::time::{Duration, Instant};
 use uuid::Uuid;
@@ -200,9 +203,10 @@ struct OutputState {
 }
 
 struct OutputInner {
-    chunks: VecDeque<(u64, Vec<u8>)>,
+    chunks: VecDeque<(u64, OutputStream, Vec<u8>)>,
     next_seq: u64,
     retained_bytes: usize,
+    capture_pending_utf8: PendingUtf8Streams,
     closed: bool,
     exit_code: Option<i32>,
 }
@@ -210,6 +214,45 @@ struct OutputInner {
 #[derive(Clone)]
 struct OutputCursor {
     next_seq: u64,
+    pending_utf8: PendingUtf8Streams,
+}
+
+#[derive(Clone, Copy)]
+enum OutputStream {
+    Combined,
+    Stdout,
+    Stderr,
+}
+
+#[derive(Clone, Default)]
+struct PendingUtf8Streams {
+    combined: Vec<u8>,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+impl PendingUtf8Streams {
+    fn get_mut(&mut self, stream: OutputStream) -> &mut Vec<u8> {
+        match stream {
+            OutputStream::Combined => &mut self.combined,
+            OutputStream::Stdout => &mut self.stdout,
+            OutputStream::Stderr => &mut self.stderr,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.combined.clear();
+        self.stdout.clear();
+        self.stderr.clear();
+    }
+
+    fn finish(&mut self) -> String {
+        let mut output = String::new();
+        output.push_str(&decode_utf8_stream(&mut self.combined, &[], true));
+        output.push_str(&decode_utf8_stream(&mut self.stdout, &[], true));
+        output.push_str(&decode_utf8_stream(&mut self.stderr, &[], true));
+        output
+    }
 }
 
 struct CollectedOutput {
@@ -251,7 +294,10 @@ impl RemoteExecProcessManager {
         output_tx: Option<mpsc::Sender<String>>,
     ) -> RemoteExecResult<RemoteExecCommandResponse> {
         let process = Arc::new(spawn_remote_process(request.clone()).await?);
-        let cursor = OutputCursor { next_seq: 0 };
+        let cursor = OutputCursor {
+            next_seq: 0,
+            pending_utf8: PendingUtf8Streams::default(),
+        };
         let session_id = self
             .store_session(
                 Arc::clone(&process),
@@ -643,22 +689,104 @@ async fn spawn_remote_process(
     request: RemoteExecCommandRequest,
 ) -> anyhow::Result<RemoteExecProcess> {
     if request.tty {
-        spawn_remote_pty_process(request).await
-    } else {
-        spawn_remote_pipe_process(request).await
+        if let Some(spec) = request
+            .ssh_manager
+            .local_container_exec_spec(&request.connection_id, &request.command, true)
+            .await?
+        {
+            return spawn_local_container_pty_process(request, spec).await;
+        }
+        return spawn_remote_pty_process(request).await;
     }
+    spawn_remote_pipe_process(request).await
+}
+
+async fn spawn_local_container_pty_process(
+    request: RemoteExecCommandRequest,
+    (executable, args): (String, Vec<String>),
+) -> anyhow::Result<RemoteExecProcess> {
+    let shell_config = ShellConfig {
+        executable,
+        args,
+        env: HashMap::new(),
+        cwd: None,
+        login: false,
+    };
+    let process_id = u32::from_le_bytes(
+        Uuid::new_v4().as_bytes()[..4]
+            .try_into()
+            .expect("UUID prefix is four bytes"),
+    );
+    let spawned = spawn_pty(
+        process_id,
+        &shell_config,
+        ShellType::Custom("Docker".to_string()),
+        80,
+        24,
+    )
+    .map_err(|error| anyhow!("Failed to start local Docker PTY: {}", error))?;
+    let output = Arc::new(OutputState::new(request.output_capture_tx.clone()));
+    let (command_tx, mut command_rx) = mpsc::channel::<RemoteExecProcessCommand>(64);
+    let owner_output = output.clone();
+    let mut events = spawned.events;
+    let writer = spawned.writer;
+    let controller = spawned.controller;
+    tokio::spawn(async move {
+        let mut exit_code = None;
+        loop {
+            tokio::select! {
+                biased;
+                command = command_rx.recv() => {
+                    match command {
+                        Some(RemoteExecProcessCommand::Write(bytes)) => {
+                            if writer.write(&bytes).await.is_err() {
+                                break;
+                            }
+                        }
+                        Some(RemoteExecProcessCommand::Control(RemoteExecControlAction::Interrupt)) => {
+                            let _ = writer.write(&[0x03]).await;
+                        }
+                        Some(RemoteExecProcessCommand::Control(RemoteExecControlAction::Kill)) | None => {
+                            let _ = controller.shutdown(true).await;
+                            exit_code = Some(137);
+                            break;
+                        }
+                    }
+                }
+                event = events.recv() => {
+                    match event {
+                        Some(PtyEvent::Data(data)) => {
+                            owner_output.push_chunk(OutputStream::Combined, data).await
+                        }
+                        Some(PtyEvent::Exit { exit_code: code }) => {
+                            exit_code = code.map(|code| code as i32);
+                            break;
+                        }
+                        None => break,
+                        Some(_) => {}
+                    }
+                }
+            }
+        }
+        owner_output.close(exit_code).await;
+    });
+    Ok(RemoteExecProcess {
+        output,
+        command_tx,
+        out_of_band_control_action: StdMutex::new(None),
+    })
 }
 
 async fn spawn_remote_pipe_process(
     request: RemoteExecCommandRequest,
 ) -> anyhow::Result<RemoteExecProcess> {
-    let channel = request
+    let transport = request
         .ssh_manager
-        .open_exec_channel(&request.connection_id, &request.command)
+        .open_workspace_stdio(&request.connection_id, &request.command)
         .await?;
     let output = Arc::new(OutputState::new(request.output_capture_tx.clone()));
     let (command_tx, command_rx) = mpsc::channel::<RemoteExecProcessCommand>(8);
-    tokio::spawn(remote_pipe_owner(channel, command_rx, output.clone()));
+    tokio::spawn(workspace_pipe_owner(transport, command_rx, output.clone()));
 
     Ok(RemoteExecProcess {
         output,
@@ -685,28 +813,36 @@ async fn spawn_remote_pty_process(
     })
 }
 
-async fn remote_pipe_owner(
-    mut channel: Channel<Msg>,
+async fn workspace_pipe_owner(
+    transport: crate::remote_ssh::WorkspaceStdio,
     mut command_rx: mpsc::Receiver<RemoteExecProcessCommand>,
     output: Arc<OutputState>,
 ) {
+    let (mut stdin, mut stdout, mut stderr, control, completion) = transport.into_parts();
+    let mut completion_task = tokio::spawn(completion.wait());
     let mut exit_code = None;
+    let mut process_completed = false;
     let mut control_state: Option<RemotePipeControlState> = None;
+    let mut stdout_closed = false;
+    let mut stderr_closed = false;
+    let mut stdout_buffer = vec![0u8; 16 * 1024];
+    let mut stderr_buffer = vec![0u8; 16 * 1024];
 
     loop {
+        if process_completed && stdout_closed && stderr_closed {
+            break;
+        }
         if let Some(state) = control_state {
             if Instant::now() >= state.deadline() {
                 match state {
                     RemotePipeControlState::InterruptGrace { .. } => {
-                        let _ = channel.signal(Sig::KILL).await;
-                        let _ = channel.eof().await;
+                        let _ = control.kill().await;
                         control_state = Some(RemotePipeControlState::KillDrain {
                             deadline: Instant::now()
                                 + Duration::from_millis(REMOTE_CONTROL_DRAIN_TIMEOUT_MS),
                         });
                     }
                     RemotePipeControlState::KillDrain { .. } => {
-                        let _ = channel.close().await;
                         break;
                     }
                 }
@@ -724,57 +860,74 @@ async fn remote_pipe_owner(
 
             command = command_rx.recv() => {
                 match command {
-                    Some(RemoteExecProcessCommand::Write(_)) => {}
+                    Some(RemoteExecProcessCommand::Write(bytes)) => {
+                        if stdin.write_all(&bytes).await.is_err() {
+                            break;
+                        }
+                        let _ = stdin.flush().await;
+                    }
                     Some(RemoteExecProcessCommand::Control(RemoteExecControlAction::Interrupt)) => {
-                        let _ = channel.signal(Sig::INT).await;
-                        let _ = channel.eof().await;
+                        let _ = control.interrupt().await;
                         control_state = Some(RemotePipeControlState::InterruptGrace {
                             deadline: Instant::now()
                                 + Duration::from_millis(REMOTE_INTERRUPT_GRACE_TIMEOUT_MS),
                         });
                     }
                     Some(RemoteExecProcessCommand::Control(RemoteExecControlAction::Kill)) => {
-                        let _ = channel.signal(Sig::TERM).await;
-                        let _ = channel.eof().await;
+                        let _ = control.kill().await;
                         control_state = Some(RemotePipeControlState::KillDrain {
                             deadline: Instant::now()
                                 + Duration::from_millis(REMOTE_CONTROL_DRAIN_TIMEOUT_MS),
                         });
                     }
                     None => {
-                        let _ = channel.signal(Sig::KILL).await;
-                        let _ = channel.close().await;
-                        break;
+                        let _ = control.kill().await;
+                        control_state = Some(RemotePipeControlState::KillDrain {
+                            deadline: Instant::now()
+                                + Duration::from_millis(REMOTE_CONTROL_DRAIN_TIMEOUT_MS),
+                        });
                     }
                 }
             }
 
-            message = channel.wait() => {
-                match message {
-                    Some(ChannelMsg::Data { data }) => output.push_chunk(data.to_vec()).await,
-                    Some(ChannelMsg::ExtendedData { data, .. }) => {
-                        output.push_chunk(data.to_vec()).await;
+            read = stdout.read(&mut stdout_buffer), if !stdout_closed => {
+                match read {
+                    Ok(0) | Err(_) => stdout_closed = true,
+                    Ok(read) => {
+                        output
+                            .push_chunk(OutputStream::Stdout, stdout_buffer[..read].to_vec())
+                            .await
                     }
-                    Some(ChannelMsg::ExitStatus { exit_status }) => {
-                        exit_code = Some(exit_status as i32);
-                    }
-                    Some(ChannelMsg::ExitSignal { signal_name, .. }) => {
-                        exit_code = Some(match signal_name {
-                            Sig::INT => 130,
-                            Sig::KILL => 137,
-                            Sig::TERM => 143,
-                            _ => -1,
-                        });
-                    }
-                    Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => break,
-                    Some(_) => {}
                 }
+            }
+
+            read = stderr.read(&mut stderr_buffer), if !stderr_closed => {
+                match read {
+                    Ok(0) | Err(_) => stderr_closed = true,
+                    Ok(read) => {
+                        output
+                            .push_chunk(OutputStream::Stderr, stderr_buffer[..read].to_vec())
+                            .await
+                    }
+                }
+            }
+
+            // An unknown status stays unknown. Reporting a synthetic `-1` here
+            // used to make a command that ran fine look like it failed, and the
+            // model cannot tell that apart from a real non-zero exit.
+            completed = &mut completion_task, if !process_completed => {
+                exit_code = completed.ok().and_then(|exit| exit.exit_code);
+                process_completed = true;
             }
 
             _ = tokio::time::sleep(wait_budget), if control_state.is_some() => {}
         }
     }
 
+    let _ = stdin.shutdown().await;
+    if !completion_task.is_finished() {
+        completion_task.abort();
+    }
     output.close(exit_code).await;
 }
 
@@ -785,14 +938,21 @@ async fn remote_pty_owner(
 ) {
     let mut exit_code = None;
     let mut close_after_control_at: Option<Instant> = None;
+    let mut exit_status_deadline: Option<Instant> = None;
 
     loop {
         if close_after_control_at.is_some_and(|deadline| Instant::now() >= deadline) {
             let _ = channel.close().await;
             break;
         }
+        if exit_status_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            break;
+        }
 
         let wait_budget = close_after_control_at
+            .into_iter()
+            .chain(exit_status_deadline)
+            .min()
             .map(|deadline| deadline.saturating_duration_since(Instant::now()))
             .filter(|duration| !duration.is_zero())
             .unwrap_or_else(|| Duration::from_millis(100));
@@ -826,29 +986,86 @@ async fn remote_pty_owner(
             message = channel.wait() => {
                 match message {
                     Some(ChannelMsg::Data { data }) | Some(ChannelMsg::ExtendedData { data, .. }) => {
-                        output.push_chunk(data.to_vec()).await;
+                        output
+                            .push_chunk(OutputStream::Combined, data.to_vec())
+                            .await;
                     }
                     Some(ChannelMsg::ExitStatus { exit_status }) => {
                         exit_code = Some(exit_status as i32);
+                        if exit_status_deadline.is_some() {
+                            break;
+                        }
                     }
-                    Some(ChannelMsg::ExitSignal { signal_name, .. }) => {
-                        exit_code = Some(match signal_name {
-                            Sig::INT => 130,
-                            Sig::KILL => 137,
-                            Sig::TERM => 143,
-                            _ => -1,
+                    Some(ChannelMsg::ExitSignal { ref signal_name, .. }) => {
+                        if exit_code.is_none() {
+                            exit_code = ssh_exit_code_for_signal(signal_name);
+                        }
+                        if exit_status_deadline.is_some() && exit_code.is_some() {
+                            break;
+                        }
+                    }
+                    // See `run_ssh_channel`: EOF may precede the exit status, so
+                    // keep the channel open long enough to collect it.
+                    Some(ChannelMsg::Eof) => {
+                        if exit_code.is_some() {
+                            break;
+                        }
+                        exit_status_deadline.get_or_insert_with(|| {
+                            Instant::now() + SSH_EXIT_STATUS_AFTER_EOF_GRACE
                         });
                     }
-                    Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => break,
+                    Some(ChannelMsg::Close) | None => break,
                     Some(_) => {}
                 }
             }
 
-            _ = tokio::time::sleep(wait_budget), if close_after_control_at.is_some() => {}
+            _ = tokio::time::sleep(wait_budget),
+                if close_after_control_at.is_some() || exit_status_deadline.is_some() => {}
         }
     }
 
     output.close(exit_code).await;
+}
+
+/// Incrementally decode a UTF-8 byte stream without treating a code point split
+/// across transport chunks as invalid. Truly invalid sequences keep the
+/// previous lossy-decoding contract.
+fn decode_utf8_stream(pending: &mut Vec<u8>, chunk: &[u8], finish: bool) -> String {
+    pending.extend_from_slice(chunk);
+    let mut output = String::new();
+
+    loop {
+        match std::str::from_utf8(pending) {
+            Ok(valid) => {
+                output.push_str(valid);
+                pending.clear();
+                break;
+            }
+            Err(error) => {
+                let valid_up_to = error.valid_up_to();
+                if valid_up_to > 0 {
+                    output.push_str(
+                        std::str::from_utf8(&pending[..valid_up_to])
+                            .expect("UTF-8 validator reported a valid prefix"),
+                    );
+                    pending.drain(..valid_up_to);
+                }
+                match error.error_len() {
+                    Some(invalid_len) => {
+                        output.push('\u{fffd}');
+                        pending.drain(..invalid_len);
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+
+    if finish && !pending.is_empty() {
+        output.push_str(&String::from_utf8_lossy(pending));
+        pending.clear();
+    }
+    output
 }
 
 impl OutputState {
@@ -858,6 +1075,7 @@ impl OutputState {
                 chunks: VecDeque::new(),
                 next_seq: 0,
                 retained_bytes: 0,
+                capture_pending_utf8: PendingUtf8Streams::default(),
                 closed: false,
                 exit_code: None,
             }),
@@ -866,39 +1084,47 @@ impl OutputState {
         }
     }
 
-    async fn push_chunk(&self, chunk: Vec<u8>) {
+    async fn push_chunk(&self, stream: OutputStream, chunk: Vec<u8>) {
         if chunk.is_empty() {
             return;
         }
-        let capture_text = self
-            .output_capture_tx
-            .as_ref()
-            .map(|_| String::from_utf8_lossy(&chunk).to_string());
-        {
+        let capture_text = {
             let mut inner = self.inner.lock().await;
+            let capture_text = self.output_capture_tx.as_ref().map(|_| {
+                decode_utf8_stream(inner.capture_pending_utf8.get_mut(stream), &chunk, false)
+            });
             let seq = inner.next_seq;
             inner.next_seq = inner.next_seq.saturating_add(1);
             inner.retained_bytes = inner.retained_bytes.saturating_add(chunk.len());
-            inner.chunks.push_back((seq, chunk));
+            inner.chunks.push_back((seq, stream, chunk));
             while inner.retained_bytes > MAX_RETAINED_OUTPUT_BYTES {
-                if let Some((_, dropped)) = inner.chunks.pop_front() {
+                if let Some((_, _, dropped)) = inner.chunks.pop_front() {
                     inner.retained_bytes = inner.retained_bytes.saturating_sub(dropped.len());
                 } else {
                     break;
                 }
             }
-        }
+            capture_text
+        };
         if let (Some(tx), Some(text)) = (&self.output_capture_tx, capture_text) {
-            let _ = tx.send(text);
+            if !text.is_empty() {
+                let _ = tx.send(text);
+            }
         }
         self.notify.notify_waiters();
     }
 
     async fn close(&self, exit_code: Option<i32>) {
-        {
+        let capture_tail = {
             let mut inner = self.inner.lock().await;
             inner.closed = true;
             inner.exit_code = exit_code;
+            inner.capture_pending_utf8.finish()
+        };
+        if let Some(tx) = &self.output_capture_tx {
+            if !capture_tail.is_empty() {
+                let _ = tx.send(capture_tail);
+            }
         }
         self.notify.notify_waiters();
     }
@@ -931,16 +1157,35 @@ impl OutputState {
         output_tx: Option<&mpsc::Sender<String>>,
     ) -> bool {
         let inner = self.inner.lock().await;
-        for (seq, chunk) in inner.chunks.iter() {
+        if let Some((first_seq, _, _)) = inner.chunks.front() {
+            if cursor.next_seq < *first_seq {
+                // Retention pruning may discard the beginning of a split code
+                // point. Never combine that orphaned suffix with later bytes.
+                cursor.pending_utf8.clear();
+                cursor.next_seq = *first_seq;
+            }
+        }
+        for (seq, stream, chunk) in inner.chunks.iter() {
             if *seq >= cursor.next_seq {
-                let text = String::from_utf8_lossy(chunk).to_string();
-                sink.push_str(&text);
-                if let Some(tx) = output_tx {
-                    let _ = tx.try_send(text);
+                let text = decode_utf8_stream(cursor.pending_utf8.get_mut(*stream), chunk, false);
+                if !text.is_empty() {
+                    sink.push_str(&text);
+                    if let Some(tx) = output_tx {
+                        let _ = tx.try_send(text);
+                    }
                 }
             }
         }
         cursor.next_seq = inner.next_seq;
+        if inner.closed {
+            let tail = cursor.pending_utf8.finish();
+            if !tail.is_empty() {
+                sink.push_str(&tail);
+                if let Some(tx) = output_tx {
+                    let _ = tx.try_send(tail);
+                }
+            }
+        }
         inner.closed
     }
 
@@ -1132,8 +1377,60 @@ fn new_chunk_id() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{new_session_id, HeadTailText};
+    use super::{
+        decode_utf8_stream, new_session_id, workspace_pipe_owner, HeadTailText, OutputState,
+        OutputStream, PendingUtf8Streams,
+    };
+    use crate::remote_ssh::transport::WorkspaceStdio;
     use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+    use tokio::time::Duration;
+
+    #[cfg(unix)]
+    async fn pipe_owner_exit_code(script: &str) -> Option<i32> {
+        let transport =
+            WorkspaceStdio::spawn_local_process("sh", &["-lc".to_string(), script.to_string()])
+                .expect("local workspace process should start");
+        let output = Arc::new(OutputState::new(None));
+        let (_command_tx, command_rx) = mpsc::channel(8);
+        tokio::spawn(workspace_pipe_owner(
+            transport,
+            command_rx,
+            Arc::clone(&output),
+        ));
+
+        tokio::time::timeout(Duration::from_secs(10), output.wait_closed())
+            .await
+            .expect("pipe owner should close the output state")
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn pipe_owner_reports_successful_process_exit_code() {
+        assert_eq!(pipe_owner_exit_code("df -h >/dev/null 2>&1").await, Some(0));
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn pipe_owner_reports_failing_process_exit_code() {
+        assert_eq!(pipe_owner_exit_code("exit 3").await, Some(3));
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn pipe_owner_reports_exit_code_after_large_output() {
+        assert_eq!(
+            pipe_owner_exit_code("head -c 400000 /dev/zero | tr '\\0' 'a'").await,
+            Some(0)
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn pipe_owner_reports_signal_death_as_conventional_status() {
+        assert_eq!(pipe_owner_exit_code("kill -TERM $$").await, Some(143));
+    }
 
     #[test]
     fn remote_exec_session_ids_match_local_test_baseline() {
@@ -1149,5 +1446,39 @@ mod tests {
 
         assert_eq!(buffer.total_chars, 16);
         assert_eq!(buffer.render(), "abcdefghijklmnop");
+    }
+
+    #[test]
+    fn utf8_stream_decoder_preserves_code_points_split_across_chunks() {
+        let bytes = "路径/文件.txt".as_bytes();
+        let mut pending = Vec::new();
+        let mut decoded = String::new();
+
+        for byte in bytes {
+            decoded.push_str(&decode_utf8_stream(&mut pending, &[*byte], false));
+        }
+        decoded.push_str(&decode_utf8_stream(&mut pending, &[], true));
+
+        assert_eq!(decoded, "路径/文件.txt");
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn utf8_stream_decoder_keeps_stdout_and_stderr_boundaries_independent() {
+        let chinese = "路".as_bytes();
+        let mut pending = PendingUtf8Streams::default();
+
+        assert_eq!(
+            decode_utf8_stream(pending.get_mut(OutputStream::Stdout), &chinese[..1], false),
+            ""
+        );
+        assert_eq!(
+            decode_utf8_stream(pending.get_mut(OutputStream::Stderr), b"error", false),
+            "error"
+        );
+        assert_eq!(
+            decode_utf8_stream(pending.get_mut(OutputStream::Stdout), &chinese[1..], false),
+            "路"
+        );
     }
 }

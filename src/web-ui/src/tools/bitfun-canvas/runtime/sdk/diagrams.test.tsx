@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { renderToStaticMarkup } from 'react-dom/server';
 
-import { DependencyGraph, FlowDiagram, computeDAGLayout } from './diagrams';
+import { DependencyGraph, FlowDiagram } from './diagrams';
+import { computeDAGLayout } from './diagramLayout';
 
 describe('Canvas diagram helpers', () => {
   it('computes a vertical DAG layout compatible with generated architecture canvases', () => {
@@ -130,7 +131,7 @@ describe('Canvas diagram helpers', () => {
 
     expect(markup).toContain('bf-diagram');
     expect(markup).toContain('aria-label="Runtime"');
-    expect(markup).toContain('var(--element-bg-subtle)');
+    expect(markup).toContain('var(--bf-appearance-token-element-bg-subtle)');
     expect(markup).toContain('<path');
     expect(markup).toContain('width="4"');
     expect(markup).toContain('Shell');

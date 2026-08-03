@@ -2,20 +2,22 @@ use anyhow::{anyhow, Context, Result};
 use std::path::Path;
 use std::time::Duration;
 
+use bitfun_agent_runtime::sdk::AgentSessionUsageRequest;
 use bitfun_core::agentic::get_agent_registry;
-use bitfun_core::agentic::persistence::PersistenceManager;
 use bitfun_core::infrastructure::try_get_path_manager_arc;
 use bitfun_core::plugin_runtime::{
-    preview_managed_plugin_activation, set_managed_plugin_activation, ManagedPluginActivationView,
+    activate_managed_plugin, deactivate_managed_plugin, preview_managed_plugin_activation,
+    ManagedPluginActivationView, ManagedPluginDeactivationResult,
 };
 use bitfun_core::plugin_source::{
-    refresh_managed_plugin_sources, set_managed_plugin_trust, ManagedPluginSourceSnapshot,
-    ManagedPluginTrustDecision, ManagedPluginTrustLevel,
+    refresh_managed_plugin_sources, set_managed_plugin_trust, ManagedPluginSourceError,
+    ManagedPluginSourceIssue, ManagedPluginSourceSnapshot, ManagedPluginTrustDecision,
+    ManagedPluginTrustLevel,
 };
+use bitfun_core::product_assembly::ProductRuntimeParts;
+use bitfun_core::runtime_ports::PluginRuntimeAvailability;
 use bitfun_core::service::config::initialize_global_config;
-use bitfun_core::service::session_usage::{
-    generate_session_usage_report, render_usage_report_markdown, SessionUsageReportRequest,
-};
+use bitfun_core::service::session_usage::render_usage_report_markdown;
 
 async fn ensure_global_config_service(
 ) -> Result<std::sync::Arc<bitfun_core::service::config::ConfigService>> {
@@ -80,6 +82,7 @@ pub(crate) async fn print_models() -> Result<()> {
         config_service.get_config(None).await?;
 
     let primary_model_id = global_config.ai.default_models.primary.clone();
+    let mode_model_id = crate::model_selection::resolve_mode_model_id(&global_config.ai);
 
     println!("AI models");
     println!();
@@ -90,12 +93,7 @@ pub(crate) async fn print_models() -> Result<()> {
 
     for model in models {
         let is_primary = primary_model_id.as_deref() == Some(model.id.as_str());
-        let current_modes: Vec<String> = global_config
-            .ai
-            .agent_models
-            .iter()
-            .filter_map(|(mode, model_id)| (model_id == &model.id).then_some(mode.clone()))
-            .collect();
+        let is_mode_default = mode_model_id.as_deref() == Some(model.id.as_str());
 
         println!(
             "- {}{} ({})",
@@ -106,8 +104,8 @@ pub(crate) async fn print_models() -> Result<()> {
         println!("  Name: {}", model.name);
         println!("  Provider: {}", model.provider);
         println!("  Model: {}", model.model_name);
-        if !current_modes.is_empty() {
-            println!("  Used by modes: {}", current_modes.join(", "));
+        if is_mode_default {
+            println!("  Used by modes: all");
         }
     }
 
@@ -167,18 +165,18 @@ pub(crate) async fn print_mcp_servers() -> Result<()> {
 
 pub(crate) async fn set_default_model(model_id: &str) -> Result<()> {
     let config_service = ensure_global_config_service().await?;
-    let agent_registry = get_agent_registry();
-    let modes = agent_registry.get_modes_info().await;
-
     config_service
         .set_config("ai.default_models.primary", model_id)
         .await?;
-    for mode in modes {
-        let path = format!("ai.agent_models.{}", mode.id);
-        config_service.set_config(&path, model_id).await?;
-    }
+    config_service
+        .set_config("ai.agent_model_defaults.mode", model_id)
+        .await?;
 
     println!("Default model set to: {}", model_id);
+
+    // Short-lived management process: the sync loop never runs here, so push
+    // the change directly (no-op when logged out).
+    crate::account_sync::push_settings_after_local_change().await;
     Ok(())
 }
 
@@ -209,41 +207,58 @@ pub(crate) async fn print_mcp_json_config() -> Result<()> {
     let config_service = ensure_global_config_service().await?;
     let mcp_service = bitfun_core::service::mcp::MCPService::new(config_service.clone())
         .map_err(|error| anyhow!(error.to_string()))?;
-    let json = mcp_service.config_service().load_mcp_json_config().await?;
-    println!("{}", json);
+    let snapshot = mcp_service.config_service().load_mcp_json_config().await?;
+    println!("{}", snapshot.json_config);
     Ok(())
 }
 
+pub(crate) async fn run_mcp_import(command: crate::mcp_import::McpImportCommand) -> Result<()> {
+    let _config_service = ensure_global_config_service().await?;
+    crate::mcp_import::execute(command).await
+}
+
+fn validate_usage_session_id(session_id: &str) -> Result<()> {
+    bitfun_agent_runtime::session_control::validate_session_id(session_id)
+        .map_err(anyhow::Error::msg)
+}
+
 pub(crate) async fn print_usage_report(session_id: Option<&str>) -> Result<()> {
-    let agentic_system = crate::agent::agentic_system::init_agentic_system_for_cli().await?;
-    let path_manager = try_get_path_manager_arc().map_err(|error| anyhow!(error.to_string()))?;
-    let persistence_manager =
-        PersistenceManager::new(path_manager).map_err(|error| anyhow!(error.to_string()))?;
+    if let Some(session_id) = session_id.filter(|value| !value.trim().is_empty()) {
+        validate_usage_session_id(session_id)?;
+    }
     let workspace_path = std::env::current_dir().context("Failed to resolve current directory")?;
-    let coordinator = agentic_system.coordinator.clone();
+    let runtime = crate::initialize_core_services(
+        &workspace_path,
+        crate::runtime::approval::CliApprovalPolicy::Reject,
+        crate::BootstrapProfile::Management,
+    )
+    .await?;
     let resolved_session_id = match session_id {
         Some(session_id) if !session_id.trim().is_empty() => session_id.to_string(),
-        _ => coordinator
-            .list_sessions(&workspace_path)
+        _ => runtime
+            .agent_runtime()
+            .list_sessions(bitfun_runtime_ports::AgentSessionListRequest {
+                workspace_path: workspace_path.to_string_lossy().to_string(),
+                remote_connection_id: None,
+                remote_ssh_host: None,
+            })
             .await?
             .first()
             .map(|session| session.session_id.clone())
             .ok_or_else(|| anyhow!("No history sessions for current project"))?,
     };
 
-    let report = generate_session_usage_report(
-        &persistence_manager,
-        Some(agentic_system.token_usage_service.as_ref()),
-        SessionUsageReportRequest {
+    let report = runtime
+        .agent_runtime()
+        .generate_session_usage(AgentSessionUsageRequest {
             session_id: resolved_session_id,
             workspace_path: Some(workspace_path.to_string_lossy().to_string()),
             remote_connection_id: None,
             remote_ssh_host: None,
             include_hidden_subagents: true,
-        },
-    )
-    .await
-    .map_err(|error| anyhow!(error.to_string()))?;
+        })
+        .await
+        .map_err(|error| anyhow!(error.into_message()))?;
 
     println!("{}", render_usage_report_markdown(&report));
     Ok(())
@@ -328,7 +343,7 @@ pub(crate) async fn set_plugin_trust(
 pub(crate) async fn activate_plugin(package_id: &str, confirm: Option<&str>) -> Result<()> {
     let workspace = std::env::current_dir().context("Failed to resolve current directory")?;
     let view = if let Some(content_hash) = confirm {
-        set_managed_plugin_activation(&workspace, package_id, true, Some(content_hash)).await
+        activate_managed_plugin(&workspace, package_id, Some(content_hash)).await
     } else {
         preview_managed_plugin_activation(&workspace, package_id).await
     }
@@ -336,7 +351,7 @@ pub(crate) async fn activate_plugin(package_id: &str, confirm: Option<&str>) -> 
         let diagnostic = crate::plugin_diagnostics::escape_terminal_text(&error.to_string());
         if confirm.is_some() {
             anyhow!(
-                "{}\nRe-run `bitfun-cli plugins activate {}` to preview the current content, then confirm with the new content hash.",
+                "{}\nRe-run `bitfun plugins activate {}` to preview the current content, then confirm with the new content hash.",
                 diagnostic,
                 crate::plugin_diagnostics::escape_terminal_text(package_id)
             )
@@ -349,7 +364,7 @@ pub(crate) async fn activate_plugin(package_id: &str, confirm: Option<&str>) -> 
     if confirm.is_none() {
         println!();
         println!(
-            "No activation state changed. Re-run `bitfun-cli plugins activate {} --confirm {}` to confirm this exact package content.",
+            "No activation state changed. Re-run `bitfun plugins activate {} --confirm {}` to confirm this exact package content.",
             crate::plugin_diagnostics::escape_terminal_text(package_id),
             crate::plugin_diagnostics::escape_terminal_text(&view.content_hash)
         );
@@ -359,25 +374,86 @@ pub(crate) async fn activate_plugin(package_id: &str, confirm: Option<&str>) -> 
 
 pub(crate) async fn deactivate_plugin(package_id: &str) -> Result<()> {
     let workspace = std::env::current_dir().context("Failed to resolve current directory")?;
-    let view = set_managed_plugin_activation(&workspace, package_id, false, None)
+    let result = deactivate_managed_plugin(&workspace, package_id)
         .await
         .map_err(|error| {
-            anyhow!(crate::plugin_diagnostics::escape_terminal_text(
-                &error.to_string()
-            ))
+            let diagnostic = crate::plugin_diagnostics::escape_terminal_text(&error.to_string());
+            if matches!(
+                error,
+                ManagedPluginSourceError::DeactivationPersistenceUncertain { .. }
+            ) {
+                anyhow!(
+                    "{diagnostic}\nThe saved state may already be cleared. Retry `bitfun plugins deactivate {}` to confirm the result; the operation is idempotent.",
+                    crate::plugin_diagnostics::escape_terminal_text(package_id)
+                )
+            } else {
+                anyhow!(diagnostic)
+            }
         })?;
-    println!(
-        "Plugin package {} is inactive.",
-        crate::plugin_diagnostics::escape_terminal_text(&view.package_id)
-    );
-    for diagnostic in &view.diagnostics {
-        println!(
-            "- [warning] {}",
-            crate::plugin_diagnostics::escape_terminal_text(diagnostic)
-        );
+    match result {
+        ManagedPluginDeactivationResult::Deactivated {
+            package_id,
+            diagnostics,
+        } => {
+            let package_id = crate::plugin_diagnostics::escape_terminal_text(&package_id);
+            println!("Plugin package {package_id} was deactivated.");
+            print_deactivation_diagnostics(&diagnostics);
+        }
+        ManagedPluginDeactivationResult::ResidualActivationCleared {
+            package_id,
+            current_package_available,
+            diagnostics,
+        } => {
+            let package_id = crate::plugin_diagnostics::escape_terminal_text(&package_id);
+            match current_package_available {
+                Some(true) => println!(
+                    "Plugin package {package_id} previous source's saved activation state was cleared; the current package was not active."
+                ),
+                Some(false) => println!(
+                    "Plugin package {package_id} is unavailable; its saved activation state was cleared."
+                ),
+                None => println!(
+                    "Plugin package {package_id} saved activation state was cleared; current package availability could not be determined."
+                ),
+            }
+            print_deactivation_diagnostics(&diagnostics);
+        }
+        ManagedPluginDeactivationResult::AlreadyInactive {
+            package_id,
+            current_package_available,
+            diagnostics,
+        } => {
+            let package_id = crate::plugin_diagnostics::escape_terminal_text(&package_id);
+            match current_package_available {
+                Some(true) => println!("Plugin package {package_id} was already inactive."),
+                Some(false) => println!(
+                    "Plugin package {package_id} is unavailable and has no saved activation state."
+                ),
+                None => println!(
+                    "Plugin package {package_id} has no saved activation state; current package availability could not be determined."
+                ),
+            }
+            print_deactivation_diagnostics(&diagnostics);
+        }
     }
     println!("No plugin code or candidate effect was executed.");
     Ok(())
+}
+
+fn print_deactivation_diagnostics(diagnostics: &[ManagedPluginSourceIssue]) {
+    for diagnostic in diagnostics {
+        println!("- {}", render_plugin_source_issue(diagnostic));
+    }
+}
+
+fn render_plugin_source_issue(issue: &ManagedPluginSourceIssue) -> String {
+    format!(
+        "[{}:{}] {}: {}",
+        if issue.is_error { "error" } else { "warn" },
+        crate::plugin_diagnostics::escape_terminal_text(&issue.code),
+        crate::plugin_diagnostics::escape_terminal_text(&issue.source_path),
+        crate::plugin_diagnostics::escape_terminal_text(&issue.message)
+    )
 }
 
 fn print_plugin_activation(view: &ManagedPluginActivationView, preview: bool) {
@@ -478,7 +554,11 @@ fn print_plugin_snapshot(snapshot: &ManagedPluginSourceSnapshot) {
             crate::plugin_diagnostics::escape_terminal_text(&package.package_id),
             crate::plugin_diagnostics::escape_terminal_text(&package.version),
             package.source_scope,
-            plugin_trust_label(package.trust_level),
+            if snapshot.discovery_complete {
+                plugin_trust_label(package.trust_level)
+            } else {
+                "review state unavailable"
+            },
         );
         println!(
             "  Source: {}",
@@ -491,7 +571,9 @@ fn print_plugin_snapshot(snapshot: &ManagedPluginSourceSnapshot) {
         println!("  Content hash: {}", package.content_hash);
         println!(
             "  Activation: {}",
-            if package.activated {
+            if !snapshot.discovery_complete {
+                "unknown; source discovery is incomplete"
+            } else if package.activated {
                 "active for candidate projection; plugin code is not executed"
             } else {
                 "inactive; source review does not activate this package"
@@ -499,13 +581,7 @@ fn print_plugin_snapshot(snapshot: &ManagedPluginSourceSnapshot) {
         );
     }
     for issue in &snapshot.issues {
-        println!(
-            "- [{}:{}] {}: {}",
-            if issue.is_error { "error" } else { "warn" },
-            crate::plugin_diagnostics::escape_terminal_text(&issue.code),
-            crate::plugin_diagnostics::escape_terminal_text(&issue.source_path),
-            crate::plugin_diagnostics::escape_terminal_text(&issue.message)
-        );
+        println!("- {}", render_plugin_source_issue(issue));
     }
     println!(
         "{}",
@@ -546,7 +622,7 @@ pub(crate) async fn print_mcp_config_summary() -> Result<()> {
     Ok(())
 }
 
-pub(crate) async fn print_doctor() -> Result<bool> {
+pub(crate) async fn print_doctor(product_runtime: &ProductRuntimeParts) -> Result<bool> {
     let workspace = std::env::current_dir().context("Failed to resolve current directory")?;
     let config_dir = crate::config::CliConfig::config_dir()?;
     let config_service = ensure_global_config_service().await?;
@@ -587,6 +663,29 @@ pub(crate) async fn print_doctor() -> Result<bool> {
 
     println!("BitFun CLI doctor");
     println!();
+    println!(
+        "[ok] Product runtime: {} assembly-ready",
+        product_runtime.plan().profile().id()
+    );
+    println!("[ok] Runtime capability registrations: complete");
+    println!("[info] Execution owner: bitfun-core compatibility");
+    match product_runtime.plugin_runtime().availability() {
+        PluginRuntimeAvailability::Disabled { reason } => {
+            println!("[info] Plugin runtime: disabled ({reason})");
+        }
+        PluginRuntimeAvailability::ProjectionOnly { reason } => {
+            println!("[info] Plugin runtime: projection-only ({reason})");
+        }
+        PluginRuntimeAvailability::Unavailable { reason } => {
+            println!("[info] Plugin runtime: unavailable ({reason})");
+        }
+        PluginRuntimeAvailability::Available => {
+            println!("[ok] Plugin runtime: available");
+        }
+        _ => {
+            println!("[info] Plugin runtime: unknown");
+        }
+    }
     println!("[ok] Workspace: {}", workspace.display());
     println!("[ok] Config directory: {}", config_dir.display());
     println!("[ok] Agent modes: {}", modes.len());
@@ -606,18 +705,18 @@ pub(crate) async fn print_doctor() -> Result<bool> {
             plugin_error_count,
         )
     );
-    println!(
-        "[ok] Managed plugin source integrity checked; {} active. Candidate projection was not probed.",
-        active_plugin_count
-    );
-    for issue in plugin_sources.issues.iter().take(10) {
+    if plugin_sources.discovery_complete {
         println!(
-            "  - [{}:{}] {}: {}",
-            if issue.is_error { "error" } else { "warn" },
-            crate::plugin_diagnostics::escape_terminal_text(&issue.code),
-            crate::plugin_diagnostics::escape_terminal_text(&issue.source_path),
-            crate::plugin_diagnostics::escape_terminal_text(&issue.message)
+            "[ok] Managed plugin source integrity checked; {} active. Candidate projection was not probed.",
+            active_plugin_count
         );
+    } else {
+        println!(
+            "[error] Managed plugin source scan is incomplete; review and activation status are unavailable. Candidate projection was not probed."
+        );
+    }
+    for issue in plugin_sources.issues.iter().take(10) {
+        println!("  - {}", render_plugin_source_issue(issue));
     }
     if plugin_sources.issues.len() > 10 {
         println!(
@@ -634,4 +733,17 @@ pub(crate) async fn print_doctor() -> Result<bool> {
         println!("Doctor checks passed.");
     }
     Ok(plugin_sources_ready)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_usage_session_id;
+
+    #[test]
+    fn usage_rejects_path_like_session_ids_before_runtime_initialization() {
+        let error = validate_usage_session_id("../../other-project/session")
+            .expect_err("usage must reject path-like session ids");
+
+        assert!(error.to_string().contains("session_id"), "{error}");
+    }
 }

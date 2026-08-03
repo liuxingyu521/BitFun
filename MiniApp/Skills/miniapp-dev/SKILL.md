@@ -193,8 +193,11 @@ MiniApp 框架**只暴露下列能力**，没有任何"通用 BitFun 后端通�
 | AI | `app.ai.complete / chat / cancel / getModels` | 复用宿主 AIClient，受 `permissions.ai`（含 `allowed_models` / 速率限制） |
 | 对话框 | `app.dialog.open/save/message` | Tauri dialog 插件 |
 | 剪贴板 | `app.clipboard.readText/writeText` | 宿主 navigator.clipboard |
+| Agent 会话 | `app.agent.run / cancel / turnText / cancelStaleRuns / onEvent` | 受 `permissions.agent.enabled` 限制；启动小应用自己的隐藏 agent 回合，事件只回流到发起的小应用。工具集按运行时档位收敛：市场小应用（`runtime_profile = market_strict`）只保留 `WebSearch` / `WebFetch` 这类只读联网调研工具，碰不到文件系统、命令行和宿主控制面；内置 / `compatibility` 档位保留完整的 headless 工具集 |
+| 悬浮会话气泡 | `app.chat.claimComposer / releaseComposer / focusSession / setComposerDraft / onUserMessage` | 受 `permissions.agent.enabled` 限制；把内容和提交路由注册进右下角的标准悬浮聊天窗（输入器、附件、模型、权限、停止等仍由宿主共享组件拥有），并展示小应用自己的 Agent 过程（Agentic MiniApp 模式，样板间：`builtin-ppt-live`） |
+| 幻灯片栅格化 | `app.deck.renderPage` | 在隐藏宿主 WebView 中渲染单页 HTML，返回 base64 PNG/PDF（导出用） |
 | 自定义后端 | `app.call('xxx', …)` + `worker.js` | 仅 `node.enabled = true` 时可用，自己实现业务逻辑 |
-| 主题 / i18n | `app.theme` / `app.locale` / `app.onThemeChange` / `app.onLocaleChange` / `app.t(...)` | 见对应章节 |
+| 主题 / i18n | `app.appearanceMode` / `app.locale` / `app.onAppearanceChange` / `app.onLocaleChange` / `app.t(...)` | 见对应章节 |
 
 ### 框架**不**直接暴露的 BitFun 后端能力（截至本文档）
 
@@ -203,7 +206,7 @@ MiniApp 框架**只暴露下列能力**，没有任何"通用 BitFun 后端通�
 - WorkspaceService（结构化工作区索引、统一搜索）
 - GitService（结构化 status / diff / blame，区别于裸 `git` 命令）
 - TerminalService（创建/读写交互式终端）
-- Session / AgenticSystem（启动 Agent 会话、消费工具调用与流式事件）
+- Session / AgenticSystem 的**通用**会话管理（任意会话的创建、接管、读写）——小应用只能通过 `app.agent.*` 启动**自己的**隐藏会话并消费其事件，再通过 `app.chat.*` 借用悬浮会话气泡做输入与过程展示；不能访问其他会话
 - LSP / Snapshot / Mermaid / Skills / Browser API / Computer Use / Config 等
 
 需要这类能力时的合规姿势：
@@ -227,6 +230,8 @@ MiniApp UI 内通过 **window.app** 访问：
 | `app.os.*` | 同上 |
 | `app.storage.*` | 同上 |
 | `app.dialog.open/save/message` | 由 Bridge 转 Tauri dialog 插件 |
+| `app.agent.*` | 隐藏 agent 回合（`permissions.agent.enabled`），事件经 `app.agent.onEvent` 回流 |
+| `app.chat.*` | 标准悬浮聊天窗集成：`claimComposer({ title, composer: { placeholder }, welcome })` 注册有界内容与提交路由（不能替换/缩放输入器；当前 tab 为本小应用时，共享 ChatInput 的提交经 `onUserMessage` 送达）、`focusSession(sessionId)` 让气泡展示本小应用的 agent 会话、`setComposerDraft(text)` 展开气泡并预填共享输入器（不发送，供示例 prompt 使用）|
 | 生命周期 / 事件 | 见 bridge_builder 生成的适配器 |
 
 ## 主题集成
@@ -237,16 +242,16 @@ MiniApp 在 iframe 中运行时自动与主应用主题同步，避免界面风�
 
 | 成员 | 说明 |
 |------|------|
-| `app.theme` | 当前主题类型字符串：`'dark'` 或 `'light'`（随主应用切换更新） |
-| `app.onThemeChange(fn)` | 注册主题变更回调，参数为 payload：`{ type, id, vars }` |
+| `app.appearanceMode` | 当前主题类型字符串：`'dark'` 或 `'light'`（随主应用切换更新） |
+| `app.onAppearanceChange(fn)` | 注册主题变更回调，参数为 payload：`{ mode, id, vars }` |
 
-### data-theme-type 属性
+### data-bf-appearance-mode 属性
 
-编译后的 HTML 根元素 `<html>` 带有 `data-theme-type="dark"` 或 `"light"`，便于用 CSS 按主题写样式，例如：
+编译后的 HTML 根元素 `<html>` 带有 `data-bf-appearance-mode="dark"` 或 `"light"`，便于用 CSS 按主题写样式，例如：
 
 ```css
-[data-theme-type="light"] .panel { background: #f5f5f5; }
-[data-theme-type="dark"] .panel { background: #1a1a1a; }
+[data-bf-appearance-mode="light"] .panel { background: #f5f5f5; }
+[data-bf-appearance-mode="dark"] .panel { background: #1a1a1a; }
 ```
 
 ### --bitfun-* CSS 变量
@@ -302,8 +307,8 @@ body {
 
 ### 同步时机
 
-- iframe 加载后 bridge 会向宿主发送 `bitfun/request-theme`，宿主回推当前主题变量，iframe 内 `_applyThemeVars` 写入 `:root`。
-- 主应用切换主题时，宿主会向 iframe 发送 `themeChange` 事件，bridge 更新变量并触发 `onThemeChange` 回调。
+- iframe 加载后 bridge 会向宿主发送 `bitfun/request-appearance`，宿主回推当前主题变量，iframe 内 `_applyAppearanceVars` 写入 `:root`。
+- 主应用切换主题时，宿主会向 iframe 发送 `appearanceChange` 事件，bridge 更新变量并触发 `onAppearanceChange` 回调。
 
 ## 国际化（i18n）
 
@@ -417,3 +422,22 @@ BuiltinApp {
 
 - 重构计划: `.cursor/plans/miniapp_v2_full_refactor_*.plan.md`
 - 架构说明见 plan 内「MiniApp V2 一步到位重构计划」
+
+## 发布到市场
+
+用户明确要求把 MiniApp 发布/上架到市场时，用 `PublishMiniApp` 工具：
+
+- 传 `app_id` 和 1–5 张截图路径（PNG/JPEG/WebP，单张 ≤ 5 MiB）。
+  没有截图时先向用户要，或请用户在「市场 → 我的投稿」用「截取当前画面」生成。
+- **截图比例用 16:9，推荐 1920×1080**。市场网页和 BitFun 桌面端都按 16:9
+  居中裁剪显示，非 16:9 的图会被切掉边缘。第一张是列表卡片封面，选最能说明
+  用途的那张，关键信息放画面中部不要贴边。超过 2560px 的边会被服务端缩到
+  2560，所以 2560×1440 是有效上限。显示契约见
+  `src/miniapp-market-web/README.md` 的「上架截图比例」。
+- 名称、描述、图标、分类、标签自动取自 `meta.json`；slug 和版本号自动推导。
+  发布前确认 `meta.json` 的 `description` 非空、权限是最小集
+  （市场会拒绝 `node.enabled=true`、宽泛 fs scope 等）。
+- 未登录时工具会返回 GitHub 授权链接：把链接给用户，等用户完成授权后
+  用相同参数再调用一次即可继续。
+- 提交后进入人工审核；用户可在「市场 → 我的投稿」查看状态。
+- 这是对外动作：只在用户明确要求发布时调用，不要主动发布。

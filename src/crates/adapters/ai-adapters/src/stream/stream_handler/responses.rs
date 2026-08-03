@@ -5,6 +5,8 @@ use crate::stream::types::responses::{
 };
 use crate::stream::types::unified::UnifiedResponse;
 use anyhow::{anyhow, Result};
+use bitfun_agent_stream::ToolCallCompletion;
+use bitfun_core_types::errors::AiProviderError;
 use eventsource_stream::Eventsource;
 use log::{error, trace};
 use reqwest::Response;
@@ -42,6 +44,14 @@ impl InProgressToolCall {
             saw_any_delta: false,
             sent_header: false,
         })
+    }
+}
+
+fn responses_completed_tool_call_completion(saw_function_call: bool) -> ToolCallCompletion {
+    if saw_function_call {
+        ToolCallCompletion::NormalToolUse
+    } else {
+        ToolCallCompletion::NormalNoToolUse
     }
 }
 
@@ -223,8 +233,10 @@ fn handle_function_call_output_item_done(
 }
 
 fn extract_api_error_message(event_json: &Value) -> Option<String> {
-    let response = event_json.get("response")?;
-    let error = response.get("error")?;
+    let error = event_json
+        .get("response")
+        .and_then(|response| response.get("error"))
+        .or_else(|| event_json.get("error"))?;
 
     if error.is_null() {
         return None;
@@ -240,6 +252,39 @@ fn extract_api_error_message(event_json: &Value) -> Option<String> {
     Some("An error occurred during responses streaming".to_string())
 }
 
+fn extract_api_error(event_json: &Value) -> Option<AiProviderError> {
+    let error = event_json
+        .get("response")
+        .and_then(|response| response.get("error"))
+        .or_else(|| event_json.get("error"));
+    let code = event_json
+        .get("code")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            error.and_then(|error| {
+                error
+                    .get("code")
+                    .or_else(|| error.get("type"))
+                    .and_then(Value::as_str)
+            })
+        })
+        .map(str::to_string);
+    if error.is_none() && code.is_none() {
+        return None;
+    }
+    let message = event_json
+        .get("message")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| extract_api_error_message(event_json))?;
+    Some(AiProviderError::from_parts(
+        message,
+        Some("openai_responses".to_string()),
+        code,
+        None,
+    ))
+}
+
 pub async fn handle_responses_stream(
     response: Response,
     tx_event: mpsc::UnboundedSender<Result<UnifiedResponse>>,
@@ -251,6 +296,7 @@ pub async fn handle_responses_stream(
     // Some providers close the stream after emitting the terminal event and may not send `[DONE]`.
     let mut received_finish_reason = false;
     let mut received_text_delta = false;
+    let mut saw_function_call = false;
     let mut tool_calls_by_output_index: HashMap<usize, InProgressToolCall> = HashMap::new();
     let mut tool_call_index_by_id: HashMap<String, usize> = HashMap::new();
     let mut stats = StreamStats::new("Responses");
@@ -322,15 +368,15 @@ pub async fn handle_responses_stream(
             }
         };
 
-        if let Some(api_error_message) = extract_api_error_message(&event_json) {
-            let error_msg = format!(
+        if let Some(mut provider_error) = extract_api_error(&event_json) {
+            provider_error.message = format!(
                 "Responses SSE API error: {}, data: {}",
-                api_error_message, raw
+                provider_error.message, raw
             );
             stats.increment("error:api");
             stats.log_summary("sse_api_error");
-            error!("{}", error_msg);
-            let _ = tx_event.send(Err(anyhow!(error_msg)));
+            error!("{}", provider_error);
+            let _ = tx_event.send(Err(anyhow!(provider_error)));
             return;
         }
 
@@ -364,6 +410,7 @@ pub async fn handle_responses_stream(
                         if let Some(ref call_id) = tc.call_id {
                             tool_call_index_by_id.insert(call_id.clone(), output_index);
                         }
+                        saw_function_call = true;
                         tool_calls_by_output_index.insert(output_index, tc);
                     }
                 }
@@ -421,6 +468,7 @@ pub async fn handle_responses_stream(
 
                 // For tool calls, prefer streaming deltas and only use item.done as a tail-filler / fallback.
                 if item_value.get("type").and_then(Value::as_str) == Some("function_call") {
+                    saw_function_call = true;
                     handle_function_call_output_item_done(
                         &mut timeout_controller,
                         &tx_event,
@@ -460,6 +508,7 @@ pub async fn handle_responses_stream(
                             if item.get("type").and_then(Value::as_str) != Some("function_call") {
                                 continue;
                             }
+                            saw_function_call = true;
                             let Some(tc) = tool_calls_by_output_index.get_mut(&idx) else {
                                 continue;
                             };
@@ -510,6 +559,9 @@ pub async fn handle_responses_stream(
                         received_finish_reason = true;
                         let unified_response = UnifiedResponse {
                             usage: response.usage.map(Into::into),
+                            tool_call_completion: Some(responses_completed_tool_call_completion(
+                                saw_function_call,
+                            )),
                             finish_reason: Some("stop".to_string()),
                             ..Default::default()
                         };
@@ -533,6 +585,9 @@ pub async fn handle_responses_stream(
                     None => {
                         received_finish_reason = true;
                         let unified_response = UnifiedResponse {
+                            tool_call_completion: Some(responses_completed_tool_call_completion(
+                                saw_function_call,
+                            )),
                             finish_reason: Some("stop".to_string()),
                             ..Default::default()
                         };
@@ -555,6 +610,9 @@ pub async fn handle_responses_stream(
                         received_finish_reason = true;
                         let unified_response = UnifiedResponse {
                             usage: response.usage.map(Into::into),
+                            tool_call_completion: Some(responses_completed_tool_call_completion(
+                                saw_function_call,
+                            )),
                             finish_reason: Some("stop".to_string()),
                             ..Default::default()
                         };
@@ -577,6 +635,9 @@ pub async fn handle_responses_stream(
                     None => {
                         received_finish_reason = true;
                         let unified_response = UnifiedResponse {
+                            tool_call_completion: Some(responses_completed_tool_call_completion(
+                                saw_function_call,
+                            )),
                             finish_reason: Some("stop".to_string()),
                             ..Default::default()
                         };
@@ -623,6 +684,13 @@ pub async fn handle_responses_stream(
                     .as_deref()
                     .map(|r| format!("incomplete:{r}"))
                     .unwrap_or_else(|| "incomplete".to_string());
+                let completion = match reason.as_deref().map(str::to_ascii_lowercase).as_deref() {
+                    Some("max_output_tokens") | Some("max_tokens") => {
+                        ToolCallCompletion::OutputLimit
+                    }
+                    Some("content_filter") => ToolCallCompletion::ContentFiltered,
+                    _ => ToolCallCompletion::Unknown,
+                };
 
                 let usage = event
                     .response
@@ -634,6 +702,7 @@ pub async fn handle_responses_stream(
                 received_finish_reason = true;
                 let unified_response = UnifiedResponse {
                     usage,
+                    tool_call_completion: Some(completion),
                     finish_reason: Some(finish_reason),
                     ..Default::default()
                 };
@@ -653,10 +722,12 @@ pub async fn handle_responses_stream(
 #[cfg(test)]
 mod tests {
     use super::{
-        super::stream_stats::StreamStats, extract_api_error_message,
+        super::stream_stats::StreamStats, extract_api_error, extract_api_error_message,
         handle_function_call_arguments_delta, handle_function_call_output_item_done,
-        InProgressToolCall, StreamTimeoutController,
+        responses_completed_tool_call_completion, InProgressToolCall, StreamTimeoutController,
     };
+    use bitfun_agent_stream::ToolCallCompletion;
+    use bitfun_core_types::errors::ErrorCategory;
     use serde_json::json;
     use std::collections::HashMap;
     use tokio::sync::mpsc;
@@ -675,6 +746,26 @@ mod tests {
         assert_eq!(
             extract_api_error_message(&event).as_deref(),
             Some("provider error")
+        );
+    }
+
+    #[test]
+    fn preserves_context_overflow_code_from_failed_response() {
+        let event = json!({
+            "type": "response.failed",
+            "response": {
+                "error": {
+                    "code": "context_length_exceeded",
+                    "message": "Request failed"
+                }
+            }
+        });
+
+        let error = extract_api_error(&event).expect("provider error");
+        assert_eq!(error.category, ErrorCategory::ContextOverflow);
+        assert_eq!(
+            error.provider_code.as_deref(),
+            Some("context_length_exceeded")
         );
     }
 
@@ -701,6 +792,18 @@ mod tests {
         });
 
         assert!(extract_api_error_message(&event).is_none());
+    }
+
+    #[test]
+    fn completed_responses_stream_marks_tool_use_only_when_a_function_call_was_seen() {
+        assert_eq!(
+            responses_completed_tool_call_completion(true),
+            ToolCallCompletion::NormalToolUse
+        );
+        assert_eq!(
+            responses_completed_tool_call_completion(false),
+            ToolCallCompletion::NormalNoToolUse
+        );
     }
 
     #[test]

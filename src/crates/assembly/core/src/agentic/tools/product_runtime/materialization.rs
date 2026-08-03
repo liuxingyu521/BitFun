@@ -2,6 +2,7 @@
 
 use crate::agentic::tools::framework::Tool;
 use crate::agentic::tools::implementations::*;
+use crate::agentic::tools::product_runtime::CallDeferredTool;
 use crate::agentic::tools::registry::ProductToolDecoratorRef;
 use bitfun_agent_tools::{
     StaticToolProviderFactory, ToolRegistry as AgentToolRegistry, ToolRuntimeAssembly,
@@ -28,7 +29,9 @@ impl StaticToolProviderFactory<dyn Tool> for ProductConcreteToolFactory {
             "WriteStdin" => Some(Arc::new(WriteStdinTool::new())),
             "ExecControl" => Some(Arc::new(ExecControlTool::new())),
             "GetTime" => Some(Arc::new(GetTimeTool::new())),
+            "ListModels" => Some(Arc::new(ListModelsTool::new())),
             "Task" => Some(Arc::new(TaskTool::new())),
+            "AgentWait" => Some(Arc::new(AgentWaitTool::new())),
             "LaunchReviewAgent" => Some(Arc::new(LaunchReviewAgentTool::new())),
             "Skill" => Some(Arc::new(SkillTool::new())),
             "AskUserQuestion" => Some(Arc::new(AskUserQuestionTool::new())),
@@ -47,6 +50,7 @@ impl StaticToolProviderFactory<dyn Tool> for ProductConcreteToolFactory {
             "CreatePlan" => Some(Arc::new(CreatePlanTool::new())),
             "submit_code_review" => Some(Arc::new(CodeReviewTool::new())),
             "GetToolSpec" => Some(Arc::new(GetToolSpecTool::new())),
+            "CallDeferredTool" => Some(Arc::new(CallDeferredTool::new())),
             "GetFileDiff" => Some(Arc::new(GetFileDiffTool::new())),
             "SessionControl" => Some(Arc::new(SessionControlTool::new())),
             "SessionMessage" => Some(Arc::new(SessionMessageTool::new())),
@@ -60,8 +64,13 @@ impl StaticToolProviderFactory<dyn Tool> for ProductConcreteToolFactory {
             "GetMCPPrompt" => Some(Arc::new(GetMCPPromptTool::new())),
             "GenerativeUI" => Some(Arc::new(GenerativeUITool::new())),
             "Git" => Some(Arc::new(GitTool::new())),
+            "Worktree" => Some(Arc::new(WorktreeTool::new())),
             "ReviewPlatform" => Some(Arc::new(ReviewPlatformTool::new())),
             "InitMiniApp" => Some(Arc::new(InitMiniAppTool::new())),
+            "FinalizeMiniApp" => Some(Arc::new(FinalizeMiniAppTool::new())),
+            "PublishMiniApp" => Some(Arc::new(PublishMiniAppTool::new())),
+            "PageDeploy" => Some(Arc::new(PageDeployTool::new())),
+            "PagePublish" => Some(Arc::new(PagePublishTool::new())),
             "ControlHub" => Some(Arc::new(ControlHubTool::new())),
             "ComputerUse" => Some(Arc::new(ComputerUseTool::new())),
             "Playbook" => Some(Arc::new(PlaybookTool::new())),

@@ -7,7 +7,7 @@
 
 import React, { useState, useMemo, useCallback, useEffect, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
-import { ClipboardList, Circle, Loader2, CheckCircle, CheckCircle2, PlayCircle, XCircle, ChevronsUpDown, ChevronsDownUp, FolderOpen } from 'lucide-react';
+import { ClipboardList, Circle, Loader2, CheckCircle, CheckCircle2, PlayCircle, XCircle, ChevronsUpDown, ChevronsDownUp, FolderOpen, Save, Check } from 'lucide-react';
 import type { ToolCardProps } from '../types/flow-chat';
 import { ideControl } from '@/shared/services/ide-control/api';
 import { flowChatManager } from '@/flow_chat/services/FlowChatManager';
@@ -17,8 +17,10 @@ import { planBuildStateService } from '@/shared/services/PlanBuildStateService';
 import yaml from 'yaml';
 import { Tooltip } from '@/component-library';
 import { createLogger } from '@/shared/utils/logger';
+import { notificationService } from '@/shared/notification-system';
+import { globalEventBus } from '@/infrastructure/event-bus';
 import { useToolCardHeightContract } from './useToolCardHeightContract';
-import { basenamePath, dirnameAbsolutePath } from '@/shared/utils/pathUtils';
+import { basenamePath, dirnameAbsolutePath, joinPath } from '@/shared/utils/pathUtils';
 import { createTodoRenderItems } from './todoRenderItems';
 import { useOptionalCurrentWorkspace } from '@/infrastructure/contexts/WorkspaceContext';
 import { isRemoteWorkspace } from '@/shared/types';
@@ -82,6 +84,8 @@ export const PlanDisplay: React.FC<PlanDisplayProps> = ({
   const [isBuildStarted, setIsBuildStarted] = useState(() => {
     return planFilePath ? planBuildStateService.isBuildActive(planFilePath) : false;
   });
+  const [isSavingToProject, setIsSavingToProject] = useState(false);
+  const [hasSavedToProject, setHasSavedToProject] = useState(false);
   
   const [isTodosExpanded, setIsTodosExpanded] = useState(false);
   const toolCardId = cacheKey ?? planFilePath;
@@ -91,6 +95,13 @@ export const PlanDisplay: React.FC<PlanDisplayProps> = ({
   });
 
   const hasAutoLoaded = useRef(false);
+  const saveSuccessTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => () => {
+    if (saveSuccessTimerRef.current) {
+      clearTimeout(saveSuccessTimerRef.current);
+    }
+  }, []);
 
   // Streaming may provide partial data before planFilePath is available.
   const initialPlanData = useMemo((): PlanData | null => {
@@ -267,6 +278,47 @@ export const PlanDisplay: React.FC<PlanDisplayProps> = ({
     }
   }, [isRevealPlanDisabled, planFilePath]);
 
+  const handleSavePlanToProject = useCallback(async (event: React.MouseEvent<HTMLButtonElement>) => {
+    event.stopPropagation();
+    if (!planFilePath || !currentWorkspace || isSavingToProject) {
+      return;
+    }
+
+    const projectPlansDirectory = joinPath(currentWorkspace.rootPath, '.bitfun/plans');
+    const projectPlanPath = joinPath(projectPlansDirectory, basenamePath(planFilePath));
+    if (saveSuccessTimerRef.current) {
+      clearTimeout(saveSuccessTimerRef.current);
+      saveSuccessTimerRef.current = null;
+    }
+    setHasSavedToProject(false);
+    setIsSavingToProject(true);
+    try {
+      const content = await workspaceAPI.readFileContent(planFilePath);
+      await workspaceAPI.createDirectory(projectPlansDirectory, currentWorkspace.connectionId);
+      await workspaceAPI.writeFileContent(
+        currentWorkspace.rootPath,
+        projectPlanPath,
+        content,
+        currentWorkspace.connectionId,
+      );
+      globalEventBus.emit('file-tree:refresh');
+      setHasSavedToProject(true);
+      saveSuccessTimerRef.current = setTimeout(() => {
+        setHasSavedToProject(false);
+        saveSuccessTimerRef.current = null;
+      }, 1600);
+    } catch (error) {
+      log.error('Failed to save plan to project', {
+        planFilePath,
+        workspacePath: currentWorkspace.rootPath,
+        error: String(error),
+      });
+      notificationService.error(t('toolCards.plan.saveToProjectFailed'));
+    } finally {
+      setIsSavingToProject(false);
+    }
+  }, [currentWorkspace, isSavingToProject, planFilePath, t]);
+
   const handleBuild = useCallback(async () => {
     if (!planFilePath || buildStatus !== 'build') return;
     
@@ -330,11 +382,18 @@ ${JSON.stringify(simpleTodos, null, 2)}
   const revealPlanTooltip = isRevealPlanDisabled
     ? t('toolCards.plan.revealPlanUnavailable')
     : t('toolCards.plan.revealPlanInExplorer');
+  const savePlanTooltip = !currentWorkspace
+    ? t('toolCards.plan.saveToProjectUnavailable')
+    : isSavingToProject
+      ? t('toolCards.plan.savingToProject')
+      : hasSavedToProject
+        ? t('toolCards.plan.saveToProjectSuccess')
+      : t('toolCards.plan.saveToProject');
 
   if (!planData) {
     return (
-      <div className={`create-plan-display create-plan-display--loading create-plan-display--loading-shimmer status-${status}`}>
-        <div className="create-plan-header create-plan-header--loading-shimmer">
+      <div data-bf-component="create-plan-display" data-bf-part="loading" data-bf-state="loading" className={`create-plan-display create-plan-display--loading create-plan-display--loading-shimmer status-${status}`}>
+        <div className="create-plan-header create-plan-header--loading-shimmer" data-bf-component="create-plan-display" data-bf-part="header">
           <span>{t('toolCards.plan.loadingPlan')}</span>
         </div>
       </div>
@@ -342,18 +401,22 @@ ${JSON.stringify(simpleTodos, null, 2)}
   }
 
   return (
-    <div
+    <div data-bf-component="create-plan-display" data-bf-part="root"
       ref={cardRootRef}
       data-tool-card-id={toolCardId ?? ''}
       className={`create-plan-display status-${status}${isLoading ? ' create-plan-display--plan-generating' : ''}`}
     >
       <div
         className={`create-plan-header${isLoading ? ' create-plan-header--loading-shimmer' : ''}`}
+        data-bf-component="create-plan-display"
+        data-bf-part="header"
       >
         <Tooltip content={t('toolCards.plan.clickToOpenPlan')}>
           <button
             type="button"
             className="create-plan-header-main create-plan-header-main--clickable"
+            data-bf-component="create-plan-display"
+            data-bf-part="headerMain"
             onClick={handleViewPlan}
           >
             <div className="header-left">
@@ -364,23 +427,38 @@ ${JSON.stringify(simpleTodos, null, 2)}
             </div>
           </button>
         </Tooltip>
-        <Tooltip content={revealPlanTooltip}>
-          <span className="create-plan-header-folder-btn-wrapper">
-            <button
-              className="create-plan-header-folder-btn"
-              type="button"
-              onClick={handleRevealPlanInExplorer}
-              disabled={isRevealPlanDisabled}
-              aria-label={revealPlanTooltip}
-            >
-              <FolderOpen size={14} />
-            </button>
-          </span>
-        </Tooltip>
+        <div className="create-plan-header-actions">
+          <Tooltip content={savePlanTooltip}>
+            <span className="create-plan-header-folder-btn-wrapper">
+              <button
+                className={`create-plan-header-folder-btn${hasSavedToProject ? ' create-plan-header-folder-btn--success' : ''}`}
+                type="button"
+                onClick={handleSavePlanToProject}
+                disabled={!planFilePath || !currentWorkspace || isSavingToProject || hasSavedToProject}
+                aria-label={savePlanTooltip}
+              >
+                {isSavingToProject ? <Loader2 size={14} className="animate-spin" /> : hasSavedToProject ? <Check size={14} /> : <Save size={14} />}
+              </button>
+            </span>
+          </Tooltip>
+          <Tooltip content={revealPlanTooltip}>
+            <span className="create-plan-header-folder-btn-wrapper">
+              <button
+                className="create-plan-header-folder-btn"
+                type="button"
+                onClick={handleRevealPlanInExplorer}
+                disabled={isRevealPlanDisabled}
+                aria-label={revealPlanTooltip}
+              >
+                <FolderOpen size={14} />
+              </button>
+            </span>
+          </Tooltip>
+        </div>
       </div>
 
-      <div className="create-plan-content">
-        <div className="plan-content-left">
+      <div className="create-plan-content" data-bf-component="create-plan-display" data-bf-part="content">
+        <div className="plan-content-left" data-bf-component="create-plan-display" data-bf-part="overview">
           <h3 className="plan-title">{planData.name}</h3>
           <p className="plan-overview">{planData.overview}</p>
         </div>
@@ -396,12 +474,14 @@ ${JSON.stringify(simpleTodos, null, 2)}
       </div>
 
       {planData.todos && planData.todos.length > 0 && isTodosExpanded && (
-        <div className="create-plan-todos create-plan-todos--expanded">
+        <div className="create-plan-todos create-plan-todos--expanded" data-bf-component="create-plan-display" data-bf-part="todos" data-bf-state="expanded">
           <div className="todos-list">
             {todoRenderItems.map(({ todo, key }) => (
               <div
                 key={key}
                 className={`todo-item status-${todo.status || 'pending'}`}
+                data-bf-component="create-plan-display"
+                data-bf-part="todo"
               >
                 {todo.status === 'completed' && (
                   <CheckCircle2 size={12} className="todo-icon todo-icon--completed" />
@@ -422,7 +502,7 @@ ${JSON.stringify(simpleTodos, null, 2)}
         </div>
       )}
 
-      <div className={`create-plan-footer${isLoading ? ' create-plan-footer--generating-only' : ''}`}>
+      <div className={`create-plan-footer${isLoading ? ' create-plan-footer--generating-only' : ''}`} data-bf-component="create-plan-display" data-bf-part="footer">
         {!isLoading && (
           <button className="view-plan-btn" type="button" onClick={handleViewPlan}>
             {t('toolCards.plan.viewPlan')}

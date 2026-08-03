@@ -11,9 +11,12 @@ services.
 
 | Crate | Responsibility | Local doc |
 |---|---|---|
+| `agent-runtime-ipc` | Non-published private local IPC adapter for the opt-in first-party Shared TUI Runtime; closed interactive operations only | [AGENTS.md](agent-runtime-ipc/AGENTS.md) |
 | `ai-adapters` | AI provider request/response adapters and stream protocol glue | [AGENTS.md](ai-adapters/AGENTS.md) |
-| `api-layer` | Backend API adapter surface shared by product hosts | [AGENTS.md](api-layer/AGENTS.md) |
-| `opencode-adapter` | OpenCode-compatible source discovery, diagnostics, and trust-gated candidate adapter | [AGENTS.md](opencode-adapter/AGENTS.md) |
+| `opencode-adapter` | OpenCode source semantics for user Instructions plus the live Command, standalone Tool, Subagent, MCP, and static Hook providers; managed-package static preview | [AGENTS.md](opencode-adapter/AGENTS.md) |
+| `claude-code-adapter` | Runtime-free Claude Code user Instructions, Command, Subagent, MCP, and Hook source semantics with redacted projection | [AGENTS.md](claude-code-adapter/AGENTS.md) |
+| `codex-adapter` | Runtime-free Codex user Instructions, Subagent, MCP, and Hook source semantics with redacted projection | [AGENTS.md](codex-adapter/AGENTS.md) |
+| `static-hook-support` | Shared bounded/redacting static-source utilities plus the JSON/TOML Hook parser used by sibling ecosystem adapters; no ecosystem policy or runtime | inherited |
 | `transport` | Event transport emitters and host transport adapters | [AGENTS.md](transport/AGENTS.md) |
 | `webdriver` | Embedded WebDriver protocol and browser automation adapter | [AGENTS.md](webdriver/AGENTS.md) |
 
@@ -24,6 +27,10 @@ services.
 - Keep OS, filesystem, terminal, MCP, remote, git, and watch implementations in
   `services` unless the code is purely protocol translation.
 - Keep delivery-profile selection and adapter registration in `assembly`.
+- Do not create a shared API crate for a single host or a future protocol. A
+  non-published pre-integration seam may remain crate-internal only when the
+  adjacent design names its first consumer, stable test contract, integration
+  check, and removal condition. Promote only the API used by that consumer.
 
 ## Dependency Boundaries
 

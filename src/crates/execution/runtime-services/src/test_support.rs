@@ -1,9 +1,8 @@
 use std::sync::Arc;
 
 use bitfun_runtime_ports::{
-    ClockPort, FileSystemPort, GitPort, McpCatalogPort, NetworkPort, PermissionDecision,
-    PermissionPort, PermissionRequest, PortError, PortErrorKind, PortResult,
-    RemoteAssistantWorkspaceFacts, RemoteCapabilityPort, RemoteConnectionPort,
+    ClockPort, FileSystemPort, GitPort, McpCatalogPort, NetworkPort, PortError, PortErrorKind,
+    PortResult, RemoteAssistantWorkspaceFacts, RemoteCapabilityPort, RemoteConnectionPort,
     RemoteExecCommandRequest, RemoteExecCommandResponse, RemoteExecControlRequest,
     RemoteExecOneShotCommandRequest, RemoteExecOneShotCommandResponse, RemoteExecPort,
     RemoteExecStreamingOutputSink, RemoteProjectionPort, RemoteRecentWorkspaceFacts,
@@ -194,10 +193,17 @@ impl RemoteWorkspaceRuntimeHost for FakeRuntimePort {
         Vec::new()
     }
 
-    async fn open_workspace(&self, path: &str) -> Result<RemoteWorkspaceUpdate, String> {
+    async fn open_workspace(
+        &self,
+        path: &str,
+        _remote_connection_id: Option<&str>,
+        _remote_ssh_host: Option<&str>,
+    ) -> Result<RemoteWorkspaceUpdate, String> {
         Ok(RemoteWorkspaceUpdate {
             path: path.to_string(),
             name: "project".to_string(),
+            remote_connection_id: None,
+            remote_ssh_host: None,
         })
     }
 
@@ -209,6 +215,8 @@ impl RemoteWorkspaceRuntimeHost for FakeRuntimePort {
         Ok(RemoteWorkspaceUpdate {
             path: path.to_string(),
             name: "assistant".to_string(),
+            remote_connection_id: None,
+            remote_ssh_host: None,
         })
     }
 }
@@ -220,16 +228,6 @@ impl RemoteWorkspaceFileRuntimeHost for FakeRuntimePort {
         _session_id: Option<&str>,
     ) -> Option<std::path::PathBuf> {
         Some(std::path::PathBuf::from("/remote/project"))
-    }
-}
-
-#[async_trait::async_trait]
-impl PermissionPort for FakeRuntimePort {
-    async fn request_permission(
-        &self,
-        _request: PermissionRequest,
-    ) -> PortResult<PermissionDecision> {
-        Ok(PermissionDecision::Allow)
     }
 }
 
@@ -287,8 +285,6 @@ impl RuntimeServicesProvider for FakeRuntimeServicesProvider {
             Arc::new(FakeRuntimePort::new(RuntimeServiceCapability::Workspace));
         let session_store: Arc<dyn SessionStorePort> =
             Arc::new(FakeRuntimePort::new(RuntimeServiceCapability::SessionStore));
-        let permission: Arc<dyn PermissionPort> =
-            Arc::new(FakeRuntimePort::new(RuntimeServiceCapability::Permission));
         let events: Arc<dyn RuntimeEventSink> = Arc::new(FakeRuntimeEventSink);
         let clock: Arc<dyn ClockPort> =
             Arc::new(FakeRuntimePort::new(RuntimeServiceCapability::Clock));
@@ -297,7 +293,6 @@ impl RuntimeServicesProvider for FakeRuntimeServicesProvider {
             .with_filesystem(filesystem)
             .with_workspace(workspace)
             .with_session_store(session_store)
-            .with_permission(permission)
             .with_events(events)
             .with_clock(clock);
 

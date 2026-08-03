@@ -7,15 +7,39 @@ export interface GlobalConfig {
   terminal: TerminalConfig;
   workspace: WorkspaceConfig;
   ai: AIConfig;
+  tool_permissions: ToolPermissionConfig;
   memories: MemoriesConfig;
   version: string;
   last_modified: number;
+}
+
+export type PermissionEffect = 'allow' | 'ask' | 'deny';
+
+export interface PermissionRule {
+  action: string;
+  resource: string;
+  effect: PermissionEffect;
+}
+
+export interface PermissionPolicyConfig {
+  preset: 'ask' | 'full_access';
+  rules: PermissionRule[];
+}
+
+export interface PermissionInteractionConfig {
+  auto_approve_ask: boolean;
+}
+
+export interface ToolPermissionConfig {
+  policy: PermissionPolicyConfig;
+  interaction: PermissionInteractionConfig;
 }
 
 export type MemoryExternalContextPolicy = 'clear_tool_results' | 'allow' | 'skip_session';
 
 export interface MemoriesConfig {
   generate_memories: boolean;
+  generate_for_btw_sessions: boolean;
   use_memories: boolean;
   external_context_policy: MemoryExternalContextPolicy;
   max_raw_memories_for_consolidation: number;
@@ -48,6 +72,30 @@ export interface AppConfig {
   notifications: NotificationConfig;
   flow_chat?: AppFlowChatConfig;
   ai_experience: AIExperienceConfig;
+  user_tool_groups?: UserToolGroupsConfig;
+  user_skill_groups?: UserSkillGroupsConfig;
+}
+
+export interface UserToolGroupsConfig {
+  version: number;
+  groups: UserToolGroup[];
+}
+
+export interface UserToolGroup {
+  id: string;
+  name: string;
+  toolNames: string[];
+}
+
+export interface UserSkillGroupsConfig {
+  version: number;
+  groups: UserSkillGroup[];
+}
+
+export interface UserSkillGroup {
+  id: string;
+  name: string;
+  skillKeys: string[];
 }
 
 export type BackendLogLevel = 'trace' | 'debug' | 'info' | 'warn' | 'error' | 'off';
@@ -60,11 +108,13 @@ export interface ModelExchangeTracingConfig {
 export interface AppLoggingConfig {
   level: BackendLogLevel;
   include_sensitive_diagnostics: boolean;
+  flow_chat_diagnostics: boolean;
   model_exchange_tracing: ModelExchangeTracingConfig;
 }
 
 export interface AppFlowChatConfig {
   default_mode_id?: string | null;
+  show_permission_mode_control?: boolean;
 }
 
 export interface SidebarConfig {
@@ -83,6 +133,8 @@ export interface NotificationConfig {
   duration: number;
   /** Whether to show a toast when a dialog turn completes while the window is not focused. */
   dialog_completion_notify: boolean;
+  /** Whether to show a toast when an approval request arrives while the window is not focused. */
+  permission_request_notify: boolean;
   /** Whether to show built-in tip cards on each startup. Defaults to true. */
   enable_startup_tips: boolean;
 }
@@ -112,18 +164,31 @@ export interface AIExperienceConfig {
 
   /** Whether to enable flashgrep-backed accelerated workspace search for local workspaces. */
   enable_workspace_search: boolean;
+  /** Local speech-to-text settings for the chat composer. */
+  voice_input: VoiceInputSettings;
   /** User-defined quick actions shown in the post-coding actions menu. */
   quick_actions?: Array<{ id: string; label: string; prompt: string; enabled: boolean }>;
+}
+
+export interface VoiceInputSettings {
+  enabled: boolean;
+  provider: string;
+  model_id: string;
+  default_language: string;
+  max_recording_seconds: number;
+  microphone_device_id: string;
 }
 
 export type ModelCapability =
   | 'text_chat'
   | 'function_calling'
-  | 'image_understanding';
+  | 'image_understanding'
+  | 'speech_recognition';
 
 export type ModelCategory =
   | 'general_chat'
-  | 'multimodal';
+  | 'multimodal'
+  | 'speech_recognition';
 
 export type ReasoningMode =
   | 'default'
@@ -140,12 +205,14 @@ export interface ModelMetadata {
 
 export const CATEGORY_LABELS: Record<ModelCategory, string> = {
   general_chat: t('settings/ai-model:category.general_chat'),
-  multimodal: t('settings/ai-model:category.multimodal')
+  multimodal: t('settings/ai-model:category.multimodal'),
+  speech_recognition: t('settings/ai-model:category.speech_recognition')
 };
 
 export const CATEGORY_ICONS: Record<ModelCategory, string> = {
   general_chat: t('settings/ai-model:categoryIcons.general_chat'),
-  multimodal: t('settings/ai-model:categoryIcons.multimodal')
+  multimodal: t('settings/ai-model:categoryIcons.multimodal'),
+  speech_recognition: t('settings/ai-model:categoryIcons.speech_recognition')
 };
 
 export type CustomHeadersMode = 'replace' | 'merge';
@@ -187,11 +254,13 @@ export interface AIModelConfig {
   auth?: AuthConfig;
 }
 
+/** Subscription provider for in-app OAuth auth. */
+export type SubscriptionProvider = 'codex' | 'antigravity' | 'opencode';
+
 /** Authentication source persisted on each model entry. */
 export type AuthConfig =
   | { type: 'api_key' }
-  | { type: 'codex_cli' }
-  | { type: 'gemini_cli' };
+  | { type: 'subscription'; provider: SubscriptionProvider };
 
 export interface ProxyConfig {
   enabled: boolean;
@@ -204,12 +273,26 @@ export interface DefaultModelsConfig {
   primary?: string | null;
   fast?: string | null;
   image_understanding?: string | null;
+  speech_recognition?: string | null;
+}
+
+export type SubagentModelSelection =
+  | { kind: 'fixed'; model_id: string }
+  | { kind: 'inherit' };
+
+export interface AgentModelDefaultsConfig {
+  mode: string;
+  subagents: {
+    default: SubagentModelSelection;
+    builtin: Record<string, SubagentModelSelection>;
+    fork: SubagentModelSelection;
+  };
 }
 
 export interface AIConfig {
   models: AIModelConfig[];
   default_models: DefaultModelsConfig;
-  agent_models: Record<string, string>;
+  agent_model_defaults: AgentModelDefaultsConfig;
   func_agent_models: Record<string, string>;
   agent_profiles: Record<string, StoredAgentProfileConfigItem>;
   proxy: ProxyConfig;
@@ -224,9 +307,8 @@ export interface AIConfig {
   stream_idle_timeout_secs?: number | null;
   stream_ttft_timeout_secs?: number | null;
   tool_execution_timeout_secs?: number | null;
-  tool_confirmation_timeout_secs?: number | null;
+  allow_tool_json_repair?: boolean;
   subagent_batch_execution_policy?: 'safe_only' | 'force_parallel' | 'serial';
-  skip_tool_confirmation?: boolean;
   computer_use_enabled?: boolean;
   browser_control_preferred_browser?: string;
 }
@@ -238,6 +320,7 @@ export interface StoredAgentProfileConfigItem {
   disabled_user_skills?: string[];
   enabled_user_skills?: string[];
   subagent_overrides?: ParentSubagentOverrideConfig;
+  tool_permission_rules?: PermissionRule[];
 }
 
 export interface AgentProfileConfigItem {
@@ -260,6 +343,10 @@ export interface SkillInfo {
   path: string;
   level: SkillLevel;
   sourceSlot: string;
+  /** Provider-neutral ecosystem identity shared by related discovery slots. */
+  sourceId?: string;
+  /** Stable product name supplied by the skill source definition. */
+  sourceLabel?: string;
   dirName: string;
   isBuiltin: boolean;
   groupKey?: string | null;
@@ -267,11 +354,17 @@ export interface SkillInfo {
   isShadowed?: boolean;
   /** Key of the skill that shadows this one (if any). */
   shadowedByKey?: string | null;
+  /** False when the skill should stay out of user-facing invocation pickers. */
+  allowUserInvocation?: boolean;
+  /** Optional usage hint displayed by invocation pickers. */
+  argumentHint?: string | null;
 }
 
 export interface ModeSkillInfo extends SkillInfo {
   /** True when this skill is enabled before any mode-specific override is applied. */
   defaultEnabled: boolean;
+  /** False when this user-level skill is disabled for every agent profile. */
+  globallyEnabled: boolean;
   /** True when this skill remains enabled after all mode-specific overrides are applied. */
   effectiveEnabled: boolean;
   /** Backward-compatible inverse of `effectiveEnabled`. */
@@ -287,6 +380,10 @@ export interface ModeSkillInfo extends SkillInfo {
     | 'builtin_policy_disabled'
     | 'enabled_by_user_override'
     | 'disabled_by_user_override';
+}
+
+export interface GlobalSkillSettings {
+  globallyDisabledUserSkillKeys: string[];
 }
 
 export interface SkillMarketItem {
@@ -452,7 +549,6 @@ export interface EditorConfig {
   word_wrap: string;
   line_numbers: string;
   minimap: MinimapConfig;
-  theme: string;
   auto_save: string;
   auto_save_delay: number;
   format_on_save: boolean;
@@ -482,7 +578,6 @@ export interface TerminalConfig {
   cursor_style: string;
   cursor_blink: boolean;
   scrollback_lines: number;
-  theme: string;
   transparency: number;
   bell_style: string;
   copy_on_select: boolean;
@@ -569,12 +664,12 @@ export type ConfigPath =
   | 'app.telemetry'
   | 'app.flow_chat'
   | 'app.flow_chat.default_mode_id'
+  | 'app.flow_chat.show_permission_mode_control'
   | 'app.sidebar'
   | 'app.sidebar.width'
   | 'app.sidebar.collapsed'
   | 'editor'
   | 'editor.font_size'
-  | 'editor.theme'
   | 'terminal'
   | 'terminal.default_shell'
   | 'terminal.terminal_panel_position'
@@ -599,6 +694,7 @@ export interface RuntimeLoggingInfo {
   aiLogPath: string;
   flashgrepLogPath: string;
   webviewLogPath: string;
+  flowChatLogPath: string;
   previousUnexpectedExit?: UnexpectedExitInfo | null;
 }
 
@@ -620,6 +716,7 @@ export interface DefaultModels {
   primary: string | null;
   fast: string | null;
   image_understanding?: string | null;
+  speech_recognition?: string | null;
 }
 
 export type OptionalCapabilityModels = Record<string, never>;

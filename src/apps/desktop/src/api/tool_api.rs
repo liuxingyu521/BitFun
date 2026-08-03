@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tauri::State;
 
+use bitfun_agent_runtime::sdk::AgentUserAnswersRequest;
 use bitfun_core::agentic::{
     tools::framework::ToolUseContext,
     tools::{get_all_tools, get_readonly_tools},
@@ -17,6 +19,8 @@ use bitfun_core::service::remote_ssh::workspace_state::{
     get_remote_workspace_manager, lookup_remote_connection, workspace_session_identity,
 };
 use bitfun_core::util::elapsed_ms_u64;
+
+use crate::runtime::DesktopRuntimeContext;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -59,7 +63,6 @@ pub struct ToolInfo {
     pub input_schema: serde_json::Value,
     pub is_readonly: bool,
     pub is_concurrency_safe: bool,
-    pub needs_permissions: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dynamic_info: Option<DynamicToolInfo>,
 }
@@ -89,29 +92,6 @@ pub struct ToolValidationResponse {
     pub message: Option<String>,
     pub error_code: Option<i32>,
     pub meta: Option<serde_json::Value>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ToolConfirmationRequest {
-    #[serde(alias = "tool_use_id")]
-    pub tool_use_id: String,
-    #[serde(alias = "tool_name")]
-    pub tool_name: String,
-    pub action: String,
-    #[serde(alias = "task_id")]
-    pub task_id: Option<String>,
-    #[serde(alias = "updated_input")]
-    pub updated_input: Option<serde_json::Value>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ToolConfirmationResponse {
-    #[serde(alias = "tool_use_id")]
-    pub tool_use_id: String,
-    pub success: bool,
-    pub message: String,
 }
 
 async fn build_tool_context(workspace_path: Option<&str>) -> ToolUseContext {
@@ -217,7 +197,6 @@ async fn build_tool_info(tool: &Arc<dyn bitfun_core::agentic::tools::framework::
         input_schema: tool.input_schema_for_model().await,
         is_readonly: tool.is_readonly(),
         is_concurrency_safe: tool.is_concurrency_safe(None),
-        needs_permissions: tool.needs_permissions(None),
         dynamic_info: tool.dynamic_tool_info().map(to_dynamic_tool_info),
     }
 }
@@ -429,19 +408,49 @@ pub async fn execute_tool(request: ToolExecutionRequest) -> Result<ToolExecution
 
 #[tauri::command]
 pub async fn submit_user_answers(
+    runtime: State<'_, DesktopRuntimeContext>,
     tool_id: String,
     answers: serde_json::Value,
 ) -> Result<(), String> {
-    use bitfun_core::agentic::tools::user_input_manager::get_user_input_manager;
-    let manager = get_user_input_manager();
+    runtime
+        .agent_runtime()
+        .submit_user_answers(AgentUserAnswersRequest {
+            tool_id: tool_id.clone(),
+            answers,
+        })
+        .await
+        .map_err(|error| {
+            let error = desktop_user_answers_error_message(error.into_message());
+            error!(
+                "Failed to send user answer: tool_id={}, error={}",
+                tool_id, error
+            );
+            error
+        })
+}
 
-    manager.send_answer(&tool_id, answers).map_err(|e| {
-        error!(
-            "Failed to send user answer: tool_id={}, error={}",
-            tool_id, e
+fn desktop_user_answers_error_message(message: String) -> String {
+    message
+        .strip_prefix("Tool error: ")
+        .unwrap_or(&message)
+        .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::desktop_user_answers_error_message;
+
+    #[test]
+    fn user_answers_errors_keep_the_existing_desktop_text() {
+        assert_eq!(
+            desktop_user_answers_error_message(
+                "Tool error: Waiting channel not found: tool-1".to_string(),
+            ),
+            "Waiting channel not found: tool-1"
         );
-        e
-    })?;
-
-    Ok(())
+        assert_eq!(
+            desktop_user_answers_error_message("Runtime unavailable".to_string()),
+            "Runtime unavailable"
+        );
+    }
 }

@@ -30,7 +30,7 @@ pub use runtime_policy::{
     mcp_server_is_running, mcp_server_is_starting_or_running, mcp_should_start_after_config_update,
     MCPListChangedKind, MCPReconnectRuntimeDecision,
 };
-pub use runtime_state::MCPServerRuntimeState;
+pub use runtime_state::{MCPProcessStartContext, MCPProcessStartOutcome, MCPServerRuntimeState};
 
 /// MCP server type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -102,6 +102,40 @@ pub struct MCPServerXaaConfig {
     pub scopes: Vec<String>,
 }
 
+// Keep serialized values exact for JavaScript product surfaces.
+const MAX_MCP_TIMEOUT_MS: u64 = 9_007_199_254_740_991;
+
+/// Optional phase-specific MCP timeout overrides in milliseconds.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MCPServerTimeouts {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub startup_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub catalog_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution_ms: Option<u64>,
+}
+
+impl MCPServerTimeouts {
+    pub fn is_empty(&self) -> bool {
+        self.startup_ms.is_none() && self.catalog_ms.is_none() && self.execution_ms.is_none()
+    }
+
+    pub fn validate(&self) -> Result<(), MCPServerConfigValidationError> {
+        if [self.startup_ms, self.catalog_ms, self.execution_ms]
+            .into_iter()
+            .flatten()
+            .any(|timeout| timeout == 0 || timeout > MAX_MCP_TIMEOUT_MS)
+        {
+            return Err(MCPServerConfigValidationError::new(
+                "MCP timeout must be a positive exactly representable JSON integer",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// MCP server configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -118,6 +152,13 @@ pub struct MCPServerConfig {
     pub args: Vec<String>,
     #[serde(default)]
     pub env: HashMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub working_directory: Option<String>,
+    /// Whether a local process inherits every environment variable from the
+    /// BitFun process. `None` preserves the legacy behavior for native MCP
+    /// configurations; imported executable configuration can opt out.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inherit_parent_environment: Option<bool>,
     /// Additional HTTP headers for remote MCP servers (Cursor-style `headers`).
     #[serde(default)]
     pub headers: HashMap<String, String>,
@@ -134,8 +175,14 @@ pub struct MCPServerConfig {
     pub settings: HashMap<String, Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub oauth: Option<MCPServerOAuthConfig>,
+    /// Explicit OAuth discovery policy. `None` preserves the legacy behavior
+    /// where remote servers may negotiate OAuth after an authentication error.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oauth_enabled: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub xaa: Option<MCPServerXaaConfig>,
+    #[serde(default, skip_serializing_if = "MCPServerTimeouts::is_empty")]
+    pub timeouts: MCPServerTimeouts,
 }
 
 fn default_true() -> bool {
@@ -164,6 +211,14 @@ impl fmt::Display for MCPServerConfigValidationError {
 impl std::error::Error for MCPServerConfigValidationError {}
 
 impl MCPServerConfig {
+    pub fn remote_oauth_enabled(&self) -> bool {
+        self.oauth_enabled.unwrap_or(true)
+    }
+
+    pub fn inherits_parent_environment(&self) -> bool {
+        self.inherit_parent_environment.unwrap_or(true)
+    }
+
     pub fn resolved_transport(&self) -> MCPServerTransport {
         self.transport.unwrap_or(match self.server_type {
             MCPServerType::Local => MCPServerTransport::Stdio,
@@ -183,10 +238,17 @@ impl MCPServerConfig {
                 "MCP server name cannot be empty",
             ));
         }
+        self.timeouts.validate()?;
 
         let transport = self.resolved_transport();
         match self.server_type {
             MCPServerType::Local => {
+                if self.oauth_enabled.is_some() {
+                    return Err(MCPServerConfigValidationError::new(format!(
+                        "Local MCP server '{}' cannot configure OAuth",
+                        self.id
+                    )));
+                }
                 if self.command.is_none() {
                     return Err(MCPServerConfigValidationError::new(format!(
                         "Local MCP server '{}' must have a command",
@@ -201,8 +263,28 @@ impl MCPServerConfig {
                         transport.as_str()
                     )));
                 }
+                if self.working_directory.as_deref().is_some_and(|directory| {
+                    directory.trim().is_empty() || directory.chars().any(char::is_control)
+                }) {
+                    return Err(MCPServerConfigValidationError::new(format!(
+                        "Local MCP server '{}' has an invalid working directory",
+                        self.id
+                    )));
+                }
             }
             MCPServerType::Remote => {
+                if self.inherit_parent_environment.is_some() {
+                    return Err(MCPServerConfigValidationError::new(format!(
+                        "Remote MCP server '{}' cannot configure process environment inheritance",
+                        self.id
+                    )));
+                }
+                if self.working_directory.is_some() {
+                    return Err(MCPServerConfigValidationError::new(format!(
+                        "Remote MCP server '{}' cannot set a working directory",
+                        self.id
+                    )));
+                }
                 if self.url.is_none() {
                     return Err(MCPServerConfigValidationError::new(format!(
                         "Remote MCP server '{}' must have a URL",

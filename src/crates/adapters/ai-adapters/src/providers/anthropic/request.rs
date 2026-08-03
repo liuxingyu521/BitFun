@@ -28,6 +28,17 @@ struct ClaudeModelVersion {
     minor: u32,
 }
 
+/// Anthropic-compatible endpoints whose vendors document `Authorization: Bearer`
+/// (ANTHROPIC_AUTH_TOKEN) instead of `x-api-key`: Zhipu bigmodel.cn / Z.AI,
+/// Moonshot's /anthropic gateway, and Kimi For Coding.
+fn wants_bearer_auth(url: &str) -> bool {
+    url.contains("bigmodel.cn")
+        || url.contains("api.z.ai")
+        || url.contains("api.kimi.com/coding")
+        || ((url.contains("api.moonshot.cn") || url.contains("api.moonshot.ai"))
+            && url.contains("/anthropic"))
+}
+
 pub(crate) fn apply_headers(
     client: &AIClient,
     builder: RequestBuilder,
@@ -36,8 +47,13 @@ pub(crate) fn apply_headers(
     shared::apply_header_policy(client, builder, |mut builder| {
         builder = builder.header("Content-Type", "application/json");
 
-        if url.contains("bigmodel.cn") {
+        if wants_bearer_auth(url) {
             builder = builder.header("Authorization", format!("Bearer {}", client.config.api_key));
+            // Keep bigmodel.cn exactly as it shipped (no version header); the other
+            // bearer gateways follow the Anthropic protocol, which requires it.
+            if !url.contains("bigmodel.cn") {
+                builder = builder.header("anthropic-version", "2023-06-01");
+            }
         } else {
             builder = builder
                 .header("x-api-key", &client.config.api_key)
@@ -62,7 +78,7 @@ fn parse_claude_model_version(model_name: &str, family: &str) -> Option<ClaudeMo
 }
 
 fn anthropic_thinking_capability(model_name: &str) -> AnthropicThinkingCapability {
-    if model_name.starts_with("claude-mythos") {
+    if model_name.starts_with("claude-mythos") || model_name.starts_with("claude-fable") {
         return AnthropicThinkingCapability::AdaptiveDefaultNoDisabled;
     }
 
@@ -362,4 +378,102 @@ pub(crate) async fn send_stream(
         },
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bearer_auth_matches_each_gateway_documented_scheme() {
+        // Vendors that document ANTHROPIC_AUTH_TOKEN for their Claude-compatible gateway.
+        for url in [
+            "https://open.bigmodel.cn/api/anthropic/v1/messages",
+            "https://api.z.ai/api/anthropic/v1/messages",
+            "https://api.kimi.com/coding/v1/messages",
+            "https://api.moonshot.cn/anthropic/v1/messages",
+            "https://api.moonshot.ai/anthropic/v1/messages",
+        ] {
+            assert!(
+                wants_bearer_auth(url),
+                "{url} should authenticate with a bearer token"
+            );
+        }
+
+        // These document ANTHROPIC_API_KEY (x-api-key) instead, so they must stay on the
+        // default branch even though their paths look similar.
+        for url in [
+            "https://api.deepseek.com/anthropic/v1/messages",
+            "https://api.minimaxi.com/anthropic/v1/messages",
+            "https://api.minimax.io/anthropic/v1/messages",
+            "https://api.siliconflow.cn/v1/messages",
+            "https://api.anthropic.com/v1/messages",
+        ] {
+            assert!(
+                !wants_bearer_auth(url),
+                "{url} should authenticate with x-api-key"
+            );
+        }
+    }
+
+    #[test]
+    fn bearer_auth_holds_for_model_discovery_urls() {
+        // Discovery hits /v1/models on the same base, so both paths must agree.
+        assert!(wants_bearer_auth("https://api.kimi.com/coding/v1/models"));
+        assert!(wants_bearer_auth(
+            "https://api.moonshot.cn/anthropic/v1/models"
+        ));
+        assert!(!wants_bearer_auth("https://api.moonshot.cn/v1/models"));
+    }
+
+    #[test]
+    fn moonshot_bearer_auth_is_limited_to_the_anthropic_gateway() {
+        // The OpenAI-compatible Moonshot base never reaches this module, but keep the
+        // qualifier honest so a future caller cannot pick up the wrong scheme.
+        assert!(!wants_bearer_auth(
+            "https://api.moonshot.cn/v1/chat/completions"
+        ));
+        assert!(!wants_bearer_auth(
+            "https://api.moonshot.ai/v1/chat/completions"
+        ));
+    }
+
+    #[test]
+    fn claude_5_family_thinking_capabilities() {
+        use AnthropicThinkingCapability::*;
+
+        // Fable rejects an explicit thinking.type=disabled, so it must omit the field.
+        assert_eq!(
+            anthropic_thinking_capability("claude-fable-5"),
+            AdaptiveDefaultNoDisabled
+        );
+        assert_eq!(
+            anthropic_thinking_capability("claude-mythos-preview"),
+            AdaptiveDefaultNoDisabled
+        );
+        assert_eq!(
+            anthropic_thinking_capability("claude-opus-5"),
+            AdaptivePreferred
+        );
+        assert_eq!(
+            anthropic_thinking_capability("claude-sonnet-5"),
+            AdaptivePreferred
+        );
+        // Haiku 4.5 takes budget_tokens and errors on effort.
+        assert_eq!(
+            anthropic_thinking_capability("claude-haiku-4-5"),
+            ManualOnly
+        );
+    }
+
+    #[test]
+    fn non_claude_models_never_take_the_claude_thinking_paths() {
+        use AnthropicThinkingCapability::*;
+
+        // These reach the Anthropic builder through vendor gateways; emitting Claude's
+        // adaptive fields to them would be rejected.
+        for model in ["minimax-m3", "glm-5.2", "kimi-k3", "kimi-k2.7-code"] {
+            assert_eq!(anthropic_thinking_capability(model), ManualOnly, "{model}");
+        }
+    }
 }

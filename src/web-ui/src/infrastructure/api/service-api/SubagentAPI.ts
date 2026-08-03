@@ -6,7 +6,7 @@ import { api } from './ApiClient';
 
 
 
-export type SubagentSource = 'builtin' | 'project' | 'user';
+export type SubagentSource = 'builtin' | 'project' | 'user' | 'external';
 export type BuiltinSubagentExposure = 'public' | 'restricted' | 'hidden';
 export type SubagentOverrideState = 'enabled' | 'disabled';
 export type SubagentStateReason =
@@ -41,12 +41,14 @@ export interface SubagentInfo {
   source?: SubagentSource;
   subagentSource?: SubagentSource;
   path?: string;
-   
   model?: string;
+  modelIsExplicit?: boolean;
   visibility?: SubagentVisibilitySummary;
   configProfileId?: string;
   configProfileLabel?: string;
   configProfileMemberModeIds?: string[];
+  externalProviderLabel?: string;
+  supportsFollowUp?: boolean;
 }
 
 export interface ListSubagentsOptions {
@@ -87,6 +89,7 @@ export interface UpdateSubagentConfigPayload {
   parentAgentType?: string;
   enabled?: boolean;
   model?: string;
+  clearModelOverride?: boolean;
   workspacePath?: string;
 }
 
@@ -202,9 +205,9 @@ export const SubagentAPI = {
     });
   },
 
-  async deleteSubagent(subagentId: string): Promise<void> {
+  async deleteSubagent(subagentId: string, workspacePath?: string): Promise<void> {
     return api.invoke('delete_subagent', {
-      request: { subagentId },
+      request: { subagentId, workspacePath },
     });
   },
 };

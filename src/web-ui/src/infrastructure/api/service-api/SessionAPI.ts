@@ -2,6 +2,16 @@
 import { api } from './ApiClient';
 import { createTauriCommandError } from '../errors/TauriCommandError';
 import type { SessionMetadata, DialogTurnData } from '@/shared/types/session-history';
+import { normalizeRemoteSessionScope } from '@/shared/utils/remoteSessionScope';
+
+export type UiSessionMetadataField =
+  | 'sessionName'
+  | 'tags'
+  | 'todos'
+  | 'reviewActionState'
+  | 'unreadCompletion'
+  | 'needsUserAttention'
+  | 'titleMetadata';
 
 export interface SessionMetadataPageRequest {
   workspacePath: string;
@@ -17,6 +27,28 @@ export interface SessionMetadataPage {
   loadedTopLevelCount: number;
   nextCursor?: string;
   hasMore: boolean;
+}
+
+export interface SessionLineageRequest {
+  sessionId: string;
+  workspacePath: string;
+  remoteConnectionId?: string;
+  remoteSshHost?: string;
+}
+
+export interface SessionLineageSnapshot {
+  rootSessionId: string;
+  sessions: SessionMetadata[];
+}
+
+export interface SessionReferenceCandidate {
+  sessionId: string;
+  sessionName: string;
+  workspacePath: string;
+  remoteConnectionId?: string;
+  remoteSshHost?: string;
+  workspaceLabel: string;
+  lastActivityAt: number;
 }
 
 export interface SessionUsageReportRequest {
@@ -173,17 +205,31 @@ function remoteSessionFields(
   remoteConnectionId?: string,
   remoteSshHost?: string
 ): Record<string, string> {
+  const scope = normalizeRemoteSessionScope(remoteConnectionId, remoteSshHost);
   const o: Record<string, string> = {};
-  if (remoteConnectionId) {
-    o.remote_connection_id = remoteConnectionId;
+  if (scope.remoteConnectionId) {
+    o.remote_connection_id = scope.remoteConnectionId;
   }
-  if (remoteSshHost) {
-    o.remote_ssh_host = remoteSshHost;
+  if (scope.remoteSshHost) {
+    o.remote_ssh_host = scope.remoteSshHost;
   }
   return o;
 }
 
 export class SessionAPI {
+  async searchReferenceableSessions(
+    query: string,
+    limit = 30,
+  ): Promise<SessionReferenceCandidate[]> {
+    try {
+      return await api.invoke('search_referenceable_sessions', {
+        request: { query, limit },
+      });
+    } catch (error) {
+      throw createTauriCommandError('search_referenceable_sessions', error, { query, limit });
+    }
+  }
+
   async forkSession(
     sourceSessionId: string,
     sourceTurnId: string,
@@ -192,12 +238,13 @@ export class SessionAPI {
     remoteSshHost?: string
   ): Promise<{ sessionId: string; sessionName: string; agentType: string }> {
     try {
+      const normalizedRemoteFields = remoteSessionFields(remoteConnectionId, remoteSshHost);
       return await api.invoke('fork_session', {
         request: {
           source_session_id: sourceSessionId,
           source_turn_id: sourceTurnId,
           workspace_path: workspacePath,
-          ...remoteSessionFields(remoteConnectionId, remoteSshHost),
+          ...normalizedRemoteFields,
         }
       });
     } catch (error) {
@@ -243,6 +290,25 @@ export class SessionAPI {
         workspacePath: request.workspacePath,
         limit: request.limit,
         cursor: request.cursor,
+      });
+    }
+  }
+
+  async getSessionLineage(
+    request: SessionLineageRequest
+  ): Promise<SessionLineageSnapshot | null> {
+    try {
+      return await api.invoke('get_session_lineage', {
+        request: {
+          session_id: request.sessionId,
+          workspace_path: request.workspacePath,
+          ...remoteSessionFields(request.remoteConnectionId, request.remoteSshHost),
+        }
+      });
+    } catch (error) {
+      throw createTauriCommandError('get_session_lineage', error, {
+        sessionId: request.sessionId,
+        workspacePath: request.workspacePath,
       });
     }
   }
@@ -295,6 +361,7 @@ export class SessionAPI {
   async saveSessionMetadata(
     metadata: SessionMetadata,
     workspacePath: string,
+    fields: UiSessionMetadataField[],
     remoteConnectionId?: string,
     remoteSshHost?: string
   ): Promise<void> {
@@ -302,6 +369,7 @@ export class SessionAPI {
       await api.invoke('save_session_metadata', {
         request: {
           metadata,
+          fields,
           workspace_path: workspacePath,
           ...remoteSessionFields(remoteConnectionId, remoteSshHost),
         }

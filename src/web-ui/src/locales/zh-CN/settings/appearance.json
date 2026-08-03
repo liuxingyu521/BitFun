@@ -1,4 +1,47 @@
 {
   "title": "外观",
-  "subtitle": "界面语言、主题与全局字体大小"
+  "subtitle": "界面语言、外观包与全局字体大小",
+  "effects": {
+    "title": "动态效果",
+    "hint": "控制界面中的视觉反馈。",
+    "mouseGlow": {
+      "label": "鼠标跟随光效",
+      "description": "让卡片边缘显示跟随鼠标移动的柔和聚光效果。系统开启“减少动态效果”时会自动暂停。"
+    }
+  },
+  "package": {
+    "title": "外观包",
+    "description": "导入声明式 BitFun 外观包，资源仅保存在当前设备。",
+    "import": "导入外观包",
+    "importSuccess": "已导入 {{name}}",
+    "importFailed": "无法导入外观包，请查看问题详情。",
+    "activateFailed": "无法应用外观包，请查看问题详情。",
+    "export": "导出外观包",
+    "exportFailed": "无法导出外观包：{{error}}",
+    "delete": "删除外观包",
+    "deleteTitle": "删除外观包？",
+    "deleteMessage": "从当前设备删除 {{name}}？",
+    "deleteSuccess": "已删除 {{name}}",
+    "deleteFailed": "无法删除外观包：{{error}}",
+    "nativeName": "BitFun 默认",
+    "nativeDescription": "使用当前内置外观。",
+    "unknownAuthor": "未知作者",
+    "empty": "尚未导入外观包。",
+    "diagnostics": {
+      "validationTitle": "外观包与当前版本不兼容",
+      "importTitle": "外观包导入失败",
+      "activateTitle": "外观包应用失败",
+      "validationHint": "发现 {{count}} 个问题。请依据当前版本的外观契约重新生成外观包。",
+      "importSummary": "外观包包含 {{count}} 个契约问题，请查看详情。",
+      "activateSummary": "外观包包含 {{count}} 个契约问题，请查看详情。",
+      "componentGroup": "组件：{{id}}",
+      "sceneGroup": "场景：{{id}}",
+      "sectionGroup": "配置区域：{{id}}",
+      "unknownComponent": "当前版本未注册此组件。",
+      "unknownScene": "当前版本未注册此场景。",
+      "unknownPart": "当前版本不存在部件“{{part}}”。",
+      "allowedParts": "查看当前可用部件",
+      "dismiss": "关闭问题详情"
+    }
+  }
 }

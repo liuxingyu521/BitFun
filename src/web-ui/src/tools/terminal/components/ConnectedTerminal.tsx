@@ -5,7 +5,7 @@
 
 import React, { useEffect, useRef, useCallback, useState, memo } from 'react';
 import { AlertCircle, RefreshCw, Terminal as TerminalIcon, Trash2 } from 'lucide-react';
-import Terminal, { TerminalRef } from './Terminal';
+import Terminal, { TerminalRef, type TerminalOptions } from './Terminal';
 import { useTerminal } from '../hooks/useTerminal';
 import { registerTerminalActions, unregisterTerminalActions } from '../services/TerminalActionManager';
 import {
@@ -45,6 +45,8 @@ export interface ConnectedTerminalProps {
   autoFocus?: boolean;
   showToolbar?: boolean;
   showStatusBar?: boolean;
+  /** Optional xterm options (e.g. smaller font in embedded dialogs). */
+  options?: TerminalOptions;
   /** Optional session data; fetched when omitted. */
   session?: SessionResponse;
   onClose?: () => void;
@@ -59,6 +61,7 @@ const ConnectedTerminal: React.FC<ConnectedTerminalProps> = memo(({
   autoFocus = true,
   showToolbar = false,
   showStatusBar = false,
+  options,
   session: initialSession,
   onClose,
   onTitleChange,
@@ -444,8 +447,8 @@ const ConnectedTerminal: React.FC<ConnectedTerminalProps> = memo(({
 
   if (isLoading) {
     return (
-      <div className={`bitfun-terminal ${className}`} data-testid="shell-command-list">
-        <div className="bitfun-terminal__loading" data-testid="shell-command-status" data-command-status="loading">
+      <div className={`bitfun-terminal ${className}`} data-testid="shell-command-list" data-bf-component="terminal-tool" data-bf-part="root" data-bf-state="loading">
+        <div className="bitfun-terminal__loading" data-testid="shell-command-status" data-command-status="loading" data-bf-component="terminal-tool" data-bf-part="loading">
           <div className="bitfun-terminal__loading-spinner" />
           <span className="bitfun-terminal__loading-text">Connecting to terminal...</span>
         </div>
@@ -455,8 +458,8 @@ const ConnectedTerminal: React.FC<ConnectedTerminalProps> = memo(({
 
   if (error) {
     return (
-      <div className={`bitfun-terminal ${className}`} data-testid="shell-command-list">
-        <div className="bitfun-terminal__error" data-testid="shell-command-status" data-command-status="error">
+      <div className={`bitfun-terminal ${className}`} data-testid="shell-command-list" data-bf-component="terminal-tool" data-bf-part="root" data-bf-state="error">
+        <div className="bitfun-terminal__error" data-testid="shell-command-status" data-command-status="error" data-bf-component="terminal-tool" data-bf-part="error">
           <AlertCircle className="bitfun-terminal__error-icon" size={32} />
           <span className="bitfun-terminal__error-message">{error}</span>
           <button 
@@ -478,9 +481,12 @@ const ConnectedTerminal: React.FC<ConnectedTerminalProps> = memo(({
       data-testid="shell-command-list"
       data-command-id={sessionId}
       data-command-status={isExited ? 'exited' : 'running'}
+      data-bf-component="terminal-tool"
+      data-bf-part="root"
+      data-bf-state={isExited ? 'exited' : 'running'}
     >
       {showToolbar && (
-        <div className="bitfun-terminal__toolbar">
+        <div className="bitfun-terminal__toolbar" data-bf-component="terminal-tool" data-bf-part="toolbar">
           <div className="bitfun-terminal__toolbar-left">
             <TerminalIcon size={14} />
             <span className="bitfun-terminal__toolbar-title" data-testid="shell-panel-title">
@@ -516,6 +522,7 @@ const ConnectedTerminal: React.FC<ConnectedTerminalProps> = memo(({
         terminalId={terminalId}
         sessionId={sessionId}
         autoFocus={autoFocus}
+        options={options}
         onData={handleData}
         onResize={handleResize}
         onTitleChange={handleTitleChange}
@@ -531,7 +538,7 @@ const ConnectedTerminal: React.FC<ConnectedTerminalProps> = memo(({
           isExited ? 'bitfun-terminal__statusbar--exited' : ''
         } ${
           error ? 'bitfun-terminal__statusbar--error' : ''
-        }`}>
+        }`} data-bf-component="terminal-tool" data-bf-part="statusBar">
           <div className="bitfun-terminal__statusbar-left">
             <span
               className="bitfun-terminal__statusbar-item"

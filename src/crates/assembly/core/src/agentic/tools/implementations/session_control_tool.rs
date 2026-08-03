@@ -22,6 +22,7 @@ use bitfun_agent_runtime::session_control::{
     SessionControlAction, SessionControlCancelRoute, SessionControlInput,
     SessionControlValidationContext, SessionControlValidationResult,
 };
+use bitfun_core_types::SessionExecutionTarget;
 use bitfun_runtime_ports::{
     AgentSessionCreateRequest, AgentSessionDeleteRequest, AgentSessionListRequest,
     AgentSessionSummary, AgentSessionWorkspaceBinding, AgentSessionWorkspaceRequest,
@@ -38,6 +39,9 @@ const CANCEL_WAIT_TIMEOUT: Duration = Duration::from_secs(3);
 #[derive(Debug, Clone)]
 struct SessionControlWorkspaceTarget {
     display_workspace: String,
+    project_workspace: String,
+    execution_target: Option<SessionExecutionTarget>,
+    workspace_id: Option<String>,
     remote_connection_id: Option<String>,
     remote_ssh_host: Option<String>,
 }
@@ -134,6 +138,9 @@ impl SessionControlTool {
     ) -> SessionControlWorkspaceTarget {
         SessionControlWorkspaceTarget {
             display_workspace: normalize_path(&workspace.root_path_string()),
+            project_workspace: normalize_path(&workspace.project_root_path_string()),
+            execution_target: workspace.execution_target.clone(),
+            workspace_id: workspace.workspace_id.clone(),
             remote_connection_id: workspace.connection_id().map(ToOwned::to_owned),
             remote_ssh_host: if workspace.is_remote() {
                 Some(workspace.session_identity.hostname.clone())
@@ -147,8 +154,15 @@ impl SessionControlTool {
     fn workspace_target_from_binding(
         binding: AgentSessionWorkspaceBinding,
     ) -> SessionControlWorkspaceTarget {
+        let project_workspace = binding
+            .project_workspace_path
+            .clone()
+            .unwrap_or_else(|| binding.workspace_path.clone());
         SessionControlWorkspaceTarget {
             display_workspace: binding.workspace_path,
+            project_workspace,
+            execution_target: binding.execution_target,
+            workspace_id: binding.workspace_id,
             remote_connection_id: binding.remote_connection_id,
             remote_ssh_host: binding.remote_ssh_host,
         }
@@ -178,7 +192,7 @@ impl SessionControlTool {
     ) -> BitFunResult<()> {
         let existing_sessions = runtime
             .list_sessions(AgentSessionListRequest {
-                workspace_path: workspace.display_workspace.clone(),
+                workspace_path: workspace.project_workspace.clone(),
                 remote_connection_id: workspace.remote_connection_id.clone(),
                 remote_ssh_host: workspace.remote_ssh_host.clone(),
             })
@@ -276,7 +290,7 @@ Arguments:
     }
 
     fn default_exposure(&self) -> ToolExposure {
-        ToolExposure::Collapsed
+        ToolExposure::Deferred
     }
 
     fn input_schema(&self) -> Value {
@@ -312,10 +326,6 @@ Arguments:
     }
 
     fn is_readonly(&self) -> bool {
-        false
-    }
-
-    fn needs_permissions(&self, _input: Option<&Value>) -> bool {
         false
     }
 
@@ -379,8 +389,12 @@ Arguments:
                         session_name,
                         agent_type,
                         workspace_path: Some(workspace.display_workspace.clone()),
+                        project_workspace_path: Some(workspace.project_workspace.clone()),
+                        execution_target: workspace.execution_target.clone(),
+                        workspace_id: workspace.workspace_id.clone(),
                         remote_connection_id: workspace.remote_connection_id.clone(),
                         remote_ssh_host: workspace.remote_ssh_host.clone(),
+                        model_id: None,
                         metadata,
                     })
                     .await
@@ -520,9 +534,18 @@ Arguments:
                 self.ensure_session_exists(&runtime, &workspace, session_id)
                     .await?;
 
-                runtime
+                let scheduler = get_global_scheduler().ok_or_else(|| {
+                    BitFunError::tool("scheduler not initialized for session deletion".to_string())
+                })?;
+                let deletion_runtime = CoreServiceAgentRuntime::agent_runtime_with_scheduler_ports(
+                    coordinator.clone(),
+                    scheduler,
+                )
+                .map_err(BitFunError::tool)?;
+
+                deletion_runtime
                     .delete_session(AgentSessionDeleteRequest {
-                        workspace_path: workspace.display_workspace.clone(),
+                        workspace_path: workspace.project_workspace.clone(),
                         session_id: session_id.to_string(),
                         remote_connection_id: workspace.remote_connection_id.clone(),
                         remote_ssh_host: workspace.remote_ssh_host.clone(),
@@ -557,7 +580,7 @@ Arguments:
                     .await?;
                 let sessions = runtime
                     .list_sessions(AgentSessionListRequest {
-                        workspace_path: workspace.display_workspace.clone(),
+                        workspace_path: workspace.project_workspace.clone(),
                         remote_connection_id: workspace.remote_connection_id.clone(),
                         remote_ssh_host: workspace.remote_ssh_host.clone(),
                     })
@@ -594,6 +617,10 @@ Arguments:
 mod tests {
     use super::*;
     use crate::agentic::tools::framework::ToolUseContext;
+    use crate::agentic::WorkspaceBinding;
+    use bitfun_core_types::{
+        SessionExecutionTarget, SessionExecutionTargetKind, WorktreeLifecycle,
+    };
     use serde_json::json;
     use std::collections::HashMap;
     use std::fs;
@@ -607,7 +634,7 @@ mod tests {
             session_id: None,
             dialog_turn_id: None,
             workspace: None,
-            unlocked_collapsed_tools: Vec::new(),
+            loaded_deferred_tool_specs: Vec::new(),
             primary_model_facts: tool_runtime::context::PrimaryModelFacts::default(),
             custom_data: HashMap::new(),
             computer_use_host: None,
@@ -636,6 +663,30 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.path);
         }
+    }
+
+    #[test]
+    fn worktree_context_keeps_project_scope_for_session_operations() {
+        let worktree_path = PathBuf::from("/worktrees/wt-1");
+        let project_path = PathBuf::from("/repo");
+        let execution_target = SessionExecutionTarget {
+            kind: SessionExecutionTargetKind::ManagedWorktree,
+            worktree_id: Some("wt-1".to_string()),
+            root_path: "/worktrees/wt-1".to_string(),
+            base_ref: Some("HEAD".to_string()),
+            base_commit: Some("0123456789abcdef".to_string()),
+            branch: None,
+            lifecycle: Some(WorktreeLifecycle::Managed),
+        };
+        let binding = WorkspaceBinding::new(None, worktree_path.clone())
+            .with_project_root_path(project_path.clone())
+            .with_execution_target(Some(execution_target.clone()));
+
+        let target = SessionControlTool::workspace_target_from_context(&binding);
+
+        assert_eq!(PathBuf::from(target.display_workspace), worktree_path);
+        assert_eq!(PathBuf::from(target.project_workspace), project_path);
+        assert_eq!(target.execution_target, Some(execution_target));
     }
 
     #[tokio::test]

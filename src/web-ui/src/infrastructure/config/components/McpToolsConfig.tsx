@@ -4,7 +4,7 @@
  * Uses settings/mcp-tools for page title/subtitle, settings/mcp for the MCP section.
  */
 
-import React, { useRef, useState, useEffect } from 'react';
+import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
   FileJson,
@@ -28,12 +28,15 @@ import {
 } from './common';
 import { useNotification } from '@/shared/notification-system';
 import { createLogger } from '@/shared/utils/logger';
+import { usePeerDeviceModeOptional } from '@/infrastructure/peer-device/peerDeviceContextState';
+import { isTauriRuntime } from '@/infrastructure/runtime';
 import {
   MCPAPI,
   MCPRemoteOAuthSessionSnapshot,
   MCPServerInfo,
 } from '../../api/service-api/MCPAPI';
 import { systemAPI } from '../../api/service-api/SystemAPI';
+import ExternalMcpOverview from './ExternalMcpOverview';
 import './McpToolsConfig.scss';
 
 const log = createLogger('McpToolsConfig');
@@ -163,16 +166,26 @@ const McpToolsConfig: React.FC = () => {
   const { t: tMcp } = useTranslation('settings/mcp');
 
   const notification = useNotification();
+  const peerDevice = usePeerDeviceModeOptional();
+  const remoteConnectionActive = peerDevice?.peerMode.active === true;
+  const desktopConfigAvailable = isTauriRuntime() && !remoteConnectionActive;
   const classifyError = createErrorClassifier(tMcp);
 
   // ─── MCP state ─────────────────────────────────────────────────────────────
   const jsonEditorRef = useRef<HTMLTextAreaElement>(null);
   const jsonLintSeqRef = useRef(0);
   const oauthPollTimerRef = useRef<number | null>(null);
+  const serverLoadRequestIdRef = useRef(0);
+  const jsonLoadRequestIdRef = useRef(0);
+  const capabilityRef = useRef({ available: desktopConfigAvailable, epoch: 0 });
   const [servers, setServers] = useState<MCPServerInfo[]>([]);
   const [mcpLoading, setMcpLoading] = useState(true);
+  const [serverLoadFailed, setServerLoadFailed] = useState(false);
   const [showJsonEditor, setShowJsonEditor] = useState(false);
   const [jsonConfig, setJsonConfig] = useState('');
+  const [jsonConfigFingerprint, setJsonConfigFingerprint] = useState('');
+  const [jsonLoading, setJsonLoading] = useState(true);
+  const [jsonLoadFailed, setJsonLoadFailed] = useState(false);
   const [authDialogServer, setAuthDialogServer] = useState<MCPServerInfo | null>(null);
   const [authValue, setAuthValue] = useState('');
   const [authSubmitting, setAuthSubmitting] = useState(false);
@@ -186,6 +199,22 @@ const McpToolsConfig: React.FC = () => {
     position?: number;
   } | null>(null);
 
+  useLayoutEffect(() => {
+    if (capabilityRef.current.available !== desktopConfigAvailable) {
+      capabilityRef.current = {
+        available: desktopConfigAvailable,
+        epoch: capabilityRef.current.epoch + 1,
+      };
+    }
+  }, [desktopConfigAvailable]);
+
+  const currentCapabilityEpoch = useCallback((): number | null => (
+    capabilityRef.current.available ? capabilityRef.current.epoch : null
+  ), []);
+  const capabilityIsCurrent = useCallback((epoch: number): boolean => (
+    capabilityRef.current.available && capabilityRef.current.epoch === epoch
+  ), []);
+
   const tryFormatJson = (input: string): string | null => {
     try {
       return JSON.stringify(JSON.parse(input), null, 2);
@@ -197,37 +226,85 @@ const McpToolsConfig: React.FC = () => {
   // ─── MCP effects & handlers ─────────────────────────────────────────────────
   const LOAD_SERVERS_TIMEOUT_MS = 15_000;
 
-  const loadServers = async () => {
+  const loadServers = useCallback(async (): Promise<boolean> => {
+    const capabilityEpoch = currentCapabilityEpoch();
+    if (capabilityEpoch === null) return false;
+    const requestId = ++serverLoadRequestIdRef.current;
     try {
       setMcpLoading(true);
+      setServerLoadFailed(false);
       const serverList = await Promise.race([
         MCPAPI.getServers(),
         new Promise<never>((_, reject) =>
           setTimeout(() => reject(new Error('MCP servers load timed out')), LOAD_SERVERS_TIMEOUT_MS)
         ),
       ]);
+      if (
+        requestId !== serverLoadRequestIdRef.current
+        || !capabilityIsCurrent(capabilityEpoch)
+      ) {
+        return false;
+      }
       setServers(serverList);
+      setServerLoadFailed(false);
+      return true;
     } catch (error) {
+      if (
+        requestId !== serverLoadRequestIdRef.current
+        || !capabilityIsCurrent(capabilityEpoch)
+      ) {
+        return false;
+      }
       log.error('Failed to load MCP servers', error);
+      setServerLoadFailed(true);
+      return false;
     } finally {
-      setMcpLoading(false);
+      if (
+        requestId === serverLoadRequestIdRef.current
+        && capabilityIsCurrent(capabilityEpoch)
+      ) {
+        setMcpLoading(false);
+      }
     }
-  };
+  }, [capabilityIsCurrent, currentCapabilityEpoch]);
 
-  const loadJsonConfig = async () => {
+  const loadJsonConfig = useCallback(async (): Promise<boolean> => {
+    const capabilityEpoch = currentCapabilityEpoch();
+    if (capabilityEpoch === null) return false;
+    const requestId = ++jsonLoadRequestIdRef.current;
+    setJsonLoading(true);
+    setJsonLoadFailed(false);
     try {
       const config = await MCPAPI.loadMCPJsonConfig();
-      setJsonConfig(config);
-    } catch {
-      setJsonConfig(
-        JSON.stringify(
-          { mcpServers: { 'example-server': { command: 'npx', args: ['-y', '@example/mcp-server'], env: {} } } },
-          null,
-          2
-        )
-      );
+      if (
+        requestId !== jsonLoadRequestIdRef.current
+        || !capabilityIsCurrent(capabilityEpoch)
+      ) {
+        return false;
+      }
+      setJsonConfig(config.jsonConfig);
+      setJsonConfigFingerprint(config.fingerprint);
+      setJsonLoadFailed(false);
+      return true;
+    } catch (error) {
+      if (
+        requestId !== jsonLoadRequestIdRef.current
+        || !capabilityIsCurrent(capabilityEpoch)
+      ) {
+        return false;
+      }
+      log.error('Failed to load MCP JSON configuration', error);
+      setJsonLoadFailed(true);
+      return false;
+    } finally {
+      if (
+        requestId === jsonLoadRequestIdRef.current
+        && capabilityIsCurrent(capabilityEpoch)
+      ) {
+        setJsonLoading(false);
+      }
     }
-  };
+  }, [capabilityIsCurrent, currentCapabilityEpoch]);
 
   function stopOAuthPolling() {
     if (oauthPollTimerRef.current !== null) {
@@ -238,8 +315,10 @@ const McpToolsConfig: React.FC = () => {
 
   const handleOAuthSessionUpdate = async (
     serverId: string,
-    session: MCPRemoteOAuthSessionSnapshot | null
+    session: MCPRemoteOAuthSessionSnapshot | null,
+    capabilityEpoch: number,
   ) => {
+    if (!capabilityIsCurrent(capabilityEpoch)) return;
     setOauthSession(session);
 
     const status = session?.status;
@@ -258,6 +337,7 @@ const McpToolsConfig: React.FC = () => {
         }
       );
       await loadServers();
+      if (!capabilityIsCurrent(capabilityEpoch)) return;
       closeAuthDialog();
       return;
     }
@@ -273,13 +353,20 @@ const McpToolsConfig: React.FC = () => {
     }
   };
 
-  const pollOAuthSession = (serverId: string) => {
+  const pollOAuthSession = (serverId: string, capabilityEpoch: number) => {
+    if (!capabilityIsCurrent(capabilityEpoch)) return;
     stopOAuthPolling();
     oauthPollTimerRef.current = window.setInterval(async () => {
+      if (!capabilityIsCurrent(capabilityEpoch)) {
+        stopOAuthPolling();
+        return;
+      }
       try {
         const session = await MCPAPI.getRemoteOAuthSession({ serverId });
-        await handleOAuthSessionUpdate(serverId, session);
+        if (!capabilityIsCurrent(capabilityEpoch)) return;
+        await handleOAuthSessionUpdate(serverId, session, capabilityEpoch);
       } catch (error) {
+        if (!capabilityIsCurrent(capabilityEpoch)) return;
         stopOAuthPolling();
         notification.error(
           error instanceof Error ? error.message : String(error),
@@ -293,9 +380,27 @@ const McpToolsConfig: React.FC = () => {
   };
 
   useEffect(() => {
-    loadServers();
-    loadJsonConfig();
-  }, []);
+    serverLoadRequestIdRef.current += 1;
+    jsonLoadRequestIdRef.current += 1;
+    if (!desktopConfigAvailable) {
+      setServers([]);
+      setMcpLoading(false);
+      setServerLoadFailed(false);
+      setShowJsonEditor(false);
+      setJsonConfigFingerprint('');
+      setJsonLoading(false);
+      setJsonLoadFailed(false);
+      setAuthDialogServer(null);
+      setAuthSubmitting(false);
+      setOauthSession(null);
+      setOauthStarting(false);
+      setOauthCancelling(false);
+      stopOAuthPolling();
+      return;
+    }
+    void loadServers();
+    void loadJsonConfig();
+  }, [desktopConfigAvailable, loadJsonConfig, loadServers]);
 
   useEffect(() => {
     return () => {
@@ -348,6 +453,8 @@ const McpToolsConfig: React.FC = () => {
   }, [jsonConfig, showJsonEditor]);
 
   const handleSaveJsonConfig = async () => {
+    const capabilityEpoch = currentCapabilityEpoch();
+    if (capabilityEpoch === null) return;
     try {
       let parsedConfig;
       try {
@@ -363,7 +470,11 @@ const McpToolsConfig: React.FC = () => {
       if (typeof parsedConfig.mcpServers !== 'object' || Array.isArray(parsedConfig.mcpServers))
         throw new Error(tMcp('errors.mcpServersMustBeObject'));
 
-      await MCPAPI.saveMCPJsonConfig(jsonConfig);
+      if (!jsonConfigFingerprint) {
+        throw new Error('MCP configuration snapshot is unavailable; reload before saving');
+      }
+      await MCPAPI.saveMCPJsonConfig(jsonConfig, jsonConfigFingerprint);
+      if (!capabilityIsCurrent(capabilityEpoch)) return;
       notification.success(tMcp('messages.saveSuccess'), {
         title: tMcp('notifications.saveSuccess'),
         duration: 3000,
@@ -373,18 +484,26 @@ const McpToolsConfig: React.FC = () => {
       void (async () => {
         try {
           await loadServers();
+          if (!capabilityIsCurrent(capabilityEpoch)) return;
           await MCPAPI.initializeServers();
+          if (!capabilityIsCurrent(capabilityEpoch)) return;
         } catch {
+          if (!capabilityIsCurrent(capabilityEpoch)) return;
           notification.warning(tMcp('messages.partialStartFailed'), {
             title: tMcp('notifications.partialStartFailed'),
             duration: 5000,
           });
         } finally {
-          await loadServers();
-          await loadJsonConfig();
+          if (capabilityIsCurrent(capabilityEpoch)) {
+            await loadServers();
+            if (capabilityIsCurrent(capabilityEpoch)) {
+              await loadJsonConfig();
+            }
+          }
         }
       })();
     } catch (error) {
+      if (!capabilityIsCurrent(capabilityEpoch)) return;
       const errorInfo = classifyError(error, tMcp('actions.saveConfig'));
       let fullMessage = errorInfo.message;
       if (errorInfo.suggestions?.length) {
@@ -542,6 +661,8 @@ const McpToolsConfig: React.FC = () => {
   };
 
   const handleStartServer = async (server: MCPServerInfo) => {
+    const capabilityEpoch = currentCapabilityEpoch();
+    if (capabilityEpoch === null) return;
     if (!canStartServer(server)) {
       notifyServerStartUnavailable(server);
       return;
@@ -550,12 +671,14 @@ const McpToolsConfig: React.FC = () => {
     const serverId = server.id;
     try {
       await MCPAPI.startServer(serverId);
+      if (!capabilityIsCurrent(capabilityEpoch)) return;
       notification.success(tMcp('messages.startSuccess', { serverId }), {
         title: tMcp('notifications.startSuccess'),
         duration: 3000,
       });
       await loadServers();
     } catch (error) {
+      if (!capabilityIsCurrent(capabilityEpoch)) return;
       if (isRemoteServer(server) && isLikelyRemoteAuthError(error)) {
         handleOpenAuthDialog(server);
         if (server.oauthEnabled) {
@@ -572,14 +695,18 @@ const McpToolsConfig: React.FC = () => {
   };
 
   const handleStopServer = async (serverId: string) => {
+    const capabilityEpoch = currentCapabilityEpoch();
+    if (capabilityEpoch === null) return;
     try {
       await MCPAPI.stopServer(serverId);
+      if (!capabilityIsCurrent(capabilityEpoch)) return;
       notification.success(tMcp('messages.stopSuccess', { serverId }), {
         title: tMcp('notifications.stopSuccess'),
         duration: 3000,
       });
       await loadServers();
     } catch (error) {
+      if (!capabilityIsCurrent(capabilityEpoch)) return;
       notification.error(
         tMcp('messages.stopFailed', { serverId }) +
           ': ' +
@@ -590,6 +717,8 @@ const McpToolsConfig: React.FC = () => {
   };
 
   const handleRestartServer = async (server: MCPServerInfo) => {
+    const capabilityEpoch = currentCapabilityEpoch();
+    if (capabilityEpoch === null) return;
     if (!canStartServer(server)) {
       notifyServerStartUnavailable(server);
       return;
@@ -598,12 +727,14 @@ const McpToolsConfig: React.FC = () => {
     const serverId = server.id;
     try {
       await MCPAPI.restartServer(serverId);
+      if (!capabilityIsCurrent(capabilityEpoch)) return;
       notification.success(tMcp('messages.restartSuccess', { serverId }), {
         title: tMcp('notifications.restartSuccess'),
         duration: 3000,
       });
       await loadServers();
     } catch (error) {
+      if (!capabilityIsCurrent(capabilityEpoch)) return;
       if (isRemoteServer(server) && isLikelyRemoteAuthError(error)) {
         handleOpenAuthDialog(server);
         if (server.oauthEnabled) {
@@ -620,6 +751,8 @@ const McpToolsConfig: React.FC = () => {
   };
 
   function handleOpenAuthDialog(server: MCPServerInfo) {
+    const capabilityEpoch = currentCapabilityEpoch();
+    if (capabilityEpoch === null) return;
     setAuthDialogServer(server);
     setAuthValue('');
     setOauthSession(null);
@@ -631,11 +764,13 @@ const McpToolsConfig: React.FC = () => {
       void (async () => {
         try {
           const session = await MCPAPI.getRemoteOAuthSession({ serverId: server.id });
+          if (!capabilityIsCurrent(capabilityEpoch)) return;
           setOauthSession(session);
           if (session && !['authorized', 'failed', 'cancelled'].includes(session.status)) {
-            pollOAuthSession(server.id);
+            pollOAuthSession(server.id, capabilityEpoch);
           }
         } catch (error) {
+          if (!capabilityIsCurrent(capabilityEpoch)) return;
           log.warn('Failed to load remote OAuth session', { serverId: server.id, error });
         }
       })();
@@ -653,6 +788,11 @@ const McpToolsConfig: React.FC = () => {
 
   const handleCloseAuthDialog = () => {
     if (authSubmitting || oauthCancelling) return;
+    const capabilityEpoch = currentCapabilityEpoch();
+    if (capabilityEpoch === null) {
+      closeAuthDialog();
+      return;
+    }
 
     if (
       authDialogServer &&
@@ -664,13 +804,16 @@ const McpToolsConfig: React.FC = () => {
         try {
           await MCPAPI.cancelRemoteOAuth({ serverId: authDialogServer.id });
         } catch (error) {
+          if (!capabilityIsCurrent(capabilityEpoch)) return;
           log.warn('Failed to cancel remote OAuth session', {
             serverId: authDialogServer.id,
             error,
           });
         } finally {
-          setOauthCancelling(false);
-          closeAuthDialog();
+          if (capabilityIsCurrent(capabilityEpoch)) {
+            setOauthCancelling(false);
+            closeAuthDialog();
+          }
         }
       })();
       return;
@@ -681,6 +824,8 @@ const McpToolsConfig: React.FC = () => {
 
   const handleSaveRemoteAuth = async () => {
     if (!authDialogServer || authSubmitting) return;
+    const capabilityEpoch = currentCapabilityEpoch();
+    if (capabilityEpoch === null) return;
 
     const trimmed = authValue.trim();
     if (!trimmed) {
@@ -697,6 +842,7 @@ const McpToolsConfig: React.FC = () => {
         serverId: authDialogServer.id,
         authorizationValue: trimmed,
       });
+      if (!capabilityIsCurrent(capabilityEpoch)) return;
       notification.success(
         tMcp('messages.remoteAuthUpdated', { serverId: authDialogServer.id }),
         {
@@ -707,22 +853,28 @@ const McpToolsConfig: React.FC = () => {
       closeAuthDialog();
       await loadServers();
     } catch (error) {
+      if (!capabilityIsCurrent(capabilityEpoch)) return;
       const errorInfo = classifyError(error, tMcp('actions.saveConfig'));
       notification.error(errorInfo.message, {
         title: errorInfo.title,
         duration: errorInfo.duration,
       });
     } finally {
-      setAuthSubmitting(false);
+      if (capabilityIsCurrent(capabilityEpoch)) {
+        setAuthSubmitting(false);
+      }
     }
   };
 
   const handleDeleteServer = async (server: MCPServerInfo) => {
+    const capabilityEpoch = currentCapabilityEpoch();
+    if (capabilityEpoch === null) return;
     const confirmed = await window.confirm(tMcp('messages.deleteConfirm'));
-    if (!confirmed) return;
+    if (!confirmed || !capabilityIsCurrent(capabilityEpoch)) return;
 
     try {
       await MCPAPI.deleteServer({ serverId: server.id });
+      if (!capabilityIsCurrent(capabilityEpoch)) return;
       if (authDialogServer?.id === server.id) {
         closeAuthDialog();
       }
@@ -732,6 +884,7 @@ const McpToolsConfig: React.FC = () => {
       });
       await loadServers();
     } catch (error) {
+      if (!capabilityIsCurrent(capabilityEpoch)) return;
       const errorInfo = classifyError(error, tMcp('actions.delete'));
       notification.error(
         tMcp('errors.deleteServerFailed', {
@@ -747,14 +900,18 @@ const McpToolsConfig: React.FC = () => {
   };
 
   async function startRemoteOAuthFlow(server: MCPServerInfo) {
+    const capabilityEpoch = currentCapabilityEpoch();
+    if (capabilityEpoch === null) return;
     setOauthStarting(true);
     try {
       const session = await MCPAPI.startRemoteOAuth({ serverId: server.id });
+      if (!capabilityIsCurrent(capabilityEpoch)) return;
       setOauthSession(session);
       if (session.authorizationUrl) {
         await systemAPI.openExternal(session.authorizationUrl);
+        if (!capabilityIsCurrent(capabilityEpoch)) return;
       }
-      pollOAuthSession(server.id);
+      pollOAuthSession(server.id, capabilityEpoch);
       notification.success(
         session.message || tMcp('messages.remoteOAuthStarted', { serverId: server.id }),
         {
@@ -763,13 +920,16 @@ const McpToolsConfig: React.FC = () => {
         }
       );
     } catch (error) {
+      if (!capabilityIsCurrent(capabilityEpoch)) return;
       const errorInfo = classifyError(error, tMcp('actions.remoteAuth'));
       notification.error(errorInfo.message, {
         title: errorInfo.title,
         duration: errorInfo.duration,
       });
     } finally {
-      setOauthStarting(false);
+      if (capabilityIsCurrent(capabilityEpoch)) {
+        setOauthStarting(false);
+      }
     }
   }
 
@@ -920,18 +1080,39 @@ const McpToolsConfig: React.FC = () => {
   };
 
   const mcpSectionExtra = (
-    <IconButton
-      variant="ghost"
-      size="small"
-      onClick={() => setShowJsonEditor(!showJsonEditor)}
-      tooltip={showJsonEditor ? tMcp('actions.backToList') : tMcp('actions.jsonConfig')}
-    >
-      {showJsonEditor ? <X size={16} /> : <FileJson size={16} />}
-    </IconButton>
+    <>
+      {serverLoadFailed && !showJsonEditor ? (
+        <>
+          {servers.length > 0 ? (
+            <span className="bitfun-mcp-tools__status-badge is-pending" data-bf-component="mcp-tools-config" data-bf-part="statusBadge">
+              {tMcp('external.status.stale')}
+            </span>
+          ) : null}
+          <IconButton
+            variant="ghost"
+            size="small"
+            onClick={() => void loadServers()}
+            tooltip={tMcp('actions.refresh')}
+            aria-label={tMcp('actions.refresh')}
+          >
+            <RefreshCw size={16} aria-hidden="true" />
+          </IconButton>
+        </>
+      ) : null}
+      <IconButton
+        variant="ghost"
+        size="small"
+        onClick={() => setShowJsonEditor(!showJsonEditor)}
+        tooltip={showJsonEditor ? tMcp('actions.backToList') : tMcp('actions.jsonConfig')}
+        aria-label={showJsonEditor ? tMcp('actions.backToList') : tMcp('actions.jsonConfig')}
+      >
+        {showJsonEditor ? <X size={16} /> : <FileJson size={16} />}
+      </IconButton>
+    </>
   );
 
   const renderServerBadge = (server: MCPServerInfo) => (
-    <span className={`bitfun-mcp-tools__status-badge ${getStatusClass(server.status)}`}>
+    <span className={`bitfun-mcp-tools__status-badge ${getStatusClass(server.status)}`} data-bf-component="mcp-tools-config" data-bf-part="statusBadge">
       {getStatusIcon(server.status)}
       {getServerStatusLabel(server.status)}
     </span>
@@ -945,6 +1126,7 @@ const McpToolsConfig: React.FC = () => {
           variant="ghost"
           onClick={() => handleOpenAuthDialog(server)}
           tooltip={tMcp('actions.remoteAuth')}
+          aria-label={tMcp('actions.remoteAuth')}
         >
           <KeyRound size={14} />
         </IconButton>
@@ -954,6 +1136,7 @@ const McpToolsConfig: React.FC = () => {
         variant="ghost"
         onClick={() => handleDeleteServer(server)}
         tooltip={tMcp('actions.delete')}
+        aria-label={tMcp('actions.delete')}
       >
         <Trash2 size={14} />
       </IconButton>
@@ -967,6 +1150,11 @@ const McpToolsConfig: React.FC = () => {
               ? tMcp('actions.start')
               : tMcp('messages.commandUnavailable', { serverId: server.id })
           }
+          aria-label={
+            canStartServer(server)
+              ? tMcp('actions.start')
+              : tMcp('messages.commandUnavailable', { serverId: server.id })
+          }
         >
           <Play size={14} />
         </IconButton>
@@ -976,6 +1164,7 @@ const McpToolsConfig: React.FC = () => {
           variant="warning"
           onClick={() => handleStopServer(server.id)}
           tooltip={tMcp('actions.stop')}
+          aria-label={tMcp('actions.stop')}
         >
           <Square size={14} />
         </IconButton>
@@ -985,6 +1174,11 @@ const McpToolsConfig: React.FC = () => {
         variant="ghost"
         onClick={() => handleRestartServer(server)}
         tooltip={
+          canStartServer(server)
+            ? tMcp('actions.restart')
+            : tMcp('messages.commandUnavailable', { serverId: server.id })
+        }
+        aria-label={
           canStartServer(server)
             ? tMcp('actions.restart')
             : tMcp('messages.commandUnavailable', { serverId: server.id })
@@ -999,57 +1193,57 @@ const McpToolsConfig: React.FC = () => {
     if (!server.statusMessage && !isCommandDrivenServer(server) && !isRemoteServer(server)) return null;
 
     return (
-      <div className="bitfun-mcp-tools__server-details">
-        <div className="bitfun-mcp-tools__server-detail-item">
-          <span className="bitfun-mcp-tools__server-detail-label">
+      <div className="bitfun-mcp-tools__server-details" data-bf-component="mcp-tools-config" data-bf-part="serverDetails">
+        <div className="bitfun-mcp-tools__server-detail-item" data-bf-component="mcp-tools-config" data-bf-part="detailItem">
+          <span className="bitfun-mcp-tools__server-detail-label" data-bf-component="mcp-tools-config" data-bf-part="detailLabel">
             {tMcp('server.transport')}:
           </span>
-          <code className="bitfun-mcp-tools__server-detail-value">{server.transport}</code>
+          <code className="bitfun-mcp-tools__server-detail-value" data-bf-component="mcp-tools-config" data-bf-part="detailValue">{server.transport}</code>
         </div>
         {server.statusMessage && (
-          <div className="bitfun-mcp-tools__server-detail-item">
-            <span className="bitfun-mcp-tools__server-detail-label">
+          <div className="bitfun-mcp-tools__server-detail-item" data-bf-component="mcp-tools-config" data-bf-part="detailItem">
+            <span className="bitfun-mcp-tools__server-detail-label" data-bf-component="mcp-tools-config" data-bf-part="detailLabel">
               {tMcp('server.statusDetail')}:
             </span>
-            <span className="bitfun-mcp-tools__server-detail-value">
+            <span className="bitfun-mcp-tools__server-detail-value" data-bf-component="mcp-tools-config" data-bf-part="detailValue">
               {server.statusMessage}
             </span>
           </div>
         )}
         {server.startDisabledReason && (
-          <div className="bitfun-mcp-tools__server-detail-item">
-            <span className="bitfun-mcp-tools__server-detail-label">
+          <div className="bitfun-mcp-tools__server-detail-item" data-bf-component="mcp-tools-config" data-bf-part="detailItem">
+            <span className="bitfun-mcp-tools__server-detail-label" data-bf-component="mcp-tools-config" data-bf-part="detailLabel">
               {tMcp('server.runtime.unsupportedReason')}:
             </span>
-            <span className="bitfun-mcp-tools__server-detail-value">
+            <span className="bitfun-mcp-tools__server-detail-value" data-bf-component="mcp-tools-config" data-bf-part="detailValue">
               {getStartDisabledReasonLabel(server)}
             </span>
           </div>
         )}
         {isRemoteServer(server) && (
           <>
-            <div className="bitfun-mcp-tools__server-detail-item">
-              <span className="bitfun-mcp-tools__server-detail-label">
+            <div className="bitfun-mcp-tools__server-detail-item" data-bf-component="mcp-tools-config" data-bf-part="detailItem">
+              <span className="bitfun-mcp-tools__server-detail-label" data-bf-component="mcp-tools-config" data-bf-part="detailLabel">
                 {tMcp('server.remoteUrl')}:
               </span>
-              <code className="bitfun-mcp-tools__server-detail-value">
+              <code className="bitfun-mcp-tools__server-detail-value" data-bf-component="mcp-tools-config" data-bf-part="detailValue">
                 {server.url || '-'}
               </code>
             </div>
-            <div className="bitfun-mcp-tools__server-detail-item">
-              <span className="bitfun-mcp-tools__server-detail-label">
+            <div className="bitfun-mcp-tools__server-detail-item" data-bf-component="mcp-tools-config" data-bf-part="detailItem">
+              <span className="bitfun-mcp-tools__server-detail-label" data-bf-component="mcp-tools-config" data-bf-part="detailLabel">
                 {tMcp('server.remoteAuth')}:
               </span>
-              <span className="bitfun-mcp-tools__server-detail-value">
+              <span className="bitfun-mcp-tools__server-detail-value" data-bf-component="mcp-tools-config" data-bf-part="detailValue">
                 {getRemoteAuthSummary(server)}
               </span>
             </div>
             {(server.oauthEnabled || server.xaaEnabled) && (
-              <div className="bitfun-mcp-tools__server-detail-item">
-                <span className="bitfun-mcp-tools__server-detail-label">
+              <div className="bitfun-mcp-tools__server-detail-item" data-bf-component="mcp-tools-config" data-bf-part="detailItem">
+                <span className="bitfun-mcp-tools__server-detail-label" data-bf-component="mcp-tools-config" data-bf-part="detailLabel">
                   {tMcp('server.remoteAuthMethod')}:
                 </span>
-                <span className="bitfun-mcp-tools__server-detail-value">
+                <span className="bitfun-mcp-tools__server-detail-value" data-bf-component="mcp-tools-config" data-bf-part="detailValue">
                   {getRemoteAuthMethodLabel(server)}
                 </span>
               </div>
@@ -1058,28 +1252,28 @@ const McpToolsConfig: React.FC = () => {
         )}
         {!isCommandDrivenServer(server) ? null : (
           <>
-        <div className="bitfun-mcp-tools__server-detail-item">
-          <span className="bitfun-mcp-tools__server-detail-label">
+        <div className="bitfun-mcp-tools__server-detail-item" data-bf-component="mcp-tools-config" data-bf-part="detailItem">
+          <span className="bitfun-mcp-tools__server-detail-label" data-bf-component="mcp-tools-config" data-bf-part="detailLabel">
             {tMcp('server.command')}:
           </span>
-          <code className="bitfun-mcp-tools__server-detail-value">
+          <code className="bitfun-mcp-tools__server-detail-value" data-bf-component="mcp-tools-config" data-bf-part="detailValue">
             {server.command || '-'}
           </code>
         </div>
-        <div className="bitfun-mcp-tools__server-detail-item">
-          <span className="bitfun-mcp-tools__server-detail-label">
+        <div className="bitfun-mcp-tools__server-detail-item" data-bf-component="mcp-tools-config" data-bf-part="detailItem">
+          <span className="bitfun-mcp-tools__server-detail-label" data-bf-component="mcp-tools-config" data-bf-part="detailLabel">
             {tMcp('server.runtime.source')}:
           </span>
-          <span className="bitfun-mcp-tools__server-detail-value">
+          <span className="bitfun-mcp-tools__server-detail-value" data-bf-component="mcp-tools-config" data-bf-part="detailValue">
             {getRuntimeSourceLabel(server)}
           </span>
         </div>
         {server.commandResolvedPath && (
-          <div className="bitfun-mcp-tools__server-detail-item">
-            <span className="bitfun-mcp-tools__server-detail-label">
+          <div className="bitfun-mcp-tools__server-detail-item" data-bf-component="mcp-tools-config" data-bf-part="detailItem">
+            <span className="bitfun-mcp-tools__server-detail-label" data-bf-component="mcp-tools-config" data-bf-part="detailLabel">
               {tMcp('server.runtime.path')}:
             </span>
-            <code className="bitfun-mcp-tools__server-detail-value">
+            <code className="bitfun-mcp-tools__server-detail-value" data-bf-component="mcp-tools-config" data-bf-part="detailValue">
               {server.commandResolvedPath}
             </code>
           </div>
@@ -1091,22 +1285,52 @@ const McpToolsConfig: React.FC = () => {
   };
 
   return (
-    <ConfigPageLayout className="bitfun-mcp-tools">
-      <ConfigPageHeader title={tPage('title')} subtitle={tPage('subtitle')} />
+    <ConfigPageLayout className="bitfun-mcp-tools" data-bf-component="mcp-tools-config" data-bf-part="root" data-bf-view={showJsonEditor ? 'json' : 'list'}>
+      <ConfigPageHeader
+        title={tPage('title')}
+        subtitle={desktopConfigAvailable ? tPage('subtitle') : tMcp('subtitleReadOnly')}
+      />
 
-      <ConfigPageContent>
-        {/* MCP section */}
+      <ConfigPageContent data-bf-component="mcp-tools-config" data-bf-part="content">
         <ConfigPageSection
           title={tMcp('section.serverList.title')}
-          description={tMcp('section.serverList.description')}
-          extra={mcpSectionExtra}
+          extra={desktopConfigAvailable ? mcpSectionExtra : undefined}
         >
-          {showJsonEditor && (
-            <div className="bitfun-mcp-tools__json-editor">
-              <div className="bitfun-mcp-tools__json-editor-header">
+          {!desktopConfigAvailable && (
+            <div className="bitfun-collection-empty" data-bf-component="mcp-tools-config" data-bf-part="empty" data-testid="mcp-management-unavailable">
+              <p>{tMcp(remoteConnectionActive
+                ? 'section.serverList.remoteUnavailable'
+                : 'section.serverList.desktopUnavailable')}</p>
+            </div>
+          )}
+
+          {desktopConfigAvailable && showJsonEditor && jsonLoading && (
+            <div className="bitfun-collection-empty" data-bf-component="mcp-tools-config" data-bf-part="empty">
+              <p>{tMcp('loading')}</p>
+            </div>
+          )}
+
+          {desktopConfigAvailable && showJsonEditor && !jsonLoading && jsonLoadFailed && (
+            <div className="bitfun-collection-empty" data-bf-component="mcp-tools-config" data-bf-part="empty" role="status">
+              <p>{tMcp('jsonEditor.loadFailed')}</p>
+              <IconButton
+                variant="ghost"
+                size="small"
+                onClick={() => void loadJsonConfig()}
+                tooltip={tMcp('actions.refresh')}
+                aria-label={tMcp('actions.refresh')}
+              >
+                <RefreshCw size={16} aria-hidden="true" />
+              </IconButton>
+            </div>
+          )}
+
+          {desktopConfigAvailable && showJsonEditor && !jsonLoading && !jsonLoadFailed && (
+            <div className="bitfun-mcp-tools__json-editor" data-bf-component="mcp-tools-config" data-bf-part="jsonEditor">
+              <div className="bitfun-mcp-tools__json-editor-header" data-bf-component="mcp-tools-config" data-bf-part="jsonHeader">
                 <h3>{tMcp('jsonEditor.title')}</h3>
-                <p className="bitfun-mcp-tools__json-hint">{tMcp('jsonEditor.hint1')}</p>
-                <p className="bitfun-mcp-tools__json-hint">{tMcp('jsonEditor.hint2')}</p>
+                <p className="bitfun-mcp-tools__json-hint" data-bf-component="mcp-tools-config" data-bf-part="jsonHint">{tMcp('jsonEditor.hint1')}</p>
+                <p className="bitfun-mcp-tools__json-hint" data-bf-component="mcp-tools-config" data-bf-part="jsonHint">{tMcp('jsonEditor.hint2')}</p>
               </div>
               <Textarea
                 ref={jsonEditorRef}
@@ -1118,6 +1342,8 @@ const McpToolsConfig: React.FC = () => {
                 placeholder={`{\n  "mcpServers": {\n    "server-name": {\n      "command": "npx",\n      "args": ["-y", "@package/name"],\n      "env": {}\n    }\n  }\n}`}
                 variant="outlined"
                 className="bitfun-mcp-tools__json-textarea"
+                data-bf-component="mcp-tools-config"
+                data-bf-part="jsonTextarea"
                 spellCheck={false}
                 error={!!jsonLintError}
                 errorMessage={
@@ -1135,7 +1361,7 @@ const McpToolsConfig: React.FC = () => {
                     : undefined
                 }
               />
-              <div className="bitfun-mcp-tools__json-actions">
+              <div className="bitfun-mcp-tools__json-actions" data-bf-component="mcp-tools-config" data-bf-part="jsonActions">
                 <Button variant="secondary" onClick={() => setShowJsonEditor(false)}>
                   {tMcp('actions.cancel')}
                 </Button>
@@ -1143,13 +1369,13 @@ const McpToolsConfig: React.FC = () => {
                   {tMcp('actions.saveConfig')}
                 </Button>
               </div>
-              <div className="bitfun-mcp-tools__json-examples">
+              <div className="bitfun-mcp-tools__json-examples" data-bf-component="mcp-tools-config" data-bf-part="examples">
                 <h4>{tMcp('jsonEditor.exampleTitle')}</h4>
-                <div className="bitfun-mcp-tools__example">
+                <div className="bitfun-mcp-tools__example" data-bf-component="mcp-tools-config" data-bf-part="example">
                   <h5>{tMcp('jsonEditor.localProcess')}</h5>
                   <pre>{`{\n  "mcpServers": {\n    "zai-mcp-server": {\n      "command": "npx",\n      "args": ["-y", "@z_ai/mcp-server"],\n      "env": { "Z_AI_API_KEY": "your_api_key" }\n    }\n  }\n}`}</pre>
                 </div>
-                <div className="bitfun-mcp-tools__example">
+                <div className="bitfun-mcp-tools__example" data-bf-component="mcp-tools-config" data-bf-part="example">
                   <h5>{tMcp('jsonEditor.remoteService')}</h5>
                   <pre>{`{\n  "mcpServers": {\n    "remote-mcp": {\n      "url": "http://localhost:3000/sse"\n    }\n  }\n}`}</pre>
                 </div>
@@ -1157,14 +1383,22 @@ const McpToolsConfig: React.FC = () => {
             </div>
           )}
 
-          {!showJsonEditor && mcpLoading && (
-            <div className="bitfun-collection-empty">
+          {desktopConfigAvailable && !showJsonEditor && mcpLoading && (
+            <div className="bitfun-collection-empty" data-bf-component="mcp-tools-config" data-bf-part="empty">
               <p>{tMcp('loading')}</p>
             </div>
           )}
 
-          {!showJsonEditor && !mcpLoading && servers.length === 0 && (
-            <div className="bitfun-collection-empty">
+          {desktopConfigAvailable && !showJsonEditor && !mcpLoading
+            && serverLoadFailed && servers.length === 0 && (
+            <div className="bitfun-collection-empty" data-bf-component="mcp-tools-config" data-bf-part="empty" role="status">
+              <p>{tMcp('section.serverList.loadFailed')}</p>
+            </div>
+          )}
+
+          {desktopConfigAvailable && !showJsonEditor && !mcpLoading
+            && !serverLoadFailed && servers.length === 0 && (
+            <div className="bitfun-collection-empty" data-bf-component="mcp-tools-config" data-bf-part="empty">
               <Button variant="dashed" size="small" onClick={() => setShowJsonEditor(true)}>
                 <FileJson size={14} />
                 {tMcp('actions.jsonConfig')}
@@ -1172,7 +1406,7 @@ const McpToolsConfig: React.FC = () => {
             </div>
           )}
 
-          {!showJsonEditor &&
+          {desktopConfigAvailable && !showJsonEditor &&
             servers.map((server) => (
               <ConfigCollectionItem
                 key={server.id}
@@ -1183,9 +1417,11 @@ const McpToolsConfig: React.FC = () => {
               />
             ))}
         </ConfigPageSection>
+
+        <ExternalMcpOverview />
       </ConfigPageContent>
       <Modal
-        isOpen={!!authDialogServer}
+        isOpen={desktopConfigAvailable && !!authDialogServer}
         onClose={handleCloseAuthDialog}
         title={
           authDialogServer
@@ -1196,33 +1432,33 @@ const McpToolsConfig: React.FC = () => {
         showCloseButton={!authSubmitting && !oauthCancelling}
       >
         {authDialogServer && (
-          <div className="bitfun-mcp-tools__json-editor">
+          <div className="bitfun-mcp-tools__json-editor" data-bf-component="mcp-tools-config" data-bf-part="authEditor">
             {authDialogServer.oauthEnabled && (
               <>
-                <p className="bitfun-mcp-tools__json-hint">
+                <p className="bitfun-mcp-tools__json-hint" data-bf-component="mcp-tools-config" data-bf-part="jsonHint">
                   {tMcp('modal.remoteOAuthHint')}
                 </p>
-                <p className="bitfun-mcp-tools__json-hint">
+                <p className="bitfun-mcp-tools__json-hint" data-bf-component="mcp-tools-config" data-bf-part="jsonHint">
                   {tMcp('modal.remoteOAuthCurrentStatus', {
                     status: getOAuthStatusLabel(oauthSession),
                   })}
                 </p>
                 {oauthSession?.redirectUri && (
-                  <p className="bitfun-mcp-tools__json-hint">
+                  <p className="bitfun-mcp-tools__json-hint" data-bf-component="mcp-tools-config" data-bf-part="jsonHint">
                     {tMcp('modal.remoteOAuthRedirectUri', {
                       redirectUri: oauthSession.redirectUri,
                     })}
                   </p>
                 )}
                 {oauthSession?.message && (
-                  <p className="bitfun-mcp-tools__json-hint">
+                  <p className="bitfun-mcp-tools__json-hint" data-bf-component="mcp-tools-config" data-bf-part="jsonHint">
                     {tMcp('modal.remoteOAuthStatus', {
                       status: getOAuthStatusLabel(oauthSession),
                       message: oauthSession.message,
                     })}
                   </p>
                 )}
-                <div className="bitfun-mcp-tools__json-actions">
+                <div className="bitfun-mcp-tools__json-actions" data-bf-component="mcp-tools-config" data-bf-part="jsonActions">
                   <Button
                     variant="primary"
                     onClick={handleStartRemoteOAuth}
@@ -1234,11 +1470,11 @@ const McpToolsConfig: React.FC = () => {
                 </div>
               </>
             )}
-            <p className="bitfun-mcp-tools__json-hint">
+            <p className="bitfun-mcp-tools__json-hint" data-bf-component="mcp-tools-config" data-bf-part="jsonHint">
               {tMcp('modal.remoteAuthHint')}
             </p>
             {authDialogServer.url && (
-              <p className="bitfun-mcp-tools__json-hint">
+              <p className="bitfun-mcp-tools__json-hint" data-bf-component="mcp-tools-config" data-bf-part="jsonHint">
                 {tMcp('modal.remoteAuthServerUrl', {
                   url: authDialogServer.url,
                 })}
@@ -1251,9 +1487,11 @@ const McpToolsConfig: React.FC = () => {
               placeholder={tMcp('modal.remoteAuthPlaceholder')}
               variant="outlined"
               className="bitfun-mcp-tools__json-textarea"
+              data-bf-component="mcp-tools-config"
+              data-bf-part="jsonTextarea"
               spellCheck={false}
             />
-            <div className="bitfun-mcp-tools__json-actions">
+            <div className="bitfun-mcp-tools__json-actions" data-bf-component="mcp-tools-config" data-bf-part="jsonActions">
               <Button
                 variant="secondary"
                 onClick={handleCloseAuthDialog}

@@ -1,30 +1,106 @@
 // Boundary rules for crate dependencies and lightweight profiles.
 
+const agentRuntimeIpcForbiddenDeps = [
+  'bitfun-acp',
+  'bitfun-agent-runtime',
+  'bitfun-agent-stream',
+  'bitfun-agent-tools',
+  'bitfun-ai-adapters',
+  'bitfun-claude-code-adapter',
+  'bitfun-codex-adapter',
+  'bitfun-core',
+  'bitfun-core-types',
+  'bitfun-external-sources',
+  'bitfun-harness',
+  'bitfun-opencode-adapter',
+  'bitfun-page-function-runtime',
+  'bitfun-plugin-runtime-client',
+  'bitfun-product-capabilities',
+  'bitfun-relay-service',
+  'bitfun-runtime-services',
+  'bitfun-sdk-host',
+  'bitfun-services-core',
+  'bitfun-services-integrations',
+  'bitfun-static-hook-support',
+  'bitfun-tool-call-jsonrepair',
+  'bitfun-tool-packs',
+  'bitfun-transport',
+  'bitfun-webdriver',
+  'terminal-core',
+  'tool-runtime',
+  'tauri',
+  'reqwest',
+  'tokio-tungstenite',
+  'bitfun-cli',
+  'ratatui',
+  'crossterm',
+  'arboard',
+  'syntect-tui',
+];
+
 export const noCoreDependencyCrates = [
   'core-types',
   'events',
   'ai-adapters',
   'agent-stream',
+  'tool-call-jsonrepair',
   'agent-runtime',
+  'agent-runtime-ipc',
   'harness',
-  'plugin-runtime-host',
+  'plugin-runtime-client',
   'product-capabilities',
   'runtime-ports',
   'runtime-services',
+  'sdk-host',
   'services-core',
   'services-integrations',
   'agent-tools',
   'tool-packs',
   'product-domains',
+  'claude-code-adapter',
+  'codex-adapter',
   'opencode-adapter',
+  'static-hook-support',
+  'external-sources',
   'terminal',
   'tool-runtime',
   'transport',
-  'api-layer',
   'webdriver',
 ];
 
 export const forbiddenManifestDependencyRules = [
+  {
+    dependencyNames: ['rmcp'],
+    scanRoots: ['src/apps', 'src/crates', 'BitFun-Installer/src-tauri'],
+    workspaceManifestPath: 'Cargo.toml',
+    forbidWorkspaceAliases: false,
+    allowManifestPaths: [
+      'src/crates/services/services-integrations/Cargo.toml',
+    ],
+    reason: 'the RMCP SDK is a concrete MCP integration service dependency',
+    message: 'rmcp must stay in services-integrations and be consumed through its MCP owner facade',
+  },
+  {
+    dependencyNames: ['bitfun-agent-runtime-ipc'],
+    scanRoots: ['src/apps', 'src/crates', 'BitFun-Installer/src-tauri'],
+    workspaceManifestPath: 'Cargo.toml',
+    allowManifestPaths: ['src/apps/cli/Cargo.toml'],
+    reason: 'the private local IPC protocol has one reviewed first-party Shared TUI consumer',
+    message:
+      'agent-runtime-ipc may only be consumed by the CLI Shared TUI adapter; SDK Host, GUI, remote, and other products require separate review',
+  },
+  {
+    dependencyNames: ['sherpa-onnx'],
+    scanRoots: ['src/apps', 'src/crates', 'BitFun-Installer/src-tauri'],
+    forbidWorkspaceAliases: false,
+    allowManifestPaths: [
+      'src/crates/services/services-integrations/Cargo.toml',
+    ],
+    reason:
+      'speech recognition engines are concrete integration service dependencies',
+    message:
+      'sherpa-onnx must stay in services-integrations and be injected by a product composition root',
+  },
   {
     dependencyNames: ['bitfun-opencode-adapter'],
     scanRoots: ['src/apps', 'src/crates', 'BitFun-Installer/src-tauri'],
@@ -36,11 +112,44 @@ export const forbiddenManifestDependencyRules = [
     reason:
       'OpenCode adapter production dependencies are limited to the reviewed product composition root',
     message:
-      'only bitfun-core product-full assembly may inject bitfun-opencode-adapter through the Plugin Runtime Host boundary',
+      'only bitfun-core product-full assembly may register bitfun-opencode-adapter through reviewed capability composition roots',
+  },
+  ...[
+    ['bitfun-claude-code-adapter', 'claude-code-adapter'],
+    ['bitfun-codex-adapter', 'codex-adapter'],
+  ].map(([dependencyName, crateName]) => ({
+    dependencyNames: [dependencyName],
+    scanRoots: ['src/apps', 'src/crates', 'BitFun-Installer/src-tauri'],
+    workspaceManifestPath: 'Cargo.toml',
+    allowManifestPaths: [
+      `src/crates/adapters/${crateName}/Cargo.toml`,
+      'src/crates/assembly/core/Cargo.toml',
+    ],
+    reason: `${crateName} production dependencies are limited to the reviewed product composition root`,
+    message: `only bitfun-core product-full assembly may register ${dependencyName} through the static Hook provider boundary`,
+  })),
+  {
+    dependencyNames: ['bitfun-static-hook-support'],
+    scanRoots: ['src/apps', 'src/crates', 'BitFun-Installer/src-tauri'],
+    workspaceManifestPath: 'Cargo.toml',
+    allowManifestPaths: [
+      'src/crates/adapters/static-hook-support/Cargo.toml',
+      'src/crates/adapters/opencode-adapter/Cargo.toml',
+      'src/crates/adapters/claude-code-adapter/Cargo.toml',
+      'src/crates/adapters/codex-adapter/Cargo.toml',
+    ],
+    reason: 'static Hook parsing support is private to ecosystem source adapters',
+    message: 'static Hook support may only be consumed by reviewed ecosystem Hook adapters',
   },
 ];
 
 export const lightweightBoundaryRules = [
+  {
+    crateName: 'agent-runtime-ipc',
+    reason:
+      'agent-runtime-ipc is the non-published local protocol for the reviewed Shared TUI adapter, not a Runtime, SDK Host, service, or remote product surface',
+    forbiddenDeps: agentRuntimeIpcForbiddenDeps,
+  },
   {
     crateName: 'core-types',
     reason: 'core-types must stay low-level DTO-only',
@@ -81,7 +190,6 @@ export const lightweightBoundaryRules = [
       'bitfun-services-integrations',
       'bitfun-agent-tools',
       'bitfun-tool-packs',
-      'bitfun-product-domains',
       'bitfun-transport',
       'terminal-core',
       'tool-runtime',
@@ -154,6 +262,36 @@ export const lightweightBoundaryRules = [
     ],
   },
   {
+    crateName: 'sdk-host',
+    reason:
+      'SDK Host protocol must stay a portable Runtime adapter without concrete product, terminal, service, or CLI implementations',
+    forbiddenDeps: [
+      'bitfun-core',
+      'bitfun-ai-adapters',
+      'bitfun-services-core',
+      'bitfun-services-integrations',
+      'bitfun-agent-tools',
+      'bitfun-tool-packs',
+      'bitfun-product-capabilities',
+      'bitfun-product-domains',
+      'bitfun-transport',
+      'terminal-core',
+      'tool-runtime',
+      'tauri',
+      'reqwest',
+      'git2',
+      'rmcp',
+      'image',
+      'tokio-tungstenite',
+      'bitfun-sdk-host-app',
+      'bitfun-cli',
+      'ratatui',
+      'crossterm',
+      'arboard',
+      'syntect-tui',
+    ],
+  },
+  {
     crateName: 'harness',
     reason:
       'harness must own workflow contracts without concrete service, product, or platform implementations',
@@ -182,9 +320,9 @@ export const lightweightBoundaryRules = [
     ],
   },
   {
-    crateName: 'plugin-runtime-host',
+    crateName: 'plugin-runtime-client',
     reason:
-      'plugin-runtime-host must own portable Host boundary logic without concrete ecosystem, product, or platform implementations',
+      'plugin-runtime-client must implement the portable PluginRuntimeClient boundary without concrete ecosystem, product, or platform implementations',
     forbiddenDeps: [
       'bitfun-core',
       'bitfun-ai-adapters',
@@ -267,6 +405,13 @@ export const lightweightBoundaryRules = [
 
 export const dependencyProfileRules = [
   {
+    crateName: 'agent-runtime-ipc',
+    profileName: 'private Shared TUI local IPC profile',
+    reason:
+      'agent-runtime-ipc may share stable event and Runtime DTO contracts but must not acquire Runtime owners, SDK Host, services, remote transports, or product implementations',
+    forbiddenNonOptionalDeps: agentRuntimeIpcForbiddenDeps,
+  },
+  {
     crateName: 'core',
     profileName: 'no-default runtime-surface-light profile',
     reason:
@@ -274,9 +419,10 @@ export const dependencyProfileRules = [
     forbiddenNonOptionalDeps: [
       'aes',
       'aes-gcm',
+      'bitfun-services-integrations',
       'bitfun-product-capabilities',
       'bitfun-product-domains',
-      'bitfun-relay-server',
+      'bitfun-relay-service',
       'bitfun-tool-packs',
       'chrono-tz',
       'cron',
@@ -297,16 +443,53 @@ export const dependencyProfileRules = [
       'local-ip-address',
       'mac_address',
       'md5',
+      'notify',
       'qrcode',
       'rand',
       'readability-js',
       'rmcp',
+      'rusqlite',
       'russh',
+      'rustls',
+      'rustls-native-certs',
+      'schannel',
       'sse-stream',
       'similar',
+      'serde_yaml',
+      'terminal-core',
       'tool-runtime',
       'tokio-tungstenite',
+      'win32job',
       'x25519-dalek',
+    ],
+  },
+  {
+    crateName: 'services-core',
+    profileName: 'default reusable service profile',
+    reason:
+      'services-core default profile must not compile capability-specific native or runtime implementations',
+    forbiddenNonOptionalDeps: [
+      'anyhow',
+      'async-trait',
+      'base64',
+      'bitfun-core-types',
+      'bitfun-events',
+      'bitfun-runtime-ports',
+      'chrono',
+      'dunce',
+      'fs2',
+      'git2',
+      'globset',
+      'ignore',
+      'libc',
+      'notify',
+      'rusqlite',
+      'serde_yaml',
+      'sha2',
+      'which',
+      'win32job',
+      'windows',
+      'zip',
     ],
   },
   {
@@ -427,10 +610,10 @@ export const dependencyProfileRules = [
     ],
   },
   {
-    crateName: 'plugin-runtime-host',
-    profileName: 'default plugin host boundary profile',
+    crateName: 'plugin-runtime-client',
+    profileName: 'default plugin runtime client boundary profile',
     reason:
-      'plugin-runtime-host default profile must not compile concrete plugin execution or product-surface implementations',
+      'plugin-runtime-client default profile must not compile concrete plugin execution or product-surface implementations',
     forbiddenNonOptionalDeps: [
       'bitfun-core',
       'bitfun-ai-adapters',
@@ -557,7 +740,6 @@ export const dependencyProfileRules = [
       'tokio-tungstenite',
       'uuid',
       'which',
-      'bitfun-relay-server',
     ],
   },
 ];

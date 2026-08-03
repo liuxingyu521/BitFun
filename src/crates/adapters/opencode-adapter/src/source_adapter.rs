@@ -2,10 +2,17 @@
 //!
 //! The adapter covers real OpenCode input shapes: `opencode.json` npm plugin
 //! entries and project-local `.opencode/plugins/*.ts` source files. It does not
-//! execute JavaScript, install packages, or become the runtime host.
+//! execute JavaScript, install packages, or become the runtime client.
 
+use crate::hook_contributions::{
+    map_hook_contributions, OpenCodeHookDescriptor, OPENCODE_PLUGIN_PROVIDER_ID,
+};
 use async_trait::async_trait;
-use bitfun_plugin_runtime_host::PluginHostAdapter;
+use bitfun_plugin_runtime_client::PluginRuntimeAdapter;
+use bitfun_product_domains::external_hook_contributions::{
+    ExternalHookContributionDeclaration, ExternalHookPoint, ExternalHookRiskCapability,
+};
+use bitfun_product_domains::external_sources::SourceKey;
 use bitfun_product_domains::plugin_source::{PluginActivationAuthority, PluginPackageInput};
 use bitfun_runtime_ports::{
     PermissionPromptDenyState, PermissionPromptDescriptor, PermissionPromptEffectKind,
@@ -21,6 +28,15 @@ use bitfun_runtime_ports::{
     PluginRuntimeReadRequest, PluginRuntimeReadResponse, PluginRuntimeUnavailableReason,
     PluginSourceKind, PluginSourceRef, PluginStatusKind, PluginStatusSnapshot, PluginTrustLevel,
     PortError, PortErrorKind, PortResult,
+};
+use oxc_parse::{
+    allocator::Allocator,
+    ast::ast::{
+        ArrowFunctionExpression, Declaration, Expression, ObjectExpression, ObjectPropertyKind,
+        Statement,
+    },
+    parser::Parser,
+    span::SourceType,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -42,15 +58,30 @@ const MAX_NPM_PLUGINS: usize = 128;
 const MAX_NPM_PLUGIN_NAME_BYTES: usize = 256;
 const MAX_NPM_PLUGIN_METADATA_BYTES: usize = 16 * 1024;
 
-const UNSUPPORTED_HOOK_EVENTS: &[&str] = &[
-    "command.executed",
-    "permission.asked",
-    "permission.replied",
-    "session.compacted",
+// Frozen from the @opencode-ai/plugin Hooks interface. `tool` is handled by
+// the existing custom-tool projection and event-bus event types belong under
+// the top-level `event` Hook rather than in this property set.
+const DISCOVERABLE_HOOK_PROPERTIES: &[&str] = &[
+    "auth",
+    "chat.headers",
+    "chat.message",
+    "chat.params",
+    "command.execute.before",
+    "config",
+    "dispose",
+    "event",
+    "experimental.chat.messages.transform",
+    "experimental.chat.system.transform",
+    "experimental.compaction.autocontinue",
+    "experimental.provider.small_model",
+    "experimental.session.compacting",
+    "experimental.text.complete",
+    "permission.ask",
+    "provider",
     "shell.env",
     "tool.execute.after",
     "tool.execute.before",
-    "tui.toast.show",
+    "tool.definition",
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -78,7 +109,7 @@ impl OpenCodeAdapterError {
     }
 }
 
-struct OpenCodePluginHostAdapter {
+struct OpenCodePluginRuntimeAdapter {
     projections: Vec<OpenCodeProjection>,
     observed_at_ms: u64,
     activation: Option<OpenCodeActivationContext>,
@@ -90,7 +121,7 @@ struct OpenCodeActivationContext {
     activation_epoch: u64,
 }
 
-impl OpenCodePluginHostAdapter {
+impl OpenCodePluginRuntimeAdapter {
     fn from_package(input: PluginPackageInput, observed_at_ms: u64) -> PortResult<Self> {
         let (manifest, source, files) = input.into_parts();
         if manifest.adapter != "opencode_compatible" {
@@ -407,9 +438,13 @@ impl OpenCodePluginHostAdapter {
 }
 
 #[async_trait]
-impl PluginHostAdapter for OpenCodePluginHostAdapter {
+impl PluginRuntimeAdapter for OpenCodePluginRuntimeAdapter {
     fn adapter_id(&self) -> &str {
         OPENCODE_ADAPTER_ID
+    }
+
+    fn availability(&self) -> PluginRuntimeAvailability {
+        PluginRuntimeAvailability::projection_only(PluginRuntimeUnavailableReason::HostUnavailable)
     }
 
     async fn read_plugins(
@@ -480,7 +515,7 @@ pub fn load_opencode_package_adapter(
     activation: Option<PluginActivationAuthority>,
     observed_at_ms: u64,
 ) -> PortResult<(
-    Arc<dyn PluginHostAdapter>,
+    Arc<dyn PluginRuntimeAdapter>,
     Vec<(
         PluginSourceRef,
         String,
@@ -490,9 +525,9 @@ pub fn load_opencode_package_adapter(
 )> {
     let adapter = match activation {
         Some(authority) => {
-            OpenCodePluginHostAdapter::from_activated_package(input, authority, observed_at_ms)?
+            OpenCodePluginRuntimeAdapter::from_activated_package(input, authority, observed_at_ms)?
         }
-        None => OpenCodePluginHostAdapter::from_package(input, observed_at_ms)?,
+        None => OpenCodePluginRuntimeAdapter::from_package(input, observed_at_ms)?,
     };
     let targets = adapter.custom_tool_dispatch_targets();
     Ok((Arc::new(adapter), targets))
@@ -1083,6 +1118,7 @@ impl OpenCodeAdapterSource {
 struct OpenCodeSourceProjection {
     config: OpenCodeConfig,
     local_plugin: OpenCodeLocalPlugin,
+    hook_contributions: Vec<ExternalHookContributionDeclaration>,
     source: PluginSourceRef,
     observed_at_ms: u64,
 }
@@ -1112,10 +1148,30 @@ impl OpenCodeSourceProjection {
                 path: Some(source.local_plugin_path.clone()),
             }),
         };
+        let source_key =
+            SourceKey::new(OPENCODE_PLUGIN_PROVIDER_ID, local_plugin.plugin_id.clone()).map_err(
+                |error| OpenCodeAdapterError::InvalidPluginSource {
+                    field: "plugin.hooks",
+                    message: format!("invalid Hook source identity: {error}"),
+                },
+            )?;
+        let descriptors = local_plugin
+            .statically_mapped_hooks
+            .iter()
+            .filter_map(|event| OpenCodeHookDescriptor::from_static_projection_event(event))
+            .collect();
+        let hook_contributions =
+            map_hook_contributions(source_key, descriptors).map_err(|error| {
+                OpenCodeAdapterError::InvalidPluginSource {
+                    field: "plugin.hooks",
+                    message: format!("Hook mapping failed: {}", error.as_str()),
+                }
+            })?;
 
         Ok(Self {
             config,
             local_plugin,
+            hook_contributions,
             source: source_ref,
             observed_at_ms: source.observed_at_ms,
         })
@@ -1260,10 +1316,22 @@ impl OpenCodeSourceProjection {
                 .map(|package| self.npm_package_diagnostic(package, source.clone())),
         );
         diagnostics.extend(
-            self.local_plugin
-                .unsupported_hooks
+            self.hook_contributions
                 .iter()
+                .map(|hook| self.mapped_hook_diagnostic(hook, source.clone())),
+        );
+        diagnostics.extend(
+            self.local_plugin
+                .discovered_hooks
+                .iter()
+                .filter(|hook| !self.local_plugin.statically_mapped_hooks.contains(hook))
                 .map(|hook| self.unsupported_hook_diagnostic(hook, source.clone())),
+        );
+        diagnostics.extend(
+            self.local_plugin
+                .hook_projection_error
+                .as_ref()
+                .map(|error| self.hook_projection_error_diagnostic(*error, source.clone())),
         );
         diagnostics
     }
@@ -1473,6 +1541,78 @@ impl OpenCodeSourceProjection {
         }
     }
 
+    fn mapped_hook_diagnostic(
+        &self,
+        hook: &ExternalHookContributionDeclaration,
+        source: PluginSourceRef,
+    ) -> PluginDiagnostic {
+        let event_name = match hook.hook_point {
+            ExternalHookPoint::ToolBefore => "tool.execute.before",
+            ExternalHookPoint::ToolAfter => "tool.execute.after",
+        };
+        let declared_risks = format_natural_list(
+            hook.safety
+                .declared_risks
+                .iter()
+                .map(|risk| match risk {
+                    ExternalHookRiskCapability::ReadToolArguments => "read tool arguments",
+                    ExternalHookRiskCapability::ModifyToolArguments => "modify tool arguments",
+                    ExternalHookRiskCapability::ReadToolResult => "read tool results",
+                    ExternalHookRiskCapability::ModifyToolResult => "modify tool results",
+                })
+                .collect(),
+        );
+        let safety_statement = if hook.safety.complete {
+            "its declared safety facts are complete"
+        } else {
+            "its safety declaration is incomplete"
+        };
+        PluginDiagnostic {
+            diagnostic_id: format!("diag:{}:hook:{}", self.source.plugin_id, hook.contribution_id),
+            severity: PluginDiagnosticSeverity::Warning,
+            source,
+            code: "opencode.hook_mapped_runtime_unavailable".to_string(),
+            message: format!(
+                "OpenCode Hook {event_name} was recognized from the plugin return object. It may {declared_risks}, but {safety_statement} and Hook execution is unavailable in this BitFun version"
+            ),
+            detail: PluginDiagnosticDetail::Adapter {
+                adapter_id: OPENCODE_ADAPTER_ID.to_string(),
+            },
+            audit: PluginAuditRef {
+                correlation_id: hook.contribution_id.to_string(),
+                event_id: None,
+            },
+            retryable: false,
+        }
+    }
+
+    fn hook_projection_error_diagnostic(
+        &self,
+        error: OpenCodeHookProjectionError,
+        source: PluginSourceRef,
+    ) -> PluginDiagnostic {
+        PluginDiagnostic {
+            diagnostic_id: format!("diag:{}:hook-projection", self.source.plugin_id),
+            severity: PluginDiagnosticSeverity::Warning,
+            source,
+            code: "opencode.hook_projection_parse_failed".to_string(),
+            message: "OpenCode Hook projection could not parse the plugin as JavaScript or TypeScript; Hook declarations are unavailable"
+                .to_string(),
+            detail: PluginDiagnosticDetail::Adapter {
+                adapter_id: OPENCODE_ADAPTER_ID.to_string(),
+            },
+            audit: PluginAuditRef {
+                correlation_id: format!(
+                    "plugin-source:{}:hook-projection:{}",
+                    self.source.plugin_id,
+                    error.as_str()
+                ),
+                event_id: None,
+            },
+            retryable: false,
+        }
+    }
+
     fn unsupported_hook_dispatch_diagnostic(
         &self,
         envelope: &PluginDispatchEnvelope,
@@ -1643,7 +1783,22 @@ struct OpenCodeLocalPlugin {
     plugin_id: String,
     export_name: String,
     custom_tools: Vec<OpenCodeCustomTool>,
-    unsupported_hooks: Vec<String>,
+    discovered_hooks: Vec<String>,
+    statically_mapped_hooks: Vec<String>,
+    hook_projection_error: Option<OpenCodeHookProjectionError>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenCodeHookProjectionError {
+    ParseFailed,
+}
+
+impl OpenCodeHookProjectionError {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ParseFailed => "parse_failed",
+        }
+    }
 }
 
 impl OpenCodeLocalPlugin {
@@ -1655,8 +1810,18 @@ impl OpenCodeLocalPlugin {
                 message: "expected an exported OpenCode plugin function".to_string(),
             })?;
         let custom_tools = discover_custom_tools(&source)?;
-        let unsupported_hooks = discover_unsupported_hooks(&source);
-        if custom_tools.is_empty() && unsupported_hooks.is_empty() {
+        let (discovered_hooks, hook_projection_error) =
+            match discover_exported_hooks(&source, path, &export_name) {
+                Ok(hooks) => (hooks, None),
+                Err(error) => (Vec::new(), Some(error)),
+            };
+        let statically_mapped_hooks = discovered_hooks
+            .iter()
+            .filter(|event| OpenCodeHookDescriptor::from_static_projection_event(event).is_some())
+            .cloned()
+            .collect();
+        if custom_tools.is_empty() && discovered_hooks.is_empty() && hook_projection_error.is_none()
+        {
             return Err(OpenCodeAdapterError::InvalidPluginSource {
                 field: "plugin.contributions",
                 message: "expected a custom tool or hook contribution".to_string(),
@@ -1667,7 +1832,9 @@ impl OpenCodeLocalPlugin {
             plugin_id: local_plugin_id(path),
             export_name,
             custom_tools,
-            unsupported_hooks,
+            discovered_hooks,
+            statically_mapped_hooks,
+            hook_projection_error,
         })
     }
 }
@@ -1828,25 +1995,345 @@ fn strip_js_comments(source: &str) -> Result<String, OpenCodeAdapterError> {
     Ok(output)
 }
 
-fn discover_unsupported_hooks(source: &str) -> Vec<String> {
-    let mut hooks = UNSUPPORTED_HOOK_EVENTS
-        .iter()
-        .filter(|event| {
-            source.contains(&format!("\"{event}\"")) || source.contains(&format!("'{event}'"))
-        })
-        .map(|event| (*event).to_string())
-        .collect::<Vec<_>>();
-    if has_event_hook(source) && !hooks.iter().any(|hook| hook == "event") {
-        hooks.push("event".to_string());
+fn discover_exported_hooks(
+    source: &str,
+    path: &str,
+    export_name: &str,
+) -> Result<Vec<String>, OpenCodeHookProjectionError> {
+    let allocator = Allocator::default();
+    let source_type = SourceType::from_path(Path::new(path)).unwrap_or(SourceType::ts());
+    let parsed = Parser::new(&allocator, source, source_type).parse();
+    if !parsed.diagnostics.is_empty() {
+        return Err(OpenCodeHookProjectionError::ParseFailed);
     }
-    hooks
+
+    Ok(parsed
+        .program
+        .body
+        .iter()
+        .find_map(|statement| exported_hook_object(statement, export_name))
+        .map(|object| {
+            let mut seen = HashSet::new();
+            object
+                .properties
+                .iter()
+                .filter_map(|property| match property {
+                    ObjectPropertyKind::ObjectProperty(property) => property.key.static_name(),
+                    ObjectPropertyKind::SpreadProperty(_) => None,
+                })
+                .filter(|name| DISCOVERABLE_HOOK_PROPERTIES.contains(&name.as_ref()))
+                .filter(|name| seen.insert(name.to_string()))
+                .map(|name| name.into_owned())
+                .collect()
+        })
+        .unwrap_or_default())
 }
 
-fn has_event_hook(source: &str) -> bool {
-    source.lines().any(|line| {
-        let line = line.trim_start();
-        line.starts_with("event:") || line.contains(" event:")
+pub(crate) struct StaticHookEvent {
+    pub registration_id: String,
+    pub native_event: String,
+}
+
+pub(crate) struct StaticHookEventDiscovery {
+    pub events: Vec<StaticHookEvent>,
+    pub opaque_events: Vec<StaticHookEvent>,
+    pub dynamic_registrations: Vec<String>,
+}
+
+pub(crate) fn statically_discover_hook_events(
+    path: &Path,
+    source: &str,
+) -> Result<StaticHookEventDiscovery, String> {
+    let allocator = Allocator::default();
+    let source_type = SourceType::from_path(path).unwrap_or(SourceType::ts());
+    // OXC already understands comments and regular-expression literals. A
+    // text-level comment pass can corrupt valid JavaScript such as `/https?:\/\//`.
+    let parsed = Parser::new(&allocator, source, source_type).parse();
+    if !parsed.diagnostics.is_empty() {
+        return Err(OpenCodeHookProjectionError::ParseFailed
+            .as_str()
+            .to_string());
+    }
+    let mut events = Vec::new();
+    let mut opaque_events = Vec::new();
+    let mut dynamic_registrations = Vec::new();
+    let mut dynamic_seen = HashSet::new();
+    let mut exported_declaration_seen = false;
+    for statement in &parsed.program.body {
+        if let Statement::ExportDefaultDeclaration(export) = statement {
+            exported_declaration_seen = true;
+            let has_runtime_value = match &export.declaration {
+                oxc_parse::ast::ast::ExportDefaultDeclarationKind::FunctionDeclaration(
+                    function,
+                ) => !function.declare,
+                oxc_parse::ast::ast::ExportDefaultDeclarationKind::ClassDeclaration(class) => {
+                    !class.declare
+                }
+                oxc_parse::ast::ast::ExportDefaultDeclarationKind::TSInterfaceDeclaration(_) => {
+                    false
+                }
+                _ => true,
+            };
+            if has_runtime_value {
+                push_dynamic_registration(
+                    "default".to_string(),
+                    &mut dynamic_registrations,
+                    &mut dynamic_seen,
+                );
+            }
+            continue;
+        }
+        if let Statement::ExportAllDeclaration(export) = statement {
+            exported_declaration_seen = true;
+            if matches!(
+                export.export_kind,
+                oxc_parse::ast::ast::ImportOrExportKind::Value
+            ) {
+                let registration_id = export
+                    .exported
+                    .as_ref()
+                    .map(|name| name.name().to_string())
+                    .unwrap_or_else(|| format!("<export-all:{}>", export.source.value));
+                push_dynamic_registration(
+                    registration_id,
+                    &mut dynamic_registrations,
+                    &mut dynamic_seen,
+                );
+            }
+            continue;
+        }
+        let Statement::ExportNamedDeclaration(export) = statement else {
+            continue;
+        };
+        let Some(declaration) = &export.declaration else {
+            if !export.specifiers.is_empty() {
+                exported_declaration_seen = true;
+                if matches!(
+                    export.export_kind,
+                    oxc_parse::ast::ast::ImportOrExportKind::Value
+                ) {
+                    for specifier in &export.specifiers {
+                        if matches!(
+                            specifier.export_kind,
+                            oxc_parse::ast::ast::ImportOrExportKind::Value
+                        ) {
+                            push_dynamic_registration(
+                                specifier.exported.name().to_string(),
+                                &mut dynamic_registrations,
+                                &mut dynamic_seen,
+                            );
+                        }
+                    }
+                }
+            }
+            continue;
+        };
+        exported_declaration_seen = true;
+        if declaration.declare() {
+            continue;
+        }
+        let Declaration::VariableDeclaration(declaration) = declaration else {
+            let registration_id = match declaration {
+                Declaration::FunctionDeclaration(function) => {
+                    function.id.as_ref().map(|id| id.name.to_string())
+                }
+                Declaration::ClassDeclaration(class) => {
+                    class.id.as_ref().map(|id| id.name.to_string())
+                }
+                Declaration::TSEnumDeclaration(declaration)
+                    if !declaration.declare && !declaration.r#const =>
+                {
+                    Some(declaration.id.name.to_string())
+                }
+                _ => None,
+            };
+            if let Some(registration_id) = registration_id {
+                push_dynamic_registration(
+                    registration_id,
+                    &mut dynamic_registrations,
+                    &mut dynamic_seen,
+                );
+            }
+            continue;
+        };
+        for declarator in &declaration.declarations {
+            let is_simple_identifier = declarator.id.get_identifier_name().is_some();
+            let mut registration_ids = declarator
+                .id
+                .get_binding_identifiers()
+                .into_iter()
+                .map(|identifier| identifier.name.to_string())
+                .collect::<Vec<_>>();
+            if !is_simple_identifier {
+                if registration_ids.is_empty() {
+                    registration_ids.push("<destructured-export>".to_string());
+                }
+                for registration_id in registration_ids {
+                    push_dynamic_registration(
+                        registration_id,
+                        &mut dynamic_registrations,
+                        &mut dynamic_seen,
+                    );
+                }
+                continue;
+            }
+            let registration_id = registration_ids
+                .pop()
+                .expect("identifier binding must contain its registration name");
+            let Some(Expression::ArrowFunctionExpression(arrow)) = declarator
+                .init
+                .as_ref()
+                .map(Expression::get_inner_expression)
+            else {
+                push_dynamic_registration(
+                    registration_id,
+                    &mut dynamic_registrations,
+                    &mut dynamic_seen,
+                );
+                continue;
+            };
+            let Some(object) = arrow_return_object(arrow) else {
+                push_dynamic_registration(
+                    registration_id,
+                    &mut dynamic_registrations,
+                    &mut dynamic_seen,
+                );
+                continue;
+            };
+            if collect_static_hook_properties(
+                object,
+                &registration_id,
+                &mut events,
+                &mut opaque_events,
+            ) {
+                push_dynamic_registration(
+                    registration_id,
+                    &mut dynamic_registrations,
+                    &mut dynamic_seen,
+                );
+            }
+        }
+    }
+    if !exported_declaration_seen {
+        push_dynamic_registration(
+            "<module>".to_string(),
+            &mut dynamic_registrations,
+            &mut dynamic_seen,
+        );
+    }
+    Ok(StaticHookEventDiscovery {
+        events,
+        opaque_events,
+        dynamic_registrations,
     })
+}
+
+fn collect_static_hook_properties(
+    object: &ObjectExpression<'_>,
+    registration_id: &str,
+    events: &mut Vec<StaticHookEvent>,
+    opaque_events: &mut Vec<StaticHookEvent>,
+) -> bool {
+    let mut seen = HashSet::new();
+    let mut has_dynamic_registration = false;
+    for property in &object.properties {
+        let ObjectPropertyKind::ObjectProperty(property) = property else {
+            has_dynamic_registration = true;
+            continue;
+        };
+        let Some(name) = property.key.static_name() else {
+            has_dynamic_registration = true;
+            continue;
+        };
+        let name = name.into_owned();
+        if name == CUSTOM_TOOL_EXTENSION_POINT || !seen.insert(name.clone()) {
+            continue;
+        }
+        if name.is_empty() || name.len() > 160 || name.chars().any(char::is_control) {
+            has_dynamic_registration = true;
+        } else if DISCOVERABLE_HOOK_PROPERTIES.contains(&name.as_str()) {
+            events.push(StaticHookEvent {
+                registration_id: registration_id.to_string(),
+                native_event: name,
+            });
+        } else {
+            opaque_events.push(StaticHookEvent {
+                registration_id: registration_id.to_string(),
+                native_event: name,
+            });
+        }
+    }
+    has_dynamic_registration
+}
+
+fn push_dynamic_registration(
+    registration_id: String,
+    dynamic_registrations: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+) {
+    if seen.insert(registration_id.clone()) {
+        dynamic_registrations.push(registration_id);
+    }
+}
+
+fn exported_hook_object<'a>(
+    statement: &'a Statement<'a>,
+    export_name: &str,
+) -> Option<&'a ObjectExpression<'a>> {
+    let Statement::ExportNamedDeclaration(export) = statement else {
+        return None;
+    };
+    let Some(Declaration::VariableDeclaration(declaration)) = &export.declaration else {
+        return None;
+    };
+    let declarator = declaration
+        .declarations
+        .iter()
+        .find(|declarator| declarator.id.get_identifier_name().as_deref() == Some(export_name))?;
+    let Expression::ArrowFunctionExpression(arrow) =
+        declarator.init.as_ref()?.get_inner_expression()
+    else {
+        return None;
+    };
+    arrow_return_object(arrow)
+}
+
+fn arrow_return_object<'a>(
+    arrow: &'a ArrowFunctionExpression<'a>,
+) -> Option<&'a ObjectExpression<'a>> {
+    let expression = if arrow.expression {
+        let Statement::ExpressionStatement(statement) = arrow.body.statements.first()? else {
+            return None;
+        };
+        &statement.expression
+    } else {
+        let return_statement =
+            arrow
+                .body
+                .statements
+                .iter()
+                .find_map(|statement| match statement {
+                    Statement::ReturnStatement(statement) => Some(statement),
+                    _ => None,
+                })?;
+        return_statement.argument.as_ref()?
+    };
+    match expression.get_inner_expression() {
+        Expression::ObjectExpression(object) => Some(object),
+        _ => None,
+    }
+}
+
+fn format_natural_list(items: Vec<&str>) -> String {
+    match items.as_slice() {
+        [] => "use no declared data".to_string(),
+        [item] => (*item).to_string(),
+        [first, second] => format!("{first} and {second}"),
+        _ => {
+            let (last, preceding) = items.split_last().expect("non-empty risk list");
+            format!("{}, and {last}", preceding.join(", "))
+        }
+    }
 }
 
 fn is_identifier(value: &str) -> bool {
@@ -1962,7 +2449,7 @@ fn audit_ref(envelope: &PluginDispatchEnvelope) -> PluginAuditRef {
 #[cfg(test)]
 mod opencode_projection_contracts {
     use super::*;
-    use bitfun_plugin_runtime_host::PluginRuntimeHost;
+    use bitfun_plugin_runtime_client::DefaultPluginRuntimeClient;
     use bitfun_runtime_ports::{
         PermissionPromptDenyState, PermissionPromptEffectKind, PluginPayloadRedaction,
         PluginPayloadRef, PluginRuntimeClient, PluginRuntimeEpochs,
@@ -2134,7 +2621,7 @@ export const DemoPlugin = async () => ({
         assert_eq!(adapter.local_plugin.export_name, "WorkspaceToolsPlugin");
         assert_eq!(adapter.local_plugin.custom_tools[0].id, "workspaceSummary");
         assert_eq!(
-            adapter.local_plugin.unsupported_hooks,
+            adapter.local_plugin.discovered_hooks,
             ["tool.execute.before"]
         );
 
@@ -2177,10 +2664,10 @@ export const DemoPlugin = async () => ({
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.code == "opencode.npm_plugin_projection_only"));
-        assert!(response
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == "opencode.hook_projection_only"));
+        assert!(response.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "opencode.hook_mapped_runtime_unavailable"
+                && diagnostic.message.contains("tool.execute.before")
+        }));
     }
 
     #[test]
@@ -2255,21 +2742,22 @@ export const DemoPlugin = async () => ({
     }
 
     #[tokio::test]
-    async fn host_path_projects_trusted_custom_tool_candidate_with_permission_prompt() {
+    async fn client_path_projects_trusted_custom_tool_candidate_with_permission_prompt() {
         let adapter = adapter(PluginTrustLevel::Trusted);
         let plugin_id = adapter.source.plugin_id.clone();
         let dispatch = envelope(&adapter, CUSTOM_TOOL_EXTENSION_POINT);
-        let host_adapter: Arc<dyn PluginHostAdapter> = Arc::new(OpenCodePluginHostAdapter {
-            projections: vec![OpenCodeProjection::Local(adapter)],
-            observed_at_ms: 1_720_000_001,
-            activation: None,
-        });
-        let host = PluginRuntimeHost::new(host_adapter);
+        let runtime_adapter: Arc<dyn PluginRuntimeAdapter> =
+            Arc::new(OpenCodePluginRuntimeAdapter {
+                projections: vec![OpenCodeProjection::Local(adapter)],
+                observed_at_ms: 1_720_000_001,
+                activation: None,
+            });
+        let client = DefaultPluginRuntimeClient::new(runtime_adapter);
 
-        let response = host
+        let response = client
             .dispatch(dispatch)
             .await
-            .expect("host dispatch should preserve trusted custom tool candidate");
+            .expect("client dispatch should preserve trusted custom tool candidate");
 
         assert_eq!(response.adapter_id, OPENCODE_ADAPTER_ID);
         assert_eq!(response.plugin_id.as_deref(), Some(plugin_id.as_str()));
@@ -2311,21 +2799,22 @@ export const DemoPlugin = async () => ({
     }
 
     #[tokio::test]
-    async fn host_path_rejects_mismatched_custom_tool_capability_without_effect() {
+    async fn client_path_rejects_mismatched_custom_tool_capability_without_effect() {
         let adapter = adapter(PluginTrustLevel::Trusted);
         let mut dispatch = envelope(&adapter, CUSTOM_TOOL_EXTENSION_POINT);
         dispatch.declared_capability.capability_id = "opencode.permission_hook".to_string();
-        let host_adapter: Arc<dyn PluginHostAdapter> = Arc::new(OpenCodePluginHostAdapter {
-            projections: vec![OpenCodeProjection::Local(adapter)],
-            observed_at_ms: 1_720_000_001,
-            activation: None,
-        });
-        let host = PluginRuntimeHost::new(host_adapter);
+        let runtime_adapter: Arc<dyn PluginRuntimeAdapter> =
+            Arc::new(OpenCodePluginRuntimeAdapter {
+                projections: vec![OpenCodeProjection::Local(adapter)],
+                observed_at_ms: 1_720_000_001,
+                activation: None,
+            });
+        let client = DefaultPluginRuntimeClient::new(runtime_adapter);
 
-        let response = host
+        let response = client
             .dispatch(dispatch)
             .await
-            .expect("host dispatch should reject mismatched custom tool capability");
+            .expect("client dispatch should reject mismatched custom tool capability");
 
         assert!(response.effects.is_empty());
         assert_eq!(
@@ -2343,24 +2832,25 @@ export const DemoPlugin = async () => ({
     }
 
     #[tokio::test]
-    async fn host_path_rejects_custom_tool_capability_owner_mismatch_without_quarantine() {
+    async fn client_path_rejects_custom_tool_capability_owner_mismatch_without_quarantine() {
         let adapter = adapter(PluginTrustLevel::Trusted);
         let mut dispatch = envelope(&adapter, CUSTOM_TOOL_EXTENSION_POINT);
         dispatch.declared_capability.owner = PluginOwnerRef {
             kind: PluginOwnerKind::ExtensionContract,
             id: "opencode.wrong-owner".to_string(),
         };
-        let host_adapter: Arc<dyn PluginHostAdapter> = Arc::new(OpenCodePluginHostAdapter {
-            projections: vec![OpenCodeProjection::Local(adapter.clone())],
-            observed_at_ms: 1_720_000_001,
-            activation: None,
-        });
-        let host = PluginRuntimeHost::new(host_adapter);
+        let runtime_adapter: Arc<dyn PluginRuntimeAdapter> =
+            Arc::new(OpenCodePluginRuntimeAdapter {
+                projections: vec![OpenCodeProjection::Local(adapter.clone())],
+                observed_at_ms: 1_720_000_001,
+                activation: None,
+            });
+        let client = DefaultPluginRuntimeClient::new(runtime_adapter);
 
-        let response = host
+        let response = client
             .dispatch(dispatch)
             .await
-            .expect("host dispatch should reject full capability ref mismatch");
+            .expect("client dispatch should reject full capability ref mismatch");
 
         assert!(response.effects.is_empty());
         assert_eq!(
@@ -2371,7 +2861,7 @@ export const DemoPlugin = async () => ({
             response.diagnostics[0].message,
             "OpenCode custom tool dispatch requires expected capability opencode.custom_tool owned by extension_contract/opencode.custom-tools; actual capability opencode.custom_tool owned by extension_contract/opencode.wrong-owner"
         );
-        let follow_up = host
+        let follow_up = client
             .dispatch(envelope(&adapter, CUSTOM_TOOL_EXTENSION_POINT))
             .await
             .expect("capability mismatch diagnostic should not quarantine the plugin");
@@ -2379,24 +2869,25 @@ export const DemoPlugin = async () => ({
     }
 
     #[tokio::test]
-    async fn host_path_rejects_custom_tool_capability_owner_kind_mismatch_without_quarantine() {
+    async fn client_path_rejects_custom_tool_capability_owner_kind_mismatch_without_quarantine() {
         let adapter = adapter(PluginTrustLevel::Trusted);
         let mut dispatch = envelope(&adapter, CUSTOM_TOOL_EXTENSION_POINT);
         dispatch.declared_capability.owner = PluginOwnerRef {
             kind: PluginOwnerKind::ProductFeature,
             id: CUSTOM_TOOL_CAPABILITY_OWNER_ID.to_string(),
         };
-        let host_adapter: Arc<dyn PluginHostAdapter> = Arc::new(OpenCodePluginHostAdapter {
-            projections: vec![OpenCodeProjection::Local(adapter.clone())],
-            observed_at_ms: 1_720_000_001,
-            activation: None,
-        });
-        let host = PluginRuntimeHost::new(host_adapter);
+        let runtime_adapter: Arc<dyn PluginRuntimeAdapter> =
+            Arc::new(OpenCodePluginRuntimeAdapter {
+                projections: vec![OpenCodeProjection::Local(adapter.clone())],
+                observed_at_ms: 1_720_000_001,
+                activation: None,
+            });
+        let client = DefaultPluginRuntimeClient::new(runtime_adapter);
 
-        let response = host
+        let response = client
             .dispatch(dispatch)
             .await
-            .expect("host dispatch should reject capability owner kind mismatch");
+            .expect("client dispatch should reject capability owner kind mismatch");
 
         assert!(response.effects.is_empty());
         assert_eq!(
@@ -2407,7 +2898,7 @@ export const DemoPlugin = async () => ({
             response.diagnostics[0].message,
             "OpenCode custom tool dispatch requires expected capability opencode.custom_tool owned by extension_contract/opencode.custom-tools; actual capability opencode.custom_tool owned by product_feature/opencode.custom-tools"
         );
-        let follow_up = host
+        let follow_up = client
             .dispatch(envelope(&adapter, CUSTOM_TOOL_EXTENSION_POINT))
             .await
             .expect("owner kind mismatch diagnostic should not quarantine the plugin");
@@ -2415,19 +2906,20 @@ export const DemoPlugin = async () => ({
     }
 
     #[tokio::test]
-    async fn host_path_accepts_source_identity_with_different_read_model_fields() {
+    async fn client_path_accepts_source_identity_with_different_read_model_fields() {
         let adapter = adapter(PluginTrustLevel::Trusted);
         let mut dispatch = envelope(&adapter, CUSTOM_TOOL_EXTENSION_POINT);
         dispatch.source.trust_level = PluginTrustLevel::Unknown;
         dispatch.source.manifest = None;
-        let host_adapter: Arc<dyn PluginHostAdapter> = Arc::new(OpenCodePluginHostAdapter {
-            projections: vec![OpenCodeProjection::Local(adapter)],
-            observed_at_ms: 1_720_000_001,
-            activation: None,
-        });
-        let host = PluginRuntimeHost::new(host_adapter);
+        let runtime_adapter: Arc<dyn PluginRuntimeAdapter> =
+            Arc::new(OpenCodePluginRuntimeAdapter {
+                projections: vec![OpenCodeProjection::Local(adapter)],
+                observed_at_ms: 1_720_000_001,
+                activation: None,
+            });
+        let client = DefaultPluginRuntimeClient::new(runtime_adapter);
 
-        let response = host
+        let response = client
             .dispatch(dispatch.clone())
             .await
             .expect("read-model-only source fields should not break dispatch routing");
@@ -2443,20 +2935,21 @@ export const DemoPlugin = async () => ({
     }
 
     #[tokio::test]
-    async fn host_path_revoked_source_snapshot_overrides_stale_dispatch_source_without_quarantine()
-    {
+    async fn client_path_revoked_source_snapshot_overrides_stale_dispatch_source_without_quarantine(
+    ) {
         let adapter = adapter(PluginTrustLevel::Revoked);
         let mut dispatch = envelope(&adapter, CUSTOM_TOOL_EXTENSION_POINT);
         dispatch.source.trust_level = PluginTrustLevel::Trusted;
         dispatch.source.manifest = None;
-        let host_adapter: Arc<dyn PluginHostAdapter> = Arc::new(OpenCodePluginHostAdapter {
-            projections: vec![OpenCodeProjection::Local(adapter.clone())],
-            observed_at_ms: 1_720_000_001,
-            activation: None,
-        });
-        let host = PluginRuntimeHost::new(host_adapter);
+        let runtime_adapter: Arc<dyn PluginRuntimeAdapter> =
+            Arc::new(OpenCodePluginRuntimeAdapter {
+                projections: vec![OpenCodeProjection::Local(adapter.clone())],
+                observed_at_ms: 1_720_000_001,
+                activation: None,
+            });
+        let client = DefaultPluginRuntimeClient::new(runtime_adapter);
 
-        let response = host
+        let response = client
             .dispatch(dispatch.clone())
             .await
             .expect("revoked trust snapshot should project a typed diagnostic");
@@ -2469,7 +2962,7 @@ export const DemoPlugin = async () => ({
         assert_eq!(response.diagnostics[0].source, dispatch.source);
         assert_eq!(response.plugin_statuses[0].source, dispatch.source);
 
-        let follow_up = host
+        let follow_up = client
             .dispatch(dispatch)
             .await
             .expect("revoked trust diagnostic should not quarantine the plugin");
@@ -2477,21 +2970,22 @@ export const DemoPlugin = async () => ({
     }
 
     #[tokio::test]
-    async fn host_path_rejects_stale_source_ref_without_quarantine() {
+    async fn client_path_rejects_stale_source_ref_without_quarantine() {
         let adapter = adapter(PluginTrustLevel::Trusted);
         let mut dispatch = envelope(&adapter, CUSTOM_TOOL_EXTENSION_POINT);
         dispatch.source.content_hash = "sha256:stale".to_string();
-        let host_adapter: Arc<dyn PluginHostAdapter> = Arc::new(OpenCodePluginHostAdapter {
-            projections: vec![OpenCodeProjection::Local(adapter.clone())],
-            observed_at_ms: 1_720_000_001,
-            activation: None,
-        });
-        let host = PluginRuntimeHost::new(host_adapter);
+        let runtime_adapter: Arc<dyn PluginRuntimeAdapter> =
+            Arc::new(OpenCodePluginRuntimeAdapter {
+                projections: vec![OpenCodeProjection::Local(adapter.clone())],
+                observed_at_ms: 1_720_000_001,
+                activation: None,
+            });
+        let client = DefaultPluginRuntimeClient::new(runtime_adapter);
 
-        let response = host
+        let response = client
             .dispatch(dispatch.clone())
             .await
-            .expect("host dispatch should convert stale source refs into diagnostics");
+            .expect("client dispatch should convert stale source refs into diagnostics");
 
         assert!(response.effects.is_empty());
         assert_eq!(response.diagnostics[0].code, "opencode.source_mismatch");
@@ -2504,7 +2998,7 @@ export const DemoPlugin = async () => ({
             }
         );
 
-        let follow_up = host
+        let follow_up = client
             .dispatch(envelope(&adapter, CUSTOM_TOOL_EXTENSION_POINT))
             .await
             .expect("stale source diagnostic should not quarantine the plugin");
@@ -2512,19 +3006,20 @@ export const DemoPlugin = async () => ({
     }
 
     #[tokio::test]
-    async fn host_path_projects_unsupported_hook_diagnostic_without_quarantine() {
+    async fn client_path_projects_unsupported_hook_diagnostic_without_quarantine() {
         let adapter = adapter(PluginTrustLevel::Trusted);
-        let host_adapter: Arc<dyn PluginHostAdapter> = Arc::new(OpenCodePluginHostAdapter {
-            projections: vec![OpenCodeProjection::Local(adapter.clone())],
-            observed_at_ms: 1_720_000_001,
-            activation: None,
-        });
-        let host = PluginRuntimeHost::new(host_adapter);
+        let runtime_adapter: Arc<dyn PluginRuntimeAdapter> =
+            Arc::new(OpenCodePluginRuntimeAdapter {
+                projections: vec![OpenCodeProjection::Local(adapter.clone())],
+                observed_at_ms: 1_720_000_001,
+                activation: None,
+            });
+        let client = DefaultPluginRuntimeClient::new(runtime_adapter);
 
-        let response = host
+        let response = client
             .dispatch(envelope(&adapter, "tool.execute.before"))
             .await
-            .expect("host dispatch should preserve unsupported hook diagnostic");
+            .expect("client dispatch should preserve unsupported hook diagnostic");
 
         assert!(response.effects.is_empty());
         assert_eq!(response.diagnostics.len(), 1);
@@ -2537,7 +3032,7 @@ export const DemoPlugin = async () => ({
             Some("event-tool.execute.before")
         );
 
-        let follow_up = host
+        let follow_up = client
             .dispatch(envelope(&adapter, CUSTOM_TOOL_EXTENSION_POINT))
             .await
             .expect("unsupported hook diagnostic should not quarantine the plugin");

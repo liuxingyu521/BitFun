@@ -3,15 +3,15 @@
  * Shows the active model and allows quick switching.
  *
  * Config linkage:
- * - Model selection is shared across all agent types via ai.agent_models
- *   — switching in one session refreshes every existing agent mapping plus
- *   the current session's agent type, so new sessions of any type inherit it.
+ * - Model selection is shared across all future mode sessions through
+ *   ai.agent_model_defaults.mode. Delegated subagents keep separate defaults.
  * - Supports 'auto' | 'primary' | 'fast' | specific model IDs
  */
 
-import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import React, { useState, useEffect, useId, useRef, useCallback, useMemo } from 'react';
 import { createPortal } from 'react-dom';
-import { Brain, ChevronDown, Check } from 'lucide-react';
+import { getAppearanceOverlayHost } from '@/infrastructure/appearance/runtime/AppearanceOverlayHost';
+import { Brain, ChevronDown, Check, Zap } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { configManager } from '@/infrastructure/config/services/ConfigManager';
 import { agentAPI } from '@/infrastructure/api/service-api/AgentAPI';
@@ -19,20 +19,33 @@ import { ACPClientAPI, type AcpSessionOptions } from '@/infrastructure/api/servi
 import { getProviderDisplayName } from '@/infrastructure/config/services/modelConfigs';
 import { getEffectiveReasoningMode, isReasoningVisiblyEnabled } from '@/infrastructure/config/utils/reasoning';
 import { globalEventBus } from '@/infrastructure/event-bus';
-import type { AIModelConfig, DefaultModelsConfig } from '@/infrastructure/config/types';
-import { Tooltip } from '@/component-library';
+import type { AIModelConfig, AgentModelDefaultsConfig, DefaultModelsConfig } from '@/infrastructure/config/types';
+import { Switch, Tooltip } from '@/component-library';
+import { notificationService } from '@/shared/notification-system';
 import { FlowChatStore } from '../store/FlowChatStore';
 import { getModelMaxTokens } from '../services/flow-chat-manager/SessionModule';
 import { acpClientIdFromAgentType } from '../utils/acpSession';
+import { buildAcpFastModeValue, getAcpModelProviderName, resolveAcpFastModeState } from '../utils/acpSessionConfig';
+import { sessionProjectWorkspacePath } from '../utils/sessionWorkspace';
 import {
   buildContextUsageTooltip,
   type ContextUsageSource,
 } from '../utils/tokenUsageDisplay';
 import { createLogger } from '@/shared/utils/logger';
+import { getModelSelectorDropdownStyle } from './modelSelectorDropdownPosition';
 import './ModelSelector.scss';
 
 const log = createLogger('ModelSelector');
 const ACP_SESSION_OPTIONS_TIMEOUT_MS = 65_000;
+
+export interface ExternalModelSelection {
+  models: string[];
+  selectedModelId?: string;
+  defaultModelId?: string;
+  providerLabel: string;
+  disabled?: boolean;
+  onSelect: (modelId: string) => void | Promise<void>;
+}
 
 interface ModelSelectorProps {
   /** Current target agent type. */
@@ -41,8 +54,10 @@ interface ModelSelectorProps {
   className?: string;
   /** Preferred dropdown placement relative to the trigger. */
   dropdownPlacement?: 'top' | 'bottom';
-  /** Current session ID (used to update session mode config). */
+  /** Current session ID (used to update the selected session model). */
   sessionId?: string;
+  /** Whether the active input target is a Task subagent session. */
+  isSubagentSession?: boolean;
   /** Current token count. */
   currentTokens?: number;
   /** Max token capacity. */
@@ -51,6 +66,8 @@ interface ModelSelectorProps {
   contextUsageSource?: ContextUsageSource;
   /** Called when model switching starts or completes, so the parent can gate sending. */
   onLoadingChange?: (loading: boolean) => void;
+  /** Target-owned model catalog for transports that do not have a local backend session. */
+  externalSelection?: ExternalModelSelection;
 }
 
 interface ModelInfo {
@@ -164,23 +181,28 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
   className = '',
   dropdownPlacement = 'top',
   sessionId,
+  isSubagentSession = false,
   currentTokens = 0,
   maxTokens = 0,
   contextUsageSource,
   onLoadingChange,
+  externalSelection,
 }) => {
   const { t } = useTranslation('flow-chat');
   const [allModels, setAllModels] = useState<AIModelConfig[]>([]);
   const [defaultModels, setDefaultModels] = useState<DefaultModelsConfig>({});
-  const [agentModels, setAgentModels] = useState<Record<string, string>>({}); // mode_id -> model_id
+  const [modeModel, setModeModel] = useState('auto');
   const [acpOptions, setAcpOptions] = useState<AcpSessionOptions | null>(null);
   const [dropdownOpen, setDropdownOpen] = useState(false);
+  const [keyboardNavigationOpen, setKeyboardNavigationOpen] = useState(false);
   const [loading, setLoading] = useState(false);
   const acpRestoreToastShownRef = useRef<string | null>(null);
   const acpOptionsRef = useRef<AcpSessionOptions | null>(null);
 
   const dropdownRef = useRef<HTMLDivElement>(null);
   const portalDropdownRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const menuId = useId();
 
   useEffect(() => {
     onLoadingChange?.(loading);
@@ -195,6 +217,7 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
     acpClientIdFromAgentType(activeSession?.config.agentType) ??
     acpClientIdFromAgentType(activeSession?.mode);
   const isAcpSession = Boolean(acpClientId && sessionId);
+  const targetIsSubagent = isSubagentSession || activeSession?.sessionKind === 'subagent';
 
   // Load configuration data.
   const loadConfigData = useCallback(async () => {
@@ -202,15 +225,15 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
       const configData = await configManager.getConfigs([
         'ai.models',
         'ai.default_models',
-        'ai.agent_models',
+        'ai.agent_model_defaults',
       ]);
       const models = (configData['ai.models'] as AIModelConfig[] | undefined) || [];
       const defaultModelsData = (configData['ai.default_models'] as DefaultModelsConfig | undefined) || {};
-      const agentModelsData = (configData['ai.agent_models'] as Record<string, string> | undefined) || {};
+      const agentModelDefaults = configData['ai.agent_model_defaults'] as AgentModelDefaultsConfig | undefined;
 
       setAllModels(models);
       setDefaultModels(defaultModelsData);
-      setAgentModels(agentModelsData);
+      setModeModel(agentModelDefaults?.mode?.trim() || 'auto');
 
       log.debug('Configuration loaded', {
         modelsCount: models.length
@@ -258,6 +281,7 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
       }));
     }
 
+    let succeeded = false;
     try {
       const options = await withTimeout(
         ACPClientAPI.getSessionOptions({
@@ -272,13 +296,20 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
       );
       setAcpOptions(options);
       syncAcpContextUsageToStore(sessionId, options);
+      succeeded = true;
     } catch (error) {
       log.warn('Failed to load ACP session model options', { sessionId, acpClientId, error });
       setAcpOptions(null);
     } finally {
       if (shouldShowRestoreToast) {
         window.dispatchEvent(new CustomEvent('bitfun:acp-session-creation', {
-          detail: { phase: 'finish', clientId: acpClientId, action: 'restore', requestId: restoreRequestId },
+          detail: {
+            phase: 'finish',
+            clientId: acpClientId,
+            action: 'restore',
+            requestId: restoreRequestId,
+            succeeded,
+          },
         }));
       }
     }
@@ -339,27 +370,29 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
     if (!dropdownOpen || !dropdownRef.current) return;
 
     const updatePosition = () => {
-      if (!dropdownRef.current) return;
-      const rect = dropdownRef.current.getBoundingClientRect();
-      const placementStyle = dropdownPlacement === 'bottom'
-        ? { top: `${rect.bottom + 6}px`, bottom: 'auto' }
-        : { top: 'auto', bottom: `${window.innerHeight - rect.top + 6}px` };
-      setDropdownStyle({
-        position: 'fixed',
-        visibility: 'visible',
-        left: `${rect.left}px`,
-        minWidth: '220px',
-        maxWidth: '280px',
-        ...placementStyle,
-      });
+      if (!dropdownRef.current || !portalDropdownRef.current) return;
+      const anchorRect = dropdownRef.current.getBoundingClientRect();
+      const dropdownRect = portalDropdownRef.current.getBoundingClientRect();
+      setDropdownStyle(getModelSelectorDropdownStyle(
+        anchorRect,
+        dropdownRect,
+        dropdownPlacement,
+        { width: window.innerWidth, height: window.innerHeight },
+      ));
     };
 
     updatePosition();
+
+    const resizeObserver = new ResizeObserver(updatePosition);
+    if (portalDropdownRef.current) {
+      resizeObserver.observe(portalDropdownRef.current);
+    }
 
     window.addEventListener('scroll', updatePosition, true);
     window.addEventListener('resize', updatePosition);
 
     return () => {
+      resizeObserver.disconnect();
       window.removeEventListener('scroll', updatePosition, true);
       window.removeEventListener('resize', updatePosition);
     };
@@ -371,7 +404,7 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
       id: model.id,
       configName: model.name,
       modelName: model.name,
-      providerName: acpClientId ? `${acpClientId} ACP` : 'ACP',
+      providerName: getAcpModelProviderName(model) ?? (acpClientId ? `${acpClientId} ACP` : 'ACP'),
       provider: 'acp',
     }));
   }, [acpClientId, acpOptions, isAcpSession]);
@@ -386,24 +419,82 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
       provider: 'acp',
     };
   }, [acpAvailableModels, acpClientId, acpOptions?.currentModelId, isAcpSession]);
+
+  const externalAvailableModels = useMemo((): ModelInfo[] => {
+    if (!externalSelection) return [];
+    return Array.from(new Set([
+      ...externalSelection.models,
+      externalSelection.defaultModelId,
+      externalSelection.selectedModelId,
+    ].filter((model): model is string => !!model?.trim())))
+      .map(modelId => {
+        // A synced target reports stable config ids because those are what the
+        // worker must execute. Reuse the controller catalog for presentation
+        // so generated ids never leak into the normal model-picker UI.
+        const localModel = allModels.find(model => model.id === modelId);
+        return localModel
+          ? {
+              id: modelId,
+              configName: localModel.name,
+              modelName: localModel.model_name,
+              providerName: getProviderDisplayName(localModel),
+              provider: localModel.provider,
+              contextWindow: localModel.context_window,
+              enableThinking: isReasoningVisiblyEnabled(
+                getEffectiveReasoningMode(localModel),
+              ),
+              reasoningEffort: localModel.reasoning_effort,
+            }
+          : {
+              id: modelId,
+              configName: modelId,
+              modelName: modelId,
+              providerName: externalSelection.providerLabel,
+              provider: 'external',
+            };
+      });
+  }, [allModels, externalSelection]);
+
+  const externalCurrentModelId =
+    externalSelection?.selectedModelId?.trim()
+    || externalSelection?.defaultModelId?.trim()
+    || externalAvailableModels[0]?.id
+    || '';
+  const externalCurrentModel = externalAvailableModels.find(
+    model => model.id === externalCurrentModelId,
+  ) ?? null;
+
+  const acpFastMode = useMemo(
+    () => resolveAcpFastModeState(acpOptions?.configOptions ?? []),
+    [acpOptions?.configOptions],
+  );
   
   const getCurrentModelId = useCallback((): string => {
     // Session-owned model takes priority so that each session remembers
     // its own model selection independently.
     const sessionModelName = activeSession?.config.modelName?.trim();
-    if (sessionModelName && sessionModelName !== 'auto') {
-      if (sessionModelName === 'primary' || sessionModelName === 'fast') {
+    if (sessionModelName) {
+      if (isSpecialModel(sessionModelName)) {
+        if (sessionModelName === 'auto') {
+          return 'auto';
+        }
         const actualModelId = defaultModels[sessionModelName];
-        const model = allModels.find(m => m.id === actualModelId);
-        if (model) return sessionModelName;
-      } else {
-        const model = allModels.find(m => m.id === sessionModelName);
-        if (model) return sessionModelName;
+        return allModels.some(model => model.id === actualModelId)
+          ? sessionModelName
+          : 'auto';
       }
+      return allModels.some(model => model.id === sessionModelName)
+        ? sessionModelName
+        : 'auto';
     }
 
-    // Fall back to global per-mode configuration.
-    const configuredModelId = agentModels[currentMode] || 'auto';
+    if (targetIsSubagent) {
+      return 'auto';
+    }
+
+    // Legacy sessions created without a model selector fall back to the current
+    // mode default until they are migrated by the send path.
+    const configuredModelId = modeModel;
     if (configuredModelId === 'auto') return 'auto';
     if (configuredModelId === 'primary' || configuredModelId === 'fast') {
       const actualModelId = defaultModels[configuredModelId];
@@ -412,7 +503,7 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
     }
     const model = allModels.find(m => m.id === configuredModelId);
     return model ? configuredModelId : 'auto';
-  }, [allModels, currentMode, agentModels, defaultModels, activeSession?.config.modelName]);
+  }, [allModels, modeModel, defaultModels, activeSession?.config.modelName, targetIsSubagent]);
 
   const currentModel = useMemo((): ModelInfo | null => {
     const modelId = getCurrentModelId();
@@ -481,7 +572,20 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
     setLoading(true);
     setDropdownOpen(false);
 
+    // The optimistic session write below must be undone when the backend
+    // rejects the switch; otherwise the selector keeps showing a model the
+    // session never adopted, and the next send pushes it to the backend.
+    const store = FlowChatStore.getInstance();
+    const previousSessionModelName = sessionId
+      ? store.getState().sessions.get(sessionId)?.config.modelName
+      : undefined;
+    let sessionModelWrittenOptimistically = false;
+
     try {
+      if (externalSelection) {
+        await externalSelection.onSelect(modelId);
+        return;
+      }
       if (isAcpSession && acpClientId && sessionId) {
         const options = await ACPClientAPI.setSessionModel({
           sessionId,
@@ -493,48 +597,55 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
         });
         setAcpOptions(options);
         syncAcpContextUsageToStore(sessionId, options);
-        FlowChatStore.getInstance().updateSessionModelName(sessionId, modelId);
+        store.updateSessionModelName(sessionId, modelId);
         log.info('ACP session model updated', { sessionId, acpClientId, modelId });
         return;
       }
 
-      const currentAgentModels = await configManager.getConfig<Record<string, string>>('ai.agent_models') || {};
+      const updateTargetSessionModel = async () => {
+        if (!sessionId) return;
 
-      // Refresh **every** agent mapping already present in the config so
-      // all configured agents pick up the new model.  Also ensure the
-      // current session's agent type is included.  No hardcoded list —
-      // any agent type added to the config in the future is covered
-      // automatically.
-      const updatedAgentModels = { ...currentAgentModels };
-      for (const agentType of Object.keys(updatedAgentModels)) {
-        updatedAgentModels[agentType] = modelId;
-      }
-      updatedAgentModels[currentMode] = modelId;
-
-      await configManager.setConfig('ai.agent_models', updatedAgentModels);
-      setAgentModels(updatedAgentModels);
-
-      if (sessionId) {
-        const store = FlowChatStore.getInstance();
         // Update the frontend session model immediately so the UI reflects the
         // switch without waiting for the backend IPC round-trip.
         store.updateSessionModelName(sessionId, modelId);
+        sessionModelWrittenOptimistically = true;
         const maxContextTokens = await getModelMaxTokens(modelId, currentMode);
         store.updateSessionMaxContextTokens(sessionId, maxContextTokens);
         const session = store.getState().sessions.get(sessionId);
-        if (!session?.isTransient) {
+        if (session && !session.isTransient) {
           await agentAPI.updateSessionModel({
             sessionId,
             modelName: modelId,
+            workspacePath: sessionProjectWorkspacePath(session),
+            remoteConnectionId: session.remoteConnectionId,
+            remoteSshHost: session.remoteSshHost,
+            includeInternal: session.sessionKind === 'subagent',
           });
         }
+      };
+
+      if (targetIsSubagent) {
+        await updateTargetSessionModel();
+        log.info('Subagent session model updated', { sessionId, modelId });
+        return;
       }
+
+      await configManager.setConfig('ai.agent_model_defaults.mode', modelId);
+      setModeModel(modelId);
+      await updateTargetSessionModel();
 
       log.info('Mode model updated', { mode: currentMode, modelId });
 
       globalEventBus.emit('mode:config:updated');
     } catch (error) {
       log.error('Failed to switch model', error);
+      // Only a previously pinned selection can be restored: the store has no
+      // way to express "never pinned", and forcing 'auto' there would claim a
+      // binding the session does not have either.
+      if (sessionId && sessionModelWrittenOptimistically && previousSessionModelName) {
+        store.updateSessionModelName(sessionId, previousSessionModelName);
+      }
+      notificationService.error(t('modelSelector.switchFailed'));
     } finally {
       setLoading(false);
     }
@@ -545,10 +656,113 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
     activeSession?.workspacePath,
     acpClientId,
     currentMode,
+    externalSelection,
     isAcpSession,
     loading,
     sessionId,
+    t,
+    targetIsSubagent,
   ]);
+
+  const handleSetAcpFastMode = useCallback(async (enabled: boolean) => {
+    if (loading || !acpFastMode || !acpClientId || !sessionId) return;
+    const value = buildAcpFastModeValue(acpFastMode.option, enabled);
+    if (!value) return;
+
+    setLoading(true);
+    try {
+      const options = await ACPClientAPI.setSessionConfigOption({
+        sessionId,
+        clientId: acpClientId,
+        workspacePath: activeSession?.workspacePath || activeSession?.config.workspacePath,
+        remoteConnectionId: activeSession?.remoteConnectionId,
+        remoteSshHost: activeSession?.remoteSshHost,
+        configId: acpFastMode.option.id,
+        value,
+      });
+      setAcpOptions(options);
+      syncAcpContextUsageToStore(sessionId, options);
+      log.info('ACP Fast mode updated', { sessionId, acpClientId, enabled });
+    } catch (error) {
+      log.error('Failed to update ACP Fast mode', error);
+    } finally {
+      setLoading(false);
+    }
+  }, [
+    activeSession?.config.workspacePath,
+    activeSession?.remoteConnectionId,
+    activeSession?.remoteSshHost,
+    activeSession?.workspacePath,
+    acpClientId,
+    acpFastMode,
+    loading,
+    sessionId,
+  ]);
+
+  const handleTriggerKeyDown = useCallback((event: React.KeyboardEvent<HTMLButtonElement>) => {
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      event.preventDefault();
+      setKeyboardNavigationOpen(true);
+      setDropdownOpen(true);
+      if (isAcpSession) {
+        void loadAcpOptions();
+      }
+      return;
+    }
+
+    if (event.key === 'Escape' && dropdownOpen) {
+      event.preventDefault();
+      setDropdownOpen(false);
+      setKeyboardNavigationOpen(false);
+    }
+  }, [dropdownOpen, isAcpSession, loadAcpOptions]);
+
+  const handleDropdownKeyDown = useCallback((event: React.KeyboardEvent<HTMLDivElement>) => {
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      setDropdownOpen(false);
+      setKeyboardNavigationOpen(false);
+      triggerRef.current?.focus();
+      return;
+    }
+
+    if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) {
+      return;
+    }
+
+    const items = Array.from(
+      event.currentTarget.querySelectorAll<HTMLButtonElement>(
+        'button[role="menuitemradio"]:not(:disabled)',
+      ),
+    );
+    if (items.length === 0) return;
+
+    event.preventDefault();
+    const activeIndex = items.indexOf(document.activeElement as HTMLButtonElement);
+    let nextIndex = activeIndex;
+    if (event.key === 'Home') nextIndex = 0;
+    if (event.key === 'End') nextIndex = items.length - 1;
+    if (event.key === 'ArrowDown') nextIndex = activeIndex < 0 ? 0 : (activeIndex + 1) % items.length;
+    if (event.key === 'ArrowUp') nextIndex = activeIndex < 0 ? items.length - 1 : (activeIndex - 1 + items.length) % items.length;
+    items[nextIndex]?.focus();
+  }, []);
+
+  useEffect(() => {
+    if (!dropdownOpen || !keyboardNavigationOpen) return;
+
+    const frameId = window.requestAnimationFrame(() => {
+      const menu = portalDropdownRef.current;
+      const selectedItem = menu?.querySelector<HTMLButtonElement>(
+        'button[role="menuitemradio"][aria-checked="true"]',
+      );
+      const firstItem = menu?.querySelector<HTMLButtonElement>(
+        'button[role="menuitemradio"]:not(:disabled)',
+      );
+      (selectedItem ?? firstItem)?.focus();
+    });
+
+    return () => window.cancelAnimationFrame(frameId);
+  }, [dropdownOpen, keyboardNavigationOpen]);
   
   const tokenPercentage = useMemo(() => {
     if (!maxTokens || maxTokens <= 0 || !currentTokens) return 0;
@@ -563,6 +777,98 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
 
   const resolvedContextUsageSource: ContextUsageSource =
     contextUsageSource ?? (isAcpSession ? 'acp_context' : 'agent_prompt');
+
+  if (externalSelection) {
+    if (externalAvailableModels.length === 0) {
+      return null;
+    }
+
+    return (
+      <div
+        ref={dropdownRef}
+        className={`bitfun-model-selector ${className}`}
+      >
+        <Tooltip content={getModelTooltipText(
+          externalCurrentModel,
+          externalSelection.providerLabel,
+        )}>
+          <button
+            ref={triggerRef}
+            data-testid="chat-model-selector-btn"
+            className={`bitfun-model-selector__trigger ${dropdownOpen ? 'bitfun-model-selector__trigger--open' : ''}`}
+            type="button"
+            aria-haspopup="menu"
+            aria-expanded={dropdownOpen}
+            aria-controls={dropdownOpen ? menuId : undefined}
+            onKeyDown={handleTriggerKeyDown}
+            onClick={(event) => {
+              const nextOpen = !dropdownOpen;
+              setKeyboardNavigationOpen(nextOpen && event.detail === 0);
+              setDropdownOpen(nextOpen);
+            }}
+            disabled={loading || externalSelection.disabled}
+          >
+            <span className="bitfun-model-selector__name">
+              {getModelDisplayLabel(externalCurrentModel, externalCurrentModelId)}
+            </span>
+            <ChevronDown size={10} className="bitfun-model-selector__chevron" />
+          </button>
+        </Tooltip>
+
+        {dropdownOpen && createPortal(
+          <div
+            id={menuId}
+            className="bitfun-model-selector__dropdown"
+            ref={portalDropdownRef}
+            style={dropdownStyle}
+            data-testid="chat-model-selector-menu"
+            data-keyboard-open={keyboardNavigationOpen ? 'true' : 'false'}
+            data-placement={dropdownPlacement}
+            role="menu"
+            aria-label={t('modelSelector.modelSelection')}
+            onKeyDown={handleDropdownKeyDown}
+          >
+            <div className="bitfun-model-selector__dropdown-header">
+              <span>{t('modelSelector.modelSelection')}</span>
+              <span className="bitfun-model-selector__dropdown-hint">
+                {externalSelection.providerLabel}
+              </span>
+            </div>
+            <div className="bitfun-model-selector__list">
+              {externalAvailableModels.map(model => {
+                const isSelected = externalCurrentModelId === model.id;
+                return (
+                  <Tooltip key={model.id} content={model.providerName} placement="right">
+                    <button
+                      type="button"
+                      role="menuitemradio"
+                      aria-checked={isSelected}
+                      data-testid="chat-model-selector-option"
+                      data-model-id={model.id}
+                      data-model-name={model.modelName}
+                      data-selected={isSelected ? 'true' : 'false'}
+                      className={`bitfun-model-selector__option ${isSelected ? 'bitfun-model-selector__option--selected' : ''}`}
+                      onClick={() => handleSelectModel(model.id)}
+                    >
+                      <div className="bitfun-model-selector__option-main">
+                        <span className="bitfun-model-selector__option-name">
+                          {model.modelName}
+                        </span>
+                      </div>
+                      {isSelected ? (
+                        <Check size={14} className="bitfun-model-selector__option-check" />
+                      ) : null}
+                    </button>
+                  </Tooltip>
+                );
+              })}
+            </div>
+          </div>,
+          document.body,
+        )}
+      </div>
+    );
+  }
 
   if (isAcpSession) {
     if (acpAvailableModels.length === 0) {
@@ -582,28 +888,38 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
     });
 
     return (
-      <div
+      <div data-bf-component="model-selector" data-bf-part="root" data-bf-state={dropdownOpen ? 'open' : undefined}
         ref={dropdownRef}
         className={`bitfun-model-selector ${className}`}
       >
         <Tooltip content={acpTooltip}>
           <button
+            ref={triggerRef}
             data-testid="chat-model-selector-btn"
             className={`bitfun-model-selector__trigger ${dropdownOpen ? 'bitfun-model-selector__trigger--open' : ''}`}
-            onClick={() => {
+            type="button"
+            aria-haspopup="menu"
+            aria-expanded={dropdownOpen}
+            aria-controls={dropdownOpen ? menuId : undefined}
+            onKeyDown={handleTriggerKeyDown}
+            onClick={(event) => {
               const nextOpen = !dropdownOpen;
+              setKeyboardNavigationOpen(nextOpen && event.detail === 0);
               setDropdownOpen(nextOpen);
               if (nextOpen) {
-                loadAcpOptions();
+                void loadAcpOptions();
               }
             }}
             disabled={loading}
-          >
-            <span className="bitfun-model-selector__name">
+           data-bf-component="model-selector" data-bf-part="trigger" data-bf-state={dropdownOpen ? 'open' : undefined}>
+            <span className="bitfun-model-selector__name" data-bf-component="model-selector" data-bf-part="name">
               {getModelDisplayLabel(acpCurrentModel, currentAcpModelId)}
             </span>
+            {acpFastMode?.enabled && (
+              <Zap size={9} className="bitfun-model-selector__fast-icon" />
+            )}
             {tokenPercentage > 0 && (
-              <span className={`bitfun-model-selector__ctx-usage${tokenStatusClass ? ` bitfun-model-selector__ctx-usage--${tokenStatusClass}` : ''}`}>
+              <span className={`bitfun-model-selector__ctx-usage${tokenStatusClass ? ` bitfun-model-selector__ctx-usage--${tokenStatusClass}` : ''}`} data-bf-component="model-selector" data-bf-part="contextUsage">
                 · {tokenPercentage}%
               </span>
             )}
@@ -613,47 +929,86 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
 
         {dropdownOpen && createPortal(
           <div
+            id={menuId}
             className="bitfun-model-selector__dropdown"
+            data-bf-component="model-selector"
+            data-bf-part="dropdown"
             ref={portalDropdownRef}
             style={dropdownStyle}
             data-testid="chat-model-selector-menu"
+            data-keyboard-open={keyboardNavigationOpen ? 'true' : 'false'}
+            data-placement={dropdownPlacement}
+            role="menu"
+            aria-label="ACP model"
+            onKeyDown={handleDropdownKeyDown}
           >
-            <div className="bitfun-model-selector__dropdown-header">
+            <div className="bitfun-model-selector__dropdown-header" data-bf-component="model-selector" data-bf-part="dropdownHeader">
               <span>ACP model</span>
               <span className="bitfun-model-selector__dropdown-hint">
                 {acpClientId}
               </span>
             </div>
 
-            <div className="bitfun-model-selector__list">
+            <div className="bitfun-model-selector__list" data-bf-component="model-selector" data-bf-part="list">
               {acpAvailableModels.map(model => {
                 const isSelected = currentAcpModelId === model.id;
 
                 return (
-                  <Tooltip key={model.id} content={model.id} placement="right">
-                    <div
+                  <Tooltip key={model.id} content={buildModelMetaText(model)} placement="right">
+                    <button
+                      type="button"
+                      role="menuitemradio"
+                      aria-checked={isSelected}
                       data-testid="chat-model-selector-option"
                       data-model-id={model.id}
                       data-model-name={model.modelName}
                       data-selected={isSelected ? 'true' : 'false'}
                       className={`bitfun-model-selector__option ${isSelected ? 'bitfun-model-selector__option--selected' : ''}`}
+                      data-bf-component="model-selector"
+                      data-bf-part="option"
+                      data-bf-state={isSelected ? 'selected' : undefined}
                       onClick={() => handleSelectModel(model.id)}
                     >
-                      <div className="bitfun-model-selector__option-main">
+                      <div className="bitfun-model-selector__option-main" data-bf-component="model-selector" data-bf-part="optionMain">
                         <span className="bitfun-model-selector__option-name">
                           {model.modelName}
+                        </span>
+                        <span className="bitfun-model-selector__option-provider">
+                          {model.providerName}
                         </span>
                       </div>
                       {isSelected && (
                         <Check size={14} className="bitfun-model-selector__option-check" />
                       )}
-                    </div>
+                    </button>
                   </Tooltip>
                 );
               })}
             </div>
+            {acpFastMode && (
+              <>
+                <div className="bitfun-model-selector__divider" />
+                <div className="bitfun-model-selector__config-row" data-bf-component="model-selector" data-bf-part="configRow">
+                  <div className="bitfun-model-selector__config-copy">
+                    <span className="bitfun-model-selector__config-name">
+                      {t('modelSelector.fastMode')}
+                    </span>
+                    <span className="bitfun-model-selector__config-description">
+                      {t('modelSelector.fastModeDescription')}
+                    </span>
+                  </div>
+                  <Switch
+                    size="small"
+                    checked={acpFastMode.enabled}
+                    loading={loading}
+                    aria-label={t('modelSelector.fastMode')}
+                    onChange={event => { void handleSetAcpFastMode(event.target.checked); }}
+                  />
+                </div>
+              </>
+            )}
           </div>,
-          document.body
+          getAppearanceOverlayHost()
         )}
       </div>
     );
@@ -678,18 +1033,28 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
   });
 
   return (
-    <div
+    <div data-bf-component="model-selector" data-bf-part="root" data-bf-state={dropdownOpen ? 'open' : undefined}
       ref={dropdownRef}
       className={`bitfun-model-selector ${className}`}
     >
       <Tooltip content={tooltipContent}>
         <button
+          ref={triggerRef}
           data-testid="chat-model-selector-btn"
           className={`bitfun-model-selector__trigger ${dropdownOpen ? 'bitfun-model-selector__trigger--open' : ''}`}
-          onClick={() => setDropdownOpen(!dropdownOpen)}
+          type="button"
+          aria-haspopup="menu"
+          aria-expanded={dropdownOpen}
+          aria-controls={dropdownOpen ? menuId : undefined}
+          onKeyDown={handleTriggerKeyDown}
+          onClick={(event) => {
+            const nextOpen = !dropdownOpen;
+            setKeyboardNavigationOpen(nextOpen && event.detail === 0);
+            setDropdownOpen(nextOpen);
+          }}
           disabled={loading}
-        >
-          <span className="bitfun-model-selector__name">
+         data-bf-component="model-selector" data-bf-part="trigger" data-bf-state={dropdownOpen ? 'open' : undefined}>
+          <span className="bitfun-model-selector__name" data-bf-component="model-selector" data-bf-part="name">
             {getModelDisplayLabel(currentModel, t('modelSelector.autoModel'))}
           </span>
           {currentModel?.enableThinking && (
@@ -701,7 +1066,7 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
             </span>
           )}
           {tokenPercentage > 0 && (
-            <span className={`bitfun-model-selector__ctx-usage${tokenStatusClass ? ` bitfun-model-selector__ctx-usage--${tokenStatusClass}` : ''}`}>
+            <span className={`bitfun-model-selector__ctx-usage${tokenStatusClass ? ` bitfun-model-selector__ctx-usage--${tokenStatusClass}` : ''}`} data-bf-component="model-selector" data-bf-part="contextUsage">
               · {tokenPercentage}%
             </span>
           )}
@@ -711,34 +1076,45 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
 
       {dropdownOpen && createPortal(
         <div
+          id={menuId}
           className="bitfun-model-selector__dropdown"
+          data-bf-component="model-selector"
+          data-bf-part="dropdown"
           ref={portalDropdownRef}
           style={dropdownStyle}
           data-testid="chat-model-selector-menu"
+          data-keyboard-open={keyboardNavigationOpen ? 'true' : 'false'}
+          data-placement={dropdownPlacement}
+          role="menu"
+          aria-label={t('modelSelector.modelSelection')}
+          onKeyDown={handleDropdownKeyDown}
         >
-          <div className="bitfun-model-selector__dropdown-header">
+          <div className="bitfun-model-selector__dropdown-header" data-bf-component="model-selector" data-bf-part="dropdownHeader">
             <span>{t('modelSelector.modelSelection')}</span>
-            <span className="bitfun-model-selector__dropdown-hint">
-              {t('modelSelector.currentMode')}: {currentMode}
-            </span>
           </div>
 
           <Tooltip content={t('modelSelector.autoModelDesc')} placement="right">
-            <div
+            <button
+              type="button"
+              role="menuitemradio"
+              aria-checked={currentModelId === 'auto'}
               data-testid="chat-model-selector-option"
               data-model-id="auto"
               data-model-name="auto"
               data-selected={currentModelId === 'auto' ? 'true' : 'false'}
               className={`bitfun-model-selector__option bitfun-model-selector__option--special ${currentModelId === 'auto' ? 'bitfun-model-selector__option--selected' : ''}`}
+              data-bf-component="model-selector"
+              data-bf-part="option"
+              data-bf-state={currentModelId === 'auto' ? 'selected' : undefined}
               onClick={() => handleSelectModel('auto')}
             >
-              <div className="bitfun-model-selector__option-main">
+              <div className="bitfun-model-selector__option-main" data-bf-component="model-selector" data-bf-part="optionMain">
                 <span className="bitfun-model-selector__option-name">{t('modelSelector.autoModel')}</span>
               </div>
               {currentModelId === 'auto' && (
                 <Check size={14} className="bitfun-model-selector__option-check" />
               )}
-            </div>
+            </button>
           </Tooltip>
 
           {(() => {
@@ -751,21 +1127,27 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
               : t('modelSelector.autoModelDesc');
             return (
               <Tooltip content={primaryTooltip} placement="right">
-                <div
+                <button
+                  type="button"
+                  role="menuitemradio"
+                  aria-checked={currentModelId === 'primary'}
                   data-testid="chat-model-selector-option"
                   data-model-id="primary"
                   data-model-name={primaryModel?.model_name || 'primary'}
                   data-selected={currentModelId === 'primary' ? 'true' : 'false'}
                   className={`bitfun-model-selector__option bitfun-model-selector__option--special ${currentModelId === 'primary' ? 'bitfun-model-selector__option--selected' : ''}`}
+                  data-bf-component="model-selector"
+                  data-bf-part="option"
+                  data-bf-state={currentModelId === 'primary' ? 'selected' : undefined}
                   onClick={() => handleSelectModel('primary')}
                 >
-                  <div className="bitfun-model-selector__option-main">
+                  <div className="bitfun-model-selector__option-main" data-bf-component="model-selector" data-bf-part="optionMain">
                     <span className="bitfun-model-selector__option-name">{t('modelSelector.primaryModel')}</span>
                   </div>
                   {currentModelId === 'primary' && (
                     <Check size={14} className="bitfun-model-selector__option-check" />
                   )}
-                </div>
+                </button>
               </Tooltip>
             );
           })()}
@@ -780,42 +1162,54 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
               : t('modelSelector.autoModelDesc');
             return (
               <Tooltip content={fastTooltip} placement="right">
-                <div
+                <button
+                  type="button"
+                  role="menuitemradio"
+                  aria-checked={currentModelId === 'fast'}
                   data-testid="chat-model-selector-option"
                   data-model-id="fast"
                   data-model-name={fastModel?.model_name || 'fast'}
                   data-selected={currentModelId === 'fast' ? 'true' : 'false'}
                   className={`bitfun-model-selector__option bitfun-model-selector__option--special ${currentModelId === 'fast' ? 'bitfun-model-selector__option--selected' : ''}`}
+                  data-bf-component="model-selector"
+                  data-bf-part="option"
+                  data-bf-state={currentModelId === 'fast' ? 'selected' : undefined}
                   onClick={() => handleSelectModel('fast')}
                 >
-                  <div className="bitfun-model-selector__option-main">
+                  <div className="bitfun-model-selector__option-main" data-bf-component="model-selector" data-bf-part="optionMain">
                     <span className="bitfun-model-selector__option-name">{t('modelSelector.fastModel')}</span>
                   </div>
                   {currentModelId === 'fast' && (
                     <Check size={14} className="bitfun-model-selector__option-check" />
                   )}
-                </div>
+                </button>
               </Tooltip>
             );
           })()}
 
           <div className="bitfun-model-selector__divider" />
 
-          <div className="bitfun-model-selector__list">
+          <div className="bitfun-model-selector__list" data-bf-component="model-selector" data-bf-part="list">
             {availableModels.map(model => {
               const isSelected = currentModelId === model.id;
 
               return (
                 <Tooltip key={model.id} content={buildModelMetaText(model)} placement="right">
-                  <div
+                  <button
+                    type="button"
+                    role="menuitemradio"
+                    aria-checked={isSelected}
                     data-testid="chat-model-selector-option"
                     data-model-id={model.id}
                     data-model-name={model.modelName}
                     data-selected={isSelected ? 'true' : 'false'}
                     className={`bitfun-model-selector__option ${isSelected ? 'bitfun-model-selector__option--selected' : ''}`}
+                    data-bf-component="model-selector"
+                    data-bf-part="option"
+                    data-bf-state={isSelected ? 'selected' : undefined}
                     onClick={() => handleSelectModel(model.id)}
                   >
-                    <div className="bitfun-model-selector__option-main">
+                    <div className="bitfun-model-selector__option-main" data-bf-component="model-selector" data-bf-part="optionMain">
                       <span className="bitfun-model-selector__option-name">
                         {model.modelName}
                         {model.enableThinking && (
@@ -826,13 +1220,13 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
                     {isSelected && (
                       <Check size={14} className="bitfun-model-selector__option-check" />
                     )}
-                  </div>
+                  </button>
                 </Tooltip>
               );
             })}
           </div>
         </div>,
-        document.body
+        getAppearanceOverlayHost()
       )}
     </div>
   );

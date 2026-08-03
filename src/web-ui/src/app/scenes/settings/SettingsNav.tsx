@@ -12,6 +12,7 @@
  */
 
 import React, {
+  startTransition,
   useCallback,
   useEffect,
   useMemo,
@@ -25,6 +26,7 @@ import { useSettingsStore } from './settingsStore';
 import { SETTINGS_CATEGORIES } from './settingsConfig';
 import type { ConfigTab } from './settingsConfig';
 import { SETTINGS_TAB_SEARCH_CONTENT } from './settingsTabSearchContent';
+import { preloadSettingsTabContent } from './settingsContentRegistry';
 import './SettingsNav.scss';
 
 const SEARCH_DEBOUNCE_MS = 150;
@@ -127,7 +129,7 @@ function highlightFirstMatch(text: string, query: string): React.ReactNode {
   return (
     <>
       {text.slice(0, idx)}
-      <mark className="bitfun-settings-nav__search-highlight">
+      <mark data-bf-component="settings-nav" data-bf-part="highlight" className="bitfun-settings-nav__search-highlight">
         {text.slice(idx, idx + qi.length)}
       </mark>
       {text.slice(idx + qi.length)}
@@ -146,6 +148,7 @@ function useSettingsNav() {
   const searchInputRef = useRef<HTMLInputElement>(null);
   const [highlightedIndex, setHighlightedIndex] = useState(-1);
   const resultsRef = useRef<HTMLDivElement>(null);
+  const activationRequestRef = useRef(0);
 
   useEffect(() => {
     const id = window.setTimeout(() => {
@@ -180,18 +183,39 @@ function useSettingsNav() {
 
   const activateTab = useCallback(
     (tab: ConfigTab) => {
-      setActiveTab(tab);
-      clearSearch();
+      const requestId = ++activationRequestRef.current;
+      const commit = () => {
+        if (activationRequestRef.current !== requestId) return;
+        // A cached lazy panel still suspends for one promise microtask on its
+        // first mount; inside a transition React keeps the painted panel until
+        // the new one is ready instead of committing the skeleton fallback.
+        startTransition(() => {
+          setActiveTab(tab);
+          clearSearch();
+        });
+      };
+      void preloadSettingsTabContent(tab).then(commit, commit);
     },
     [setActiveTab, clearSearch]
   );
 
   const handleTabClick = useCallback(
     (tab: ConfigTab) => {
-      setActiveTab(tab);
+      const requestId = ++activationRequestRef.current;
+      const commit = () => {
+        if (activationRequestRef.current !== requestId) return;
+        startTransition(() => {
+          setActiveTab(tab);
+        });
+      };
+      void preloadSettingsTabContent(tab).then(commit, commit);
     },
     [setActiveTab]
   );
+
+  const preloadTab = useCallback((tab: ConfigTab) => {
+    void preloadSettingsTabContent(tab).catch(() => {});
+  }, []);
 
   const handleSearchKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLInputElement>) => {
@@ -253,6 +277,7 @@ function useSettingsNav() {
     t,
     activeTab,
     handleTabClick,
+    preloadTab,
     draftQuery,
     setDraftQuery,
     searchInputRef,
@@ -274,6 +299,7 @@ const SettingsNav: React.FC = () => {
     t,
     activeTab,
     handleTabClick,
+    preloadTab,
     draftQuery,
     setDraftQuery,
     searchInputRef,
@@ -290,14 +316,14 @@ const SettingsNav: React.FC = () => {
   } = useSettingsNav();
 
   return (
-    <div className="bitfun-settings-nav" data-testid="settings-nav">
-      <div className="bitfun-settings-nav__header">
+    <div data-bf-component="settings-nav" data-bf-part="root" className="bitfun-settings-nav" data-testid="settings-nav">
+      <div data-bf-component="settings-nav" data-bf-part="header" className="bitfun-settings-nav__header">
         <span className="bitfun-settings-nav__title">
           {t('shared:features.settings')}
         </span>
       </div>
 
-      <div className="bitfun-settings-nav__search">
+      <div data-bf-component="settings-nav" data-bf-part="search" className="bitfun-settings-nav__search">
         <Search
           ref={searchInputRef}
           className="bitfun-settings-nav__search-field"
@@ -318,6 +344,8 @@ const SettingsNav: React.FC = () => {
       <div
         ref={resultsRef}
         id="settings-nav-results"
+        data-bf-component="settings-nav"
+        data-bf-part="sections"
         className="bitfun-settings-nav__sections"
         role={isSearchMode ? 'listbox' : undefined}
         tabIndex={isSearchMode && results.length > 0 ? 0 : undefined}
@@ -331,17 +359,18 @@ const SettingsNav: React.FC = () => {
         {isSearchMode ? (
           <>
             {results.length === 0 ? (
-              <div className="bitfun-settings-nav__search-empty" role="status">
+              <div data-bf-component="settings-nav" data-bf-part="searchEmpty" className="bitfun-settings-nav__search-empty" role="status">
                 {t('configCenter.searchNoResults')}
               </div>
             ) : (
-              <div className="bitfun-settings-nav__search-results">
+              <div data-bf-component="settings-nav" data-bf-part="searchResults" className="bitfun-settings-nav__search-results">
                 {results.map((row, index) => {
                   const line = `${row.categoryLabel} › ${row.tabLabel}`;
                   const active = activeTab === row.tabId;
                   const highlighted = highlightedIndex === index;
                   return (
-                    <button
+                    <button data-bf-component="settings-nav" data-bf-part="searchResult"
+                      data-bf-state={[active && 'active', highlighted && 'selected'].filter(Boolean).join(' ') || undefined}
                       key={row.tabId}
                       type="button"
                       id={`settings-nav-result-${row.tabId}`}
@@ -355,7 +384,11 @@ const SettingsNav: React.FC = () => {
                         .filter(Boolean)
                         .join(' ')}
                       onClick={() => activateTab(row.tabId)}
-                      onMouseEnter={() => setHighlightedIndex(index)}
+                      onMouseEnter={() => {
+                        setHighlightedIndex(index);
+                        preloadTab(row.tabId);
+                      }}
+                      onFocus={() => preloadTab(row.tabId)}
                     >
                       <span className="bitfun-settings-nav__search-result-line">
                         {highlightFirstMatch(line, displayQuery)}
@@ -373,16 +406,19 @@ const SettingsNav: React.FC = () => {
           </>
         ) : (
           SETTINGS_CATEGORIES.map((category) => (
-            <div key={category.id} className="bitfun-settings-nav__category">
-              <div className="bitfun-settings-nav__category-header">
+            <div data-bf-component="settings-nav" data-bf-part="category" key={category.id} className="bitfun-settings-nav__category">
+              <div data-bf-component="settings-nav" data-bf-part="categoryHeader" className="bitfun-settings-nav__category-header">
                 <span className="bitfun-settings-nav__category-label">
                   {t(category.nameKey, { defaultValue: category.id })}
                 </span>
               </div>
 
-              <div className="bitfun-settings-nav__items">
+              <div data-bf-component="settings-nav" data-bf-part="items" className="bitfun-settings-nav__items">
                 {category.tabs.map((tabDef) => (
                   <button
+                    data-bf-component="settings-nav"
+                    data-bf-part="item"
+                    data-bf-state={activeTab === tabDef.id ? 'active' : undefined}
                     key={tabDef.id}
                     type="button"
                     data-testid="settings-nav-tab"
@@ -394,6 +430,8 @@ const SettingsNav: React.FC = () => {
                       .filter(Boolean)
                       .join(' ')}
                     onClick={() => handleTabClick(tabDef.id)}
+                    onPointerEnter={() => preloadTab(tabDef.id)}
+                    onFocus={() => preloadTab(tabDef.id)}
                   >
                     <span className="bitfun-settings-nav__item-label">
                       {t(tabDef.labelKey, { defaultValue: tabDef.id })}

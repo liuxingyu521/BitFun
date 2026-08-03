@@ -24,11 +24,16 @@ mod tests {
             path: format!("/tmp/{}", dir_name),
             level: SkillLocation::User,
             source_slot: "bitfun-system".to_string(),
+            source_id: "bitfun".to_string(),
+            source_label: "BitFun".to_string(),
             dir_name: dir_name.to_string(),
             is_builtin: true,
             group_key: None,
             is_shadowed: false,
             shadowed_by_key: None,
+            allow_implicit_invocation: true,
+            allow_user_invocation: true,
+            argument_hint: None,
         }
     }
 
@@ -40,11 +45,16 @@ mod tests {
             path: format!("/tmp/{}", dir_name),
             level: SkillLocation::User,
             source_slot: "bitfun".to_string(),
+            source_id: "bitfun".to_string(),
+            source_label: "BitFun".to_string(),
             dir_name: dir_name.to_string(),
             is_builtin: false,
             group_key: None,
             is_shadowed: false,
             shadowed_by_key: None,
+            allow_implicit_invocation: true,
+            allow_user_invocation: true,
+            argument_hint: None,
         }
     }
 
@@ -54,7 +64,9 @@ mod tests {
         let browser = builtin_skill("agent-browser");
 
         assert!(!resolve_skill_default_enabled_for_mode(&pdf, "agentic"));
-        assert!(resolve_skill_default_enabled_for_mode(&browser, "agentic"));
+        // agent-browser is opt-in everywhere: ControlHub's browser domain is
+        // the default browser-automation path.
+        assert!(!resolve_skill_default_enabled_for_mode(&browser, "agentic"));
         assert!(resolve_skill_default_enabled_for_mode(&pdf, "Cowork"));
         assert!(!resolve_skill_default_enabled_for_mode(&browser, "Cowork"));
     }

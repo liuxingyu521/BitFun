@@ -146,13 +146,13 @@ export const ToolTimeoutIndicator: React.FC<ToolTimeoutIndicatorProps> = ({
     );
 
     return (
-      <span
+      <span data-bf-component="tool-timeout-indicator" data-bf-part="root" data-bf-mode="completed"
         className={`duration-text duration-text--completed${completedStatus ? ` duration-text--completed-${completedStatus}` : ''}`}
         title={completionLabel}
         aria-label={completionLabel}
       >
         {renderCompletedDurationIcon(completedStatus)}
-        {durationLabel}
+        <span data-bf-component="tool-timeout-indicator" data-bf-part="duration">{durationLabel}</span>
       </span>
     );
   }
@@ -172,14 +172,16 @@ export const ToolTimeoutIndicator: React.FC<ToolTimeoutIndicatorProps> = ({
     displayRemaining < timeoutMs * 0.2;
 
   return (
-    <span className="tool-timeout-indicator">
-      <span className={`duration-text duration-text--live ${isWarning ? 'duration-text--warning' : ''}`}>
+    <span data-bf-component="tool-timeout-indicator" data-bf-part="root" data-bf-mode="live" data-bf-state={[isWarning && 'warning', isTimeoutDisabled && 'disabled', isPopoverOpen && 'open'].filter(Boolean).join(' ')} className="tool-timeout-indicator">
+      <span data-bf-component="tool-timeout-indicator" data-bf-part="duration" className={`duration-text duration-text--live ${isWarning ? 'duration-text--warning' : ''}`}>
         <Timer size={13} strokeWidth={2} />
-        <span className="duration-elapsed">{formatDurationLive(elapsedMs)}</span>
+        <span data-bf-component="tool-timeout-indicator" data-bf-part="elapsed" className="duration-elapsed">{formatDurationLive(elapsedMs)}</span>
         {hasTimeout && (
           <>
             <span className="duration-separator">/</span>
             <span
+              data-bf-component="tool-timeout-indicator"
+              data-bf-part="timeout"
               className={`duration-timeout ${isTimeoutDisabled ? 'duration-timeout--disabled' : ''} ${isWarning ? 'duration-timeout--warning' : ''}`}
             >
               {isTimeoutDisabled
@@ -193,9 +195,11 @@ export const ToolTimeoutIndicator: React.FC<ToolTimeoutIndicatorProps> = ({
       </span>
 
       {canControlTimeout && (
-        <div className="timeout-control-wrapper" ref={popoverRef}>
+        <div data-bf-component="tool-timeout-indicator" data-bf-part="controls" className="timeout-control-wrapper" ref={popoverRef}>
           <button
             type="button"
+            data-bf-component="tool-timeout-indicator"
+            data-bf-part="toggle"
             className={`timeout-ignore-btn ${isTimeoutDisabled ? 'is-active' : ''}`}
             onClick={(e) => {
               e.stopPropagation();
@@ -217,10 +221,12 @@ export const ToolTimeoutIndicator: React.FC<ToolTimeoutIndicatorProps> = ({
           </button>
 
           {isPopoverOpen && (
-            <div className="timeout-extend-popover">
+            <div data-bf-component="tool-timeout-indicator" data-bf-part="popover" className="timeout-extend-popover">
               {remainingAtDisable > 0 ? (
                 <button
                   type="button"
+                  data-bf-component="tool-timeout-indicator"
+                  data-bf-part="option"
                   className="timeout-extend-option timeout-extend-option--danger"
                   onClick={(e) => {
                     e.stopPropagation();
@@ -232,6 +238,8 @@ export const ToolTimeoutIndicator: React.FC<ToolTimeoutIndicatorProps> = ({
               ) : null}
               <button
                 type="button"
+                data-bf-component="tool-timeout-indicator"
+                data-bf-part="option"
                 className="timeout-extend-option"
                 onClick={(e) => {
                   e.stopPropagation();
@@ -242,6 +250,8 @@ export const ToolTimeoutIndicator: React.FC<ToolTimeoutIndicatorProps> = ({
               </button>
               <button
                 type="button"
+                data-bf-component="tool-timeout-indicator"
+                data-bf-part="option"
                 className="timeout-extend-option"
                 onClick={(e) => {
                   e.stopPropagation();
@@ -252,6 +262,8 @@ export const ToolTimeoutIndicator: React.FC<ToolTimeoutIndicatorProps> = ({
               </button>
               <button
                 type="button"
+                data-bf-component="tool-timeout-indicator"
+                data-bf-part="option"
                 className="timeout-extend-option"
                 onClick={(e) => {
                   e.stopPropagation();

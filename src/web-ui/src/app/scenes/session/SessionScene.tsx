@@ -505,17 +505,27 @@ const SessionScene: React.FC<SessionSceneProps> = ({
       ].filter(Boolean).join(' ')}
       style={panelCollapseHintStyles}
       data-testid="session-scene"
+      data-bf-scene="session"
+      data-bf-part="root"
+      data-bf-state={[
+        isDragging && 'dragging',
+        isDraggingBottom && 'dragging',
+        isTerminalDockedBottom && 'terminal-bottom',
+      ].filter(Boolean).join(' ') || undefined}
     >
-      <div className="bitfun-session-scene__main-row">
+      <div className="bitfun-session-scene__main-row" data-bf-scene="session" data-bf-part="main">
         {/* ChatPane — FlowChat conversation */}
         {!isChatHidden && (
           <div
             className={`bitfun-session-scene__chat-pane ${isDragging ? 'bitfun-session-scene__chat-pane--dragging' : ''}`}
             data-testid="session-chat-pane"
+            data-bf-scene="session"
+            data-bf-part="chat"
           >
             <ChatPane
               width={0}
               isFullscreen={false}
+              isSceneActive={isActive}
               isDragging={false}
               workspacePath={workspacePath}
               showChatInput
@@ -578,6 +588,8 @@ const SessionScene: React.FC<SessionSceneProps> = ({
           }}
           data-mode={rightPanelMode}
           data-testid="session-aux-pane"
+          data-bf-scene="session"
+          data-bf-part="auxiliary"
           onTransitionEnd={handleRightPanelTransitionEnd}
         >
           <AuxPane
@@ -635,6 +647,8 @@ const SessionScene: React.FC<SessionSceneProps> = ({
               height: state.layout.bottomTerminalPanelCollapsed ? undefined : `${currentBottomHeight}px`,
             }}
             data-mode={bottomTerminalPanelMode}
+            data-bf-scene="session"
+            data-bf-part="terminal"
             onTransitionEnd={handleBottomPanelTransitionEnd}
           >
             <BottomTerminalPane

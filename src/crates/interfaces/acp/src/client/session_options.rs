@@ -96,6 +96,8 @@ pub struct AcpSessionOptions {
     #[serde(default)]
     pub model_config_id: Option<String>,
     #[serde(default)]
+    pub config_options: Vec<AcpSessionConfigOption>,
+    #[serde(default)]
     pub context_usage: Option<AcpSessionContextUsage>,
 }
 
@@ -103,6 +105,44 @@ pub struct AcpSessionOptions {
 #[serde(rename_all = "camelCase")]
 pub struct AcpSessionModelOption {
     pub id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_name: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcpSessionConfigOption {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(flatten)]
+    pub kind: AcpSessionConfigKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "type",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+pub enum AcpSessionConfigKind {
+    Select {
+        current_value: String,
+        options: Vec<AcpSessionConfigSelectOption>,
+    },
+    Boolean {
+        current_value: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcpSessionConfigSelectOption {
+    pub value: String,
     pub name: String,
     #[serde(default)]
     pub description: Option<String>,
@@ -114,6 +154,10 @@ pub(super) fn session_options_from_state(
     context_usage: Option<&AcpSessionContextUsage>,
 ) -> AcpSessionOptions {
     let context_usage = context_usage.cloned();
+    let session_config_options = config_options
+        .iter()
+        .filter_map(session_config_option_from_protocol)
+        .collect();
     if let Some(models) = models.filter(|models| !models.available_models.is_empty()) {
         return AcpSessionOptions {
             current_model_id: Some(models.current_model_id.to_string()),
@@ -123,6 +167,7 @@ pub(super) fn session_options_from_state(
                 .map(model_option_from_model_info)
                 .collect(),
             model_config_id: None,
+            config_options: session_config_options,
             context_usage,
         };
     }
@@ -133,13 +178,65 @@ pub(super) fn session_options_from_state(
             current_model_id,
             available_models,
             model_config_id: Some(option.id.to_string()),
+            config_options: session_config_options,
             context_usage,
         };
     }
 
     AcpSessionOptions {
+        config_options: session_config_options,
         context_usage,
         ..Default::default()
+    }
+}
+
+fn session_config_option_from_protocol(
+    option: &SessionConfigOption,
+) -> Option<AcpSessionConfigOption> {
+    let kind = match &option.kind {
+        SessionConfigKind::Select(select) => {
+            let options = match &select.options {
+                SessionConfigSelectOptions::Ungrouped(options) => options
+                    .iter()
+                    .map(session_config_select_option_from_protocol)
+                    .collect(),
+                SessionConfigSelectOptions::Grouped(groups) => groups
+                    .iter()
+                    .flat_map(|group| {
+                        group
+                            .options
+                            .iter()
+                            .map(session_config_select_option_from_protocol)
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            };
+            AcpSessionConfigKind::Select {
+                current_value: select.current_value.to_string(),
+                options,
+            }
+        }
+        SessionConfigKind::Boolean(boolean) => AcpSessionConfigKind::Boolean {
+            current_value: boolean.current_value,
+        },
+        _ => return None,
+    };
+
+    Some(AcpSessionConfigOption {
+        id: option.id.to_string(),
+        name: option.name.clone(),
+        description: option.description.clone(),
+        kind,
+    })
+}
+
+fn session_config_select_option_from_protocol(
+    option: &agent_client_protocol::schema::SessionConfigSelectOption,
+) -> AcpSessionConfigSelectOption {
+    AcpSessionConfigSelectOption {
+        value: option.value.to_string(),
+        name: option.name.clone(),
+        description: option.description.clone(),
     }
 }
 
@@ -148,10 +245,38 @@ pub(super) fn model_config_id(config_options: &[SessionConfigOption]) -> Option<
 }
 
 fn model_option_from_model_info(model: &ModelInfo) -> AcpSessionModelOption {
+    let id = model.model_id.to_string();
     AcpSessionModelOption {
-        id: model.model_id.to_string(),
+        provider_name: provider_name_from_model_identity(&id, model.description.as_deref()),
+        id,
         name: model.name.clone(),
         description: model.description.clone(),
+    }
+}
+
+fn provider_name_from_model_identity(id: &str, description: Option<&str>) -> Option<String> {
+    description
+        .and_then(provider_prefix)
+        .or_else(|| provider_prefix(id))
+}
+
+fn normalized_provider_name(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn provider_prefix(value: &str) -> Option<String> {
+    let (provider, model) = value.trim().split_once('/')?;
+    let provider = provider.trim();
+    let model = model.trim();
+    if provider.is_empty() || model.is_empty() {
+        None
+    } else {
+        Some(provider.to_string())
     }
 }
 
@@ -179,19 +304,32 @@ fn select_model_values(
     let models = match &select.options {
         SessionConfigSelectOptions::Ungrouped(options) => options
             .iter()
-            .map(|option| AcpSessionModelOption {
-                id: option.value.to_string(),
-                name: option.name.clone(),
-                description: option.description.clone(),
+            .map(|option| {
+                let id = option.value.to_string();
+                AcpSessionModelOption {
+                    provider_name: provider_name_from_model_identity(
+                        &id,
+                        option.description.as_deref(),
+                    ),
+                    id,
+                    name: option.name.clone(),
+                    description: option.description.clone(),
+                }
             })
             .collect(),
         SessionConfigSelectOptions::Grouped(groups) => groups
             .iter()
             .flat_map(|group| {
-                group.options.iter().map(|option| AcpSessionModelOption {
-                    id: option.value.to_string(),
-                    name: option.name.clone(),
-                    description: option.description.clone(),
+                group.options.iter().map(|option| {
+                    let id = option.value.to_string();
+                    AcpSessionModelOption {
+                        provider_name: normalized_provider_name(&group.name).or_else(|| {
+                            provider_name_from_model_identity(&id, option.description.as_deref())
+                        }),
+                        id,
+                        name: option.name.clone(),
+                        description: option.description.clone(),
+                    }
                 })
             })
             .collect(),
@@ -219,6 +357,21 @@ mod tests {
     }
 
     #[test]
+    fn extracts_provider_name_from_native_model_identity() {
+        let state = SessionModelState::new(
+            "openai/gpt-5.4",
+            vec![ModelInfo::new("openai/gpt-5.4", "GPT 5.4")],
+        );
+
+        let options = session_options_from_state(Some(&state), &[], None);
+
+        assert_eq!(
+            options.available_models[0].provider_name.as_deref(),
+            Some("openai")
+        );
+    }
+
+    #[test]
     fn converts_model_config_option_fallback() {
         let config = SessionConfigOption::select(
             "model",
@@ -237,6 +390,59 @@ mod tests {
         assert_eq!(options.model_config_id.as_deref(), Some("model"));
         assert_eq!(options.available_models.len(), 2);
         assert_eq!(options.available_models[1].id, "smart");
+    }
+
+    #[test]
+    fn extracts_provider_name_from_model_config_description() {
+        let config = SessionConfigOption::select(
+            "model",
+            "Model",
+            "openai/gpt-5.4",
+            vec![
+                agent_client_protocol::schema::SessionConfigSelectOption::new(
+                    "openai/gpt-5.4",
+                    "GPT 5.4",
+                )
+                .description("openai/gpt-5.4"),
+            ],
+        )
+        .category(SessionConfigOptionCategory::Model);
+
+        let options = session_options_from_state(None, &[config], None);
+
+        assert_eq!(
+            options.available_models[0].provider_name.as_deref(),
+            Some("openai")
+        );
+    }
+
+    #[test]
+    fn preserves_model_config_group_name_as_provider_name() {
+        let config = SessionConfigOption::select(
+            "model",
+            "Model",
+            "openai/gpt-5.4",
+            vec![
+                agent_client_protocol::schema::SessionConfigSelectGroup::new(
+                    "openai",
+                    "OpenAI",
+                    vec![
+                        agent_client_protocol::schema::SessionConfigSelectOption::new(
+                            "openai/gpt-5.4",
+                            "GPT 5.4",
+                        ),
+                    ],
+                ),
+            ],
+        )
+        .category(SessionConfigOptionCategory::Model);
+
+        let options = session_options_from_state(None, &[config], None);
+
+        assert_eq!(
+            options.available_models[0].provider_name.as_deref(),
+            Some("OpenAI")
+        );
     }
 
     #[test]
@@ -259,6 +465,50 @@ mod tests {
                 .as_ref()
                 .map(|cost| cost.currency.as_str()),
             Some("USD")
+        );
+    }
+
+    #[test]
+    fn exposes_select_and_boolean_session_config_options() {
+        let select = SessionConfigOption::select(
+            "fast-mode",
+            "Fast mode",
+            "off",
+            vec![
+                agent_client_protocol::schema::SessionConfigSelectOption::new("off", "Off"),
+                agent_client_protocol::schema::SessionConfigSelectOption::new("on", "On"),
+            ],
+        )
+        .description("1.5x speed, increased usage");
+        let boolean = SessionConfigOption::boolean("web-search", "Web search", true);
+
+        let options = session_options_from_state(None, &[select, boolean], None);
+
+        assert_eq!(options.config_options.len(), 2);
+        assert_eq!(options.config_options[0].id, "fast-mode");
+        assert_eq!(
+            options.config_options[0].kind,
+            AcpSessionConfigKind::Select {
+                current_value: "off".to_string(),
+                options: vec![
+                    AcpSessionConfigSelectOption {
+                        value: "off".to_string(),
+                        name: "Off".to_string(),
+                        description: None,
+                    },
+                    AcpSessionConfigSelectOption {
+                        value: "on".to_string(),
+                        name: "On".to_string(),
+                        description: None,
+                    },
+                ],
+            }
+        );
+        assert_eq!(
+            options.config_options[1].kind,
+            AcpSessionConfigKind::Boolean {
+                current_value: true,
+            }
         );
     }
 

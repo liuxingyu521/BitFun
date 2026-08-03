@@ -9,9 +9,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ChatInputWorkspaceStrip } from './ChatInputWorkspaceStrip';
 
 const mocks = vi.hoisted(() => ({
+  refreshBasic: vi.fn(async () => undefined),
   useGitState: vi.fn(() => ({
     currentBranch: 'main',
     isRepository: true,
+    refreshBasic: vi.fn(async () => undefined),
   })),
 }));
 
@@ -36,6 +38,12 @@ vi.mock('@/tools/git/hooks/useGitState', () => ({
   useGitState: mocks.useGitState,
 }));
 
+// The real picker pulls in account state, SSH dialogs and a lazy remote-connect
+// route. This suite only asserts whether the strip mounts it at all.
+vi.mock('@/features/dispatch/DispatchTargetPicker', () => ({
+  DispatchTargetPicker: () => <div data-testid="chat-input-dispatch-trigger" />,
+}));
+
 describe('ChatInputWorkspaceStrip git refresh behavior', () => {
   let container: HTMLDivElement;
   let root: Root;
@@ -48,6 +56,7 @@ describe('ChatInputWorkspaceStrip git refresh behavior', () => {
     mocks.useGitState.mockReturnValue({
       currentBranch: 'main',
       isRepository: true,
+      refreshBasic: mocks.refreshBasic,
     });
   });
 
@@ -96,5 +105,335 @@ describe('ChatInputWorkspaceStrip git refresh behavior', () => {
       refreshOnMount: true,
       refreshOnActive: false,
     }));
+  });
+
+  it('keeps an ask-mode permission entry visible and switches from its menu', async () => {
+    const onChange = vi.fn();
+    const onHide = vi.fn();
+    await act(async () => {
+      root.render(
+        <ChatInputWorkspaceStrip
+          repositoryPath=""
+          workspaceLabel=""
+          permissionControl={{ mode: 'ask', onChange, onHide }}
+        />
+      );
+    });
+
+    const trigger = container.querySelector<HTMLButtonElement>('[data-testid="chat-input-permission-trigger"]');
+    expect(trigger?.dataset.permissionMode).toBe('ask');
+    expect(trigger?.textContent).toContain('chatInput.permissionMode.ask.label');
+
+    await act(async () => {
+      trigger?.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    });
+    expect(container.querySelector('[data-testid="chat-input-permission-menu"]')).not.toBeNull();
+
+    await act(async () => {
+      container
+        .querySelector<HTMLButtonElement>('[data-testid="chat-input-permission-option-auto"]')
+        ?.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    });
+    expect(onChange).toHaveBeenCalledWith('auto');
+    expect(container.querySelector('[data-testid="chat-input-permission-menu"]')).toBeNull();
+
+    await act(async () => {
+      trigger?.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    });
+    await act(async () => {
+      container
+        .querySelector<HTMLButtonElement>('[data-testid="chat-input-permission-hide-control"]')
+        ?.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    });
+    expect(onHide).toHaveBeenCalledOnce();
+    expect(container.querySelector('[data-testid="chat-input-permission-menu"]')).toBeNull();
+  });
+
+  it('shows ACP ownership without exposing native permission choices', async () => {
+    await act(async () => {
+      root.render(
+        <ChatInputWorkspaceStrip
+          repositoryPath="D:/workspace/BitFun"
+          workspaceLabel="BitFun"
+          permissionControl={{ mode: 'acp' }}
+        />
+      );
+    });
+
+    const trigger = container.querySelector<HTMLButtonElement>('[data-testid="chat-input-permission-trigger"]');
+    expect(trigger?.disabled).toBe(true);
+    expect(trigger?.dataset.permissionMode).toBe('acp');
+    expect(container.querySelector('[data-testid="chat-input-permission-menu"]')).toBeNull();
+  });
+
+  it('reuses the permission control with dispatch-scoped choices', async () => {
+    const onChange = vi.fn();
+    await act(async () => {
+      root.render(
+        <ChatInputWorkspaceStrip
+          repositoryPath="/repo"
+          workspaceLabel="repo"
+          permissionControl={{
+            mode: 'reject',
+            options: ['ask', 'auto', 'reject'],
+            scopeLabel: 'This dispatched session',
+            onChange,
+          }}
+        />
+      );
+    });
+
+    const trigger = container.querySelector<HTMLButtonElement>(
+      '[data-testid="chat-input-permission-trigger"]',
+    );
+    expect(trigger?.dataset.permissionMode).toBe('reject');
+    await act(async () => {
+      trigger?.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    });
+    expect(container.textContent).toContain('This dispatched session');
+    expect(container.querySelector(
+      '[data-testid="chat-input-permission-option-full_access"]',
+    )).toBeNull();
+
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>(
+        '[data-testid="chat-input-permission-option-auto"]',
+      )?.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    });
+    expect(onChange).toHaveBeenCalledWith('auto');
+  });
+
+  it('offers the worktree toggle for a Git workspace and reports the new state', async () => {
+    const onChange = vi.fn(async () => undefined);
+    await act(async () => {
+      root.render(
+        <ChatInputWorkspaceStrip
+          repositoryPath="/repo"
+          workspaceLabel="repo"
+          worktreeControl={{ enabled: false, locked: false, onChange }}
+        />
+      );
+    });
+
+    const toggle = container.querySelector<HTMLButtonElement>('[data-testid="chat-input-worktree-toggle"]');
+    expect(toggle).not.toBeNull();
+    expect(toggle?.dataset.worktreeEnabled).toBe('false');
+    expect(toggle?.disabled).toBe(false);
+
+    await act(async () => {
+      toggle?.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    });
+    expect(onChange).toHaveBeenCalledWith(true);
+  });
+
+  it('updates repeated clicks optimistically without waiting for Git work', async () => {
+    const onChange = vi.fn();
+    await act(async () => {
+      root.render(
+        <ChatInputWorkspaceStrip
+          repositoryPath="/repo"
+          workspaceLabel="repo"
+          worktreeControl={{ enabled: false, locked: false, onChange }}
+        />
+      );
+    });
+
+    const toggle = container.querySelector<HTMLButtonElement>('[data-testid="chat-input-worktree-toggle"]');
+    act(() => {
+      toggle?.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+      toggle?.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    });
+
+    expect(onChange).toHaveBeenNthCalledWith(1, true);
+    expect(onChange).toHaveBeenNthCalledWith(2, false);
+  });
+
+  it('shows an armed worktree as checked before it is materialized', async () => {
+    await act(async () => {
+      root.render(
+        <ChatInputWorkspaceStrip
+          repositoryPath="/repo"
+          workspaceLabel="repo"
+          worktreeControl={{ enabled: true, locked: false, onChange: vi.fn() }}
+        />
+      );
+    });
+
+    const toggle = container.querySelector<HTMLButtonElement>('[data-testid="chat-input-worktree-toggle"]');
+    expect(toggle?.dataset.worktreeEnabled).toBe('true');
+    expect(toggle?.dataset.worktreeMaterialized).toBe('false');
+  });
+
+  it('shows the toggle as on inside a worktree and asks to turn it off', async () => {
+    const onChange = vi.fn(async () => undefined);
+    await act(async () => {
+      root.render(
+        <ChatInputWorkspaceStrip
+          repositoryPath="/worktrees/wt-1"
+          workspaceLabel="wt-1"
+          executionTarget={{
+            kind: 'managedWorktree',
+            worktreeId: 'wt-1',
+            rootPath: '/worktrees/wt-1',
+            baseCommit: '0123456789abcdef',
+            branch: 'bitfun/isolated',
+            lifecycle: 'managed',
+          }}
+          worktreeControl={{ enabled: true, locked: false, onChange }}
+        />
+      );
+    });
+
+    const toggle = container.querySelector<HTMLButtonElement>('[data-testid="chat-input-worktree-toggle"]');
+    expect(toggle?.dataset.worktreeEnabled).toBe('true');
+    expect(container.textContent).toContain('bitfun/isolated');
+
+    await act(async () => {
+      toggle?.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    });
+    expect(onChange).toHaveBeenCalledWith(false);
+  });
+
+  it('locks the toggle once the session has a transcript', async () => {
+    const onChange = vi.fn(async () => undefined);
+    await act(async () => {
+      root.render(
+        <ChatInputWorkspaceStrip
+          repositoryPath="/repo"
+          workspaceLabel="repo"
+          worktreeControl={{ enabled: false, locked: true, onChange }}
+        />
+      );
+    });
+
+    const toggle = container.querySelector<HTMLButtonElement>('[data-testid="chat-input-worktree-toggle"]');
+    expect(toggle?.disabled).toBe(true);
+
+    await act(async () => {
+      toggle?.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    });
+    expect(onChange).not.toHaveBeenCalled();
+  });
+
+  it('refetches Git state when the execution root moves into a worktree', async () => {
+    const onChange = vi.fn(async () => undefined);
+    await act(async () => {
+      root.render(
+        <ChatInputWorkspaceStrip
+          repositoryPath="/repo"
+          workspaceLabel="repo"
+          worktreeControl={{ enabled: false, locked: false, onChange }}
+        />
+      );
+    });
+    expect(mocks.refreshBasic).not.toHaveBeenCalled();
+
+    await act(async () => {
+      root.render(
+        <ChatInputWorkspaceStrip
+          repositoryPath="/worktrees/wt-1"
+          workspaceLabel="repo"
+          executionTarget={{
+            kind: 'managedWorktree',
+            worktreeId: 'wt-1',
+            rootPath: '/worktrees/wt-1',
+            lifecycle: 'managed',
+          }}
+          worktreeControl={{ enabled: true, locked: false, onChange }}
+        />
+      );
+    });
+
+    expect(mocks.refreshBasic).toHaveBeenCalled();
+  });
+
+  it('omits the toggle when the session cannot host a worktree', async () => {
+    await act(async () => {
+      root.render(
+        <ChatInputWorkspaceStrip
+          repositoryPath="/repo"
+          workspaceLabel="repo"
+        />
+      );
+    });
+
+    expect(container.querySelector('[data-testid="chat-input-worktree-toggle"]')).toBeNull();
+  });
+
+  it('shows the dispatch picker and the worktree toggle together in a Git workspace', async () => {
+    await act(async () => {
+      root.render(
+        <ChatInputWorkspaceStrip
+          repositoryPath="/repo"
+          workspaceLabel="repo"
+          worktreeControl={{ enabled: false, locked: false, onChange: vi.fn() }}
+          dispatchControl={{
+            target: { kind: 'local' },
+            locked: false,
+            onSelectTarget: vi.fn(),
+          }}
+        />
+      );
+    });
+
+    expect(container.querySelector('[data-testid="chat-input-worktree-toggle"]')).not.toBeNull();
+    expect(container.querySelector('[data-testid="chat-input-dispatch-trigger"]')).not.toBeNull();
+  });
+
+  it('shows the dispatched branch instead of the source branch once dispatch is locked', async () => {
+    await act(async () => {
+      root.render(
+        <ChatInputWorkspaceStrip
+          repositoryPath="/repo"
+          workspaceLabel="repo"
+          worktreeControl={{
+            enabled: true,
+            locked: true,
+            lockedReason: 'dispatch',
+            onChange: vi.fn(),
+          }}
+          dispatchControl={{
+            target: {
+              kind: 'ssh',
+              connectionId: 'ssh-1',
+              workspacePath: '',
+              displayName: 'build-host',
+            },
+            locked: true,
+            branch: 'bitfun/dispatch/job-1',
+            onSelectTarget: vi.fn(),
+          }}
+        />
+      );
+    });
+
+    expect(container.textContent).toContain('bitfun/dispatch/job-1');
+    expect(container.textContent).not.toContain('main');
+  });
+
+  it('hides the dispatch picker outside a Git workspace, like the worktree toggle', async () => {
+    mocks.useGitState.mockReturnValue({
+      currentBranch: '',
+      isRepository: false,
+      refreshBasic: mocks.refreshBasic,
+    });
+
+    await act(async () => {
+      root.render(
+        <ChatInputWorkspaceStrip
+          repositoryPath="/plain-folder"
+          workspaceLabel="plain-folder"
+          worktreeControl={{ enabled: false, locked: false, onChange: vi.fn() }}
+          dispatchControl={{
+            target: { kind: 'local' },
+            locked: false,
+            onSelectTarget: vi.fn(),
+          }}
+        />
+      );
+    });
+
+    expect(container.querySelector('[data-testid="chat-input-worktree-toggle"]')).toBeNull();
+    expect(container.querySelector('[data-testid="chat-input-dispatch-trigger"]')).toBeNull();
   });
 });

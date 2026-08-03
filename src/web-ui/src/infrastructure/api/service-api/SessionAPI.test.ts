@@ -48,6 +48,100 @@ describe('SessionAPI paged metadata reads', () => {
     });
   });
 
+  it('omits a local workspace host sentinel without a remote connection id', async () => {
+    const page = {
+      sessions: [],
+      totalTopLevelCount: 0,
+      loadedTopLevelCount: 0,
+      hasMore: false,
+    };
+    invokeMock.mockResolvedValueOnce(page);
+
+    await sessionAPI.listSessionsPage({
+      workspacePath: 'D:/repo',
+      limit: 5,
+      remoteSshHost: 'localhost',
+    });
+
+    expect(invokeMock).toHaveBeenCalledWith('list_persisted_sessions_page', {
+      request: {
+        workspace_path: 'D:/repo',
+        limit: 5,
+      },
+    });
+  });
+
+  it('preserves localhost when a remote connection id disambiguates the scope', async () => {
+    const page = {
+      sessions: [],
+      totalTopLevelCount: 0,
+      loadedTopLevelCount: 0,
+      hasMore: false,
+    };
+    invokeMock.mockResolvedValueOnce(page);
+
+    await sessionAPI.listSessionsPage({
+      workspacePath: '/srv/repo',
+      limit: 5,
+      remoteConnectionId: 'connection-1',
+      remoteSshHost: 'localhost',
+    });
+
+    expect(invokeMock).toHaveBeenCalledWith('list_persisted_sessions_page', {
+      request: {
+        workspace_path: '/srv/repo',
+        limit: 5,
+        remote_connection_id: 'connection-1',
+        remote_ssh_host: 'localhost',
+      },
+    });
+  });
+
+  it('preserves a legacy non-local host without a remote connection id', async () => {
+    const page = {
+      sessions: [],
+      totalTopLevelCount: 0,
+      loadedTopLevelCount: 0,
+      hasMore: false,
+    };
+    invokeMock.mockResolvedValueOnce(page);
+
+    await sessionAPI.listSessionsPage({
+      workspacePath: '/srv/repo',
+      limit: 5,
+      remoteSshHost: 'legacy.example',
+    });
+
+    expect(invokeMock).toHaveBeenCalledWith('list_persisted_sessions_page', {
+      request: {
+        workspace_path: '/srv/repo',
+        limit: 5,
+        remote_ssh_host: 'legacy.example',
+      },
+    });
+  });
+
+  it('loads the scoped hidden Session lineage without listing all internal Sessions', async () => {
+    const snapshot = { rootSessionId: 'root', sessions: [] };
+    invokeMock.mockResolvedValueOnce(snapshot);
+
+    await expect(sessionAPI.getSessionLineage({
+      sessionId: 'child',
+      workspacePath: '/repo',
+      remoteConnectionId: 'remote-1',
+      remoteSshHost: 'host',
+    })).resolves.toBe(snapshot);
+
+    expect(invokeMock).toHaveBeenCalledWith('get_session_lineage', {
+      request: {
+        session_id: 'child',
+        workspace_path: '/repo',
+        remote_connection_id: 'remote-1',
+        remote_ssh_host: 'host',
+      },
+    });
+  });
+
   it('requests usage reports with explicit hidden subagent scope', async () => {
     const report = {
       reportId: 'usage-report-1',

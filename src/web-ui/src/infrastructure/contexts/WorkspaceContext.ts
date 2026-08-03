@@ -38,6 +38,7 @@ export interface WorkspaceContextValue extends WorkspaceState {
     workspaceId: string,
     relatedPaths: WorkspaceInfo['relatedPaths']
   ) => Promise<WorkspaceInfo>;
+  renameWorkspace: (workspaceId: string, name: string) => Promise<WorkspaceInfo>;
   scanWorkspaceInfo: () => Promise<WorkspaceInfo | null>;
   refreshRecentWorkspaces: () => Promise<void>;
   removeWorkspaceFromRecent: (workspaceId: string) => Promise<void>;

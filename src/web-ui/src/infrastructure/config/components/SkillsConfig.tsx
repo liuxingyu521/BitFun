@@ -9,6 +9,11 @@ import { useNotification } from '@/shared/notification-system';
 import { isRemoteWorkspace } from '@/shared/types';
 import { configAPI } from '../../api/service-api/ConfigAPI';
 import type { SkillInfo, SkillLevel, SkillMarketItem, SkillValidationResult } from '../types';
+import {
+  buildSkillCoverageSourceMap,
+  canDeleteSkill,
+  getSkillSourceLabel,
+} from '../skillSourcePresentation';
 import { open } from '@tauri-apps/plugin-dialog';
 import { createLogger } from '@/shared/utils/logger';
 import './SkillsConfig.scss';
@@ -40,6 +45,10 @@ const SkillsConfig: React.FC = () => {
   const [marketError, setMarketError] = useState<string | null>(null);
   const [downloadingPackage, setDownloadingPackage] = useState<string | null>(null);
   const loadRequestIdRef = useRef(0);
+  const coverageSourceBySkillKey = useMemo(
+    () => buildSkillCoverageSourceMap(skills, t('list.item.unknownSource')),
+    [skills, t],
+  );
 
   const { workspace, workspacePath, hasWorkspace } = useCurrentWorkspace();
   const isRemote = isRemoteWorkspace(workspace);
@@ -138,7 +147,10 @@ const SkillsConfig: React.FC = () => {
 
   const confirmDelete = async () => {
     const skill = deleteConfirm.skill;
-    if (!skill) return;
+    if (!skill || !canDeleteSkill(skill)) {
+      setDeleteConfirm({ show: false, skill: null });
+      return;
+    }
     try {
       await configAPI.deleteSkill({
         skillKey: skill.key,
@@ -205,14 +217,14 @@ const SkillsConfig: React.FC = () => {
   const renderAddForm = (level: SkillLevel) => {
     if (!showAddForm || formLevel !== level) return null;
     return (
-      <div className="bitfun-collection-form">
+      <div className="bitfun-collection-form" data-bf-component="skills-config" data-bf-part="form">
         <div className="bitfun-collection-form__header">
           <h3>{t('form.title')}</h3>
           <IconButton variant="ghost" size="small" onClick={resetForm} tooltip={t('form.closeTooltip')}>
             <X size={14} />
           </IconButton>
         </div>
-        <div className="bitfun-collection-form__body">
+        <div className="bitfun-collection-form__body" data-bf-component="skills-config" data-bf-part="formBody">
           <Select
             label={t('form.level.label')}
             options={[
@@ -277,41 +289,81 @@ const SkillsConfig: React.FC = () => {
   };
 
   const renderSkillRow = (skill: SkillInfo) => {
+    const sourceLabel = getSkillSourceLabel(skill, t('list.item.unknownSource'));
+    const coverageSourceLabel = coverageSourceBySkillKey.get(skill.key);
     const badge = (
-      <span className="bitfun-collection-item__badge">
-        {skill.level === 'user' ? t('list.item.user') : t('list.item.project')}
-      </span>
-    );
-    const control = (
       <>
+        <span className="bitfun-collection-item__badge">
+          {isRemote
+            ? skill.level === 'user'
+              ? t('list.item.localUser')
+              : t('list.item.remoteProject')
+            : skill.level === 'user'
+              ? t('list.item.user')
+              : t('list.item.project')}
+        </span>
+        <span className="bitfun-collection-item__badge bitfun-skills-config__source-badge">
+          {sourceLabel}
+        </span>
+        {skill.isShadowed && (
+          <span
+            className="bitfun-collection-item__badge bitfun-skills-config__covered-badge"
+            title={t('list.item.shadowedTooltip', {
+              source: coverageSourceLabel ?? t('list.item.unknownSource'),
+            })}
+          >
+            {t('list.item.shadowed')}
+          </span>
+        )}
+      </>
+    );
+    const control = canDeleteSkill(skill) ? (
         <button
           type="button"
           className="bitfun-collection-btn bitfun-collection-btn--danger"
-          onClick={(e) => { e.stopPropagation(); setDeleteConfirm({ show: true, skill }); }}
+          onClick={() => setDeleteConfirm({ show: true, skill })}
           title={t('list.item.deleteTooltip')}
         >
           <Trash2 size={14} />
         </button>
-      </>
-    );
+    ) : null;
     const details = (
-      <>
+      <div data-bf-component="skills-config" data-bf-part="details">
         <div className="bitfun-collection-details__field">{skill.description}</div>
+        <div className="bitfun-collection-details__meta">
+          <span className="bitfun-collection-details__label">{t('list.item.sourceLabel')}</span>
+          <span>{sourceLabel}</span>
+        </div>
+        {skill.isShadowed && (
+          <div className="bitfun-collection-details__meta bitfun-skills-config__coverage-detail">
+            <span className="bitfun-collection-details__label">{t('list.item.shadowedLabel')}</span>
+            <span>
+              {t('list.item.shadowedDetail', {
+                source: coverageSourceLabel ?? t('list.item.unknownSource'),
+              })}
+            </span>
+          </div>
+        )}
         <div className="bitfun-collection-details__meta">
           <span className="bitfun-collection-details__label">{t('list.item.pathLabel')}</span>
           <code className="bitfun-skills-config__path-value">{skill.path}</code>
         </div>
-      </>
+      </div>
     );
     return (
       <ConfigCollectionItem
         key={skill.key}
         label={skill.name}
         badge={badge}
+        badgePlacement="below"
         control={control}
         details={details}
         expanded={expandedSkillIds.has(skill.key)}
         onToggle={() => toggleSkillExpanded(skill.key)}
+        className={skill.isShadowed ? 'bitfun-skills-config__item--covered' : undefined}
+        data-bf-component="skills-config"
+        data-bf-part="item"
+        data-bf-state={skill.isShadowed ? 'covered' : undefined}
       />
     );
   };
@@ -319,13 +371,16 @@ const SkillsConfig: React.FC = () => {
   const renderMarketList = () => {
     if (marketLoading) {
       return (
-        <div className="bitfun-skills-config__market-list" aria-busy="true" aria-label={t('market.loading')}>
+        <div className="bitfun-skills-config__market-list" aria-busy="true" aria-label={t('market.loading')} data-bf-component="skills-config" data-bf-part="marketList" data-bf-state="loading">
           {Array.from({ length: 5 }).map((_, index) => (
             <Card
               key={`market-loading-${index}`}
               variant="elevated"
               padding="none"
               className="bitfun-skills-config__market-item is-loading"
+              data-bf-component="skills-config"
+              data-bf-part="marketItem"
+              data-bf-state="loading"
             >
               <CardBody className="bitfun-skills-config__market-item-body">
                 <div className="bitfun-skills-config__market-skeleton-main">
@@ -343,19 +398,19 @@ const SkillsConfig: React.FC = () => {
     }
 
     if (marketError) {
-      return <div className="bitfun-skills-config__market-state bitfun-skills-config__market-state--error">{t('market.errorPrefix')}{marketError}</div>;
+      return <div className="bitfun-skills-config__market-state bitfun-skills-config__market-state--error" data-bf-component="skills-config" data-bf-part="marketState" data-bf-state="error">{t('market.errorPrefix')}{marketError}</div>;
     }
 
     if (marketSkills.length === 0) {
       return (
-        <div className="bitfun-skills-config__market-state">
+        <div className="bitfun-skills-config__market-state" data-bf-component="skills-config" data-bf-part="marketState">
           {marketKeyword.trim() ? t('market.empty.noMatch') : t('market.empty.noSkills')}
         </div>
       );
     }
 
     return (
-      <div className="bitfun-skills-config__market-list">
+      <div className="bitfun-skills-config__market-list" data-bf-component="skills-config" data-bf-part="marketList">
         {displayMarketSkills.map((skill) => {
           const isDownloading = downloadingPackage === skill.installId;
           const isInstalled = installedSkillNames.has(skill.name);
@@ -372,6 +427,9 @@ const SkillsConfig: React.FC = () => {
               variant="elevated"
               padding="none"
               className={`bitfun-skills-config__market-item${isInstalled ? ' is-installed' : ''}`}
+              data-bf-component="skills-config"
+              data-bf-part="marketItem"
+              data-bf-state={isInstalled ? 'installed' : undefined}
             >
               <CardBody className="bitfun-skills-config__market-item-body">
                 <div className="bitfun-skills-config__market-item-main">
@@ -541,10 +599,10 @@ const SkillsConfig: React.FC = () => {
 
   if (loading) {
     return (
-      <ConfigPageLayout className="bitfun-skills-config">
+      <ConfigPageLayout className="bitfun-skills-config" data-bf-component="skills-config" data-bf-part="root" data-bf-state="loading">
         <ConfigPageHeader title={t('title')} subtitle={t('subtitle')} />
-        <ConfigPageContent>
-          <div className="bitfun-collection-empty"><p>{t('list.loading')}</p></div>
+        <ConfigPageContent data-bf-component="skills-config" data-bf-part="content">
+          <div className="bitfun-collection-empty" data-bf-component="skills-config" data-bf-part="loading" data-bf-state="loading"><p>{t('list.loading')}</p></div>
         </ConfigPageContent>
       </ConfigPageLayout>
     );
@@ -552,10 +610,10 @@ const SkillsConfig: React.FC = () => {
 
   if (error) {
     return (
-      <ConfigPageLayout className="bitfun-skills-config">
+      <ConfigPageLayout className="bitfun-skills-config" data-bf-component="skills-config" data-bf-part="root" data-bf-state="error">
         <ConfigPageHeader title={t('title')} subtitle={t('subtitle')} />
-        <ConfigPageContent>
-          <div className="bitfun-collection-empty"><p>{t('list.errorPrefix')}{error}</p></div>
+        <ConfigPageContent data-bf-component="skills-config" data-bf-part="content">
+          <div className="bitfun-collection-empty" data-bf-component="skills-config" data-bf-part="error" data-bf-state="error"><p>{t('list.errorPrefix')}{error}</p></div>
         </ConfigPageContent>
       </ConfigPageLayout>
     );
@@ -565,10 +623,10 @@ const SkillsConfig: React.FC = () => {
   const projectSkills = skills.filter(s => s.level === 'project');
 
   return (
-    <ConfigPageLayout className="bitfun-skills-config">
+    <ConfigPageLayout className="bitfun-skills-config" data-bf-component="skills-config" data-bf-part="root">
       <ConfigPageHeader title={t('title')} subtitle={t('subtitle')} />
 
-      <ConfigPageContent>
+      <ConfigPageContent data-bf-component="skills-config" data-bf-part="content">
         <ConfigPageSection
           title={t('market.title')}
           description={t('market.subtitle')}
@@ -583,7 +641,7 @@ const SkillsConfig: React.FC = () => {
             </IconButton>
           )}
         >
-          <div className="bitfun-skills-config__market-toolbar">
+          <div className="bitfun-skills-config__market-toolbar" data-bf-component="skills-config" data-bf-part="marketToolbar">
             <Search
               placeholder={t('market.searchPlaceholder')}
               value={marketKeyword}
@@ -604,7 +662,7 @@ const SkillsConfig: React.FC = () => {
         >
           {renderAddForm('user')}
           {userSkills.length === 0 && !(showAddForm && formLevel === 'user') ? (
-            <div className="bitfun-collection-empty">
+            <div className="bitfun-collection-empty" data-bf-component="skills-config" data-bf-part="empty">
               <Button variant="dashed" size="small" onClick={() => { setFormLevel('user'); setShowAddForm(true); }}>
                 <Plus size={14} />
                 {t('toolbar.addTooltip')}
@@ -620,7 +678,7 @@ const SkillsConfig: React.FC = () => {
         >
           {renderAddForm('project')}
           {projectSkills.length === 0 && !(showAddForm && formLevel === 'project') ? (
-            <div className="bitfun-collection-empty">
+            <div className="bitfun-collection-empty" data-bf-component="skills-config" data-bf-part="empty">
               {!hasWorkspace && <p>{t('messages.noWorkspace')}</p>}
               {hasWorkspace && (
                 <Button variant="dashed" size="small" onClick={() => { setFormLevel('project'); setShowAddForm(true); }}>
@@ -641,7 +699,7 @@ const SkillsConfig: React.FC = () => {
         message={
           <>
             <p>{t('deleteModal.message', { name: deleteConfirm.skill?.name })}</p>
-            <p style={{ marginTop: '8px', color: 'var(--color-warning)' }}>{t('deleteModal.warning')}</p>
+            <p style={{ marginTop: '8px', color: 'var(--bf-appearance-token-color-warning)' }}>{t('deleteModal.warning')}</p>
           </>
         }
         type="warning"

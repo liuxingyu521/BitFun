@@ -33,7 +33,8 @@ SessionManager -> Session -> DialogTurn -> ModelRound
   `tauri::AppHandle`; use shared abstractions such as
   `bitfun_events::EventEmitter`.
 - Desktop-only host adapters belong in `src/apps/desktop`, then flow through
-  transport/API layers.
+  typed capability interfaces; use the production transport adapter when event
+  delivery is needed.
 - Do not add new cross-layer references from `service` to `agentic` without a
   narrow port/interface boundary.
 - Do not move platform-specific logic, build-script behavior, product capability
@@ -62,18 +63,37 @@ SessionManager -> Session -> DialogTurn -> ModelRound
   owner design says otherwise.
 - `plugin_source` may inject product-owned paths and keep compatibility exports;
   concrete managed-package discovery and trust persistence stay in
-  `services-integrations`, while ecosystem parsing and Plugin Runtime Host
+  `services-integrations`, while ecosystem parsing and PluginRuntimeClient
   behavior remain in their adapter and execution owners.
-- `plugin_runtime` is the only product-full composition file allowed to select
-  an ecosystem adapter and inject it into Plugin Runtime Host. Product surfaces
-  consume its product-level activation view and must not import adapter or Host
-  ABI types.
+- `plugin_runtime`, `external_sources`, and `instruction_sources` are the reviewed product-full
+  composition files allowed to select ecosystem adapters for their respective
+  capability contracts. Product surfaces consume product-level views and must
+  not import adapter or raw plugin runtime client types.
+- External-source Desktop, TUI, Peer, and Server surfaces share the versioned
+  product-domain control DTO and closed generic actions. Capability-specific
+  approvals and conflict choices remain typed owner operations; do not add a
+  second surface-specific lifecycle model or arbitrary control payload.
 - Remote/service changes must keep external protocol lifecycle, workspace
   projection, scheduler/session restore, terminal pre-warm, and product
   execution boundaries explicit.
 - Feature work must keep `product-full` as the compatibility product assembly
   boundary unless a separate product matrix review changes default capability
   selection.
+- Keep the light compatibility features independently compilable. Local service
+  profiles are `dispatch-store`, `lsp`, `terminal`, `workspace-runtime`, and
+  `workspace-watch`; `remote-workspace` adds only the remote workspace facade,
+  while `ssh-remote` adds concrete SSH transport. Integration facades
+  `announcement`, `file-watch`, `git`, and `review-platform` remain independent,
+  with `service-integrations` only their compatibility aggregate. None of these
+  narrow features may enable `product-full` directly or transitively.
+- `product-full` must explicitly compose every capability it consumes, including
+  product-only `services-core` features such as `permission`, `session-git`, and
+  `runtime-ownership`. Do not put those features on the dependency declaration,
+  because Cargo feature union would force them into every core consumer.
+- Keep `cargo check -p bitfun-core --no-default-features` viable. Gate
+  product-only modules at their owner feature; if a light facade operation
+  cannot safely complete without a product owner, fail closed and preserve any
+  durable recovery state instead of enabling `product-full` implicitly.
 
 ## Owner References
 
@@ -93,8 +113,8 @@ Use these files for ownership details instead of expanding this guide:
 Narrower local guides already exist for some subtrees:
 
 - `src/crates/adapters/ai-adapters/AGENTS.md`
-- `src/agentic/execution/AGENTS.md`
-- `src/agentic/deep_review/AGENTS.md`
+- `src/crates/assembly/core/src/agentic/execution/AGENTS.md`
+- `src/crates/assembly/core/src/agentic/deep_review/AGENTS.md`
 
 ## Verification
 
@@ -102,7 +122,11 @@ Use the smallest check that matches the touched behavior:
 
 ```bash
 cargo check --workspace
-cargo test -p bitfun-core <test_name> -- --nocapture
+cargo check -p bitfun-core --no-default-features
+cargo check -p bitfun-core --no-default-features --features workspace-runtime
+cargo check -p bitfun-core --no-default-features --features remote-workspace
+cargo check -p bitfun-core --no-default-features --features ssh-remote
+cargo test -p bitfun-core --lib <test_name> -- --nocapture
 node scripts/check-core-boundaries.mjs
 ```
 

@@ -1,4 +1,47 @@
 {
   "title": "Appearance",
-  "subtitle": "Interface language, theme, and global font size"
+  "subtitle": "Interface language, appearance packages, and global font size",
+  "effects": {
+    "title": "Visual effects",
+    "hint": "Control visual feedback across the interface.",
+    "mouseGlow": {
+      "label": "Pointer-follow glow",
+      "description": "Show a soft spotlight that follows the pointer along card edges. It pauses automatically when reduced motion is enabled."
+    }
+  },
+  "package": {
+    "title": "Appearance packages",
+    "description": "Import declarative BitFun appearance packages stored on this device.",
+    "import": "Import package",
+    "importSuccess": "Imported {{name}}",
+    "importFailed": "Could not import the appearance package. Review the issue details.",
+    "activateFailed": "Could not apply the appearance package. Review the issue details.",
+    "export": "Export package",
+    "exportFailed": "Could not export appearance package: {{error}}",
+    "delete": "Delete package",
+    "deleteTitle": "Delete appearance package?",
+    "deleteMessage": "Delete {{name}} from this device?",
+    "deleteSuccess": "Deleted {{name}}",
+    "deleteFailed": "Could not delete appearance package: {{error}}",
+    "nativeName": "BitFun default",
+    "nativeDescription": "Use the selected built-in appearance.",
+    "unknownAuthor": "Unknown author",
+    "empty": "No imported appearance packages yet.",
+    "diagnostics": {
+      "validationTitle": "Appearance package is incompatible with this version",
+      "importTitle": "Appearance package import failed",
+      "activateTitle": "Appearance package activation failed",
+      "validationHint": "Found {{count}} issues. Regenerate the package using the current appearance contract.",
+      "importSummary": "The appearance package has {{count}} contract issues. Review the details.",
+      "activateSummary": "The appearance package has {{count}} contract issues. Review the details.",
+      "componentGroup": "Component: {{id}}",
+      "sceneGroup": "Scene: {{id}}",
+      "sectionGroup": "Configuration: {{id}}",
+      "unknownComponent": "This component is not registered in the current version.",
+      "unknownScene": "This scene is not registered in the current version.",
+      "unknownPart": "Part \"{{part}}\" does not exist in the current version.",
+      "allowedParts": "Show currently available parts",
+      "dismiss": "Dismiss issue details"
+    }
+  }
 }

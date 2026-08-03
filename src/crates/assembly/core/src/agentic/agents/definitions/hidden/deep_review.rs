@@ -16,7 +16,7 @@ impl Default for DeepReviewAgent {
 impl DeepReviewAgent {
     pub fn new() -> Self {
         let mut tool_exposure_overrides = AgentToolPolicyOverrides::default();
-        tool_exposure_overrides.insert("GetFileDiff".to_string(), ToolExposure::Expanded);
+        tool_exposure_overrides.insert("GetFileDiff".to_string(), ToolExposure::Direct);
 
         Self {
             default_tools: vec![
@@ -48,7 +48,7 @@ impl Agent for DeepReviewAgent {
     }
 
     fn description(&self) -> &str {
-        r#"Read-only strict reviewer for substantial changes. It reviews the prepared target directly, may request one focused specialist or conditional quality check, and submits an evidence-backed report. A separate ReviewFixer owns approved remediation."#
+        r#"Read-only strict reviewer for substantial changes. It reviews the prepared target directly, may spend its bounded shared allowance on focused checks or a conditional quality check, and submits one evidence-backed report. A separate ReviewFixer owns approved remediation."#
     }
 
     fn prompt_template_name(&self, _model_name: Option<&str>) -> &str {
@@ -89,7 +89,7 @@ mod tests {
         assert!(!tools.contains(&"Task".to_string()));
         assert_eq!(
             agent.tool_exposure_overrides().get("GetFileDiff"),
-            Some(&ToolExposure::Expanded),
+            Some(&ToolExposure::Direct),
         );
         assert!(tools.contains(&"submit_code_review".to_string()));
         assert!(!tools.contains(&"AskUserQuestion".to_string()));

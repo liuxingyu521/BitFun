@@ -9,33 +9,27 @@
 
 import React, { useMemo, useState, useCallback, useEffect, useLayoutEffect, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Copy, Check } from 'lucide-react';
-import type { ModelRound, ModelRoundAttempt, FlowItem, FlowTextItem, FlowToolItem, FlowThinkingItem, TokenUsage, ToolRejectOptions } from '../../types/flow-chat';
+import { Copy, Check, CircleAlert } from 'lucide-react';
+import type { ModelRound, ModelRoundAttempt, ModelRoundAttemptDiagnostic, FlowItem, FlowTextItem, FlowToolItem, FlowThinkingItem, TokenUsage, ToolRejectOptions } from '../../types/flow-chat';
 import { useI18n } from '@/infrastructure/i18n';
 import { FlowTextBlock } from '../FlowTextBlock';
 import { FlowToolCard } from '../FlowToolCard';
 import { ModelThinkingDisplay } from '../../tool-cards/ModelThinkingDisplay';
+import { TypewriterRevealGateProvider } from '../../hooks/TypewriterRevealGate';
+import { useCreateTypewriterRevealGate } from '../../hooks/typewriterRevealGateContext';
+import { getModelRoundItemClassName } from './modelRoundItemClassName';
 import { isCollapsibleTool } from '../../tool-cards/toolCardMetadata';
 import { useFlowChatContext } from './FlowChatContext';
-import { FlowChatStore } from '../../store/FlowChatStore';
 import { taskCollapseStateManager } from '../../store/TaskCollapseStateManager';
+import { getEffectiveToolName } from '../../utils/toolInvocationIdentity';
 import { ExportImageButton } from './ExportImageButton';
 import { ForkSessionButton } from './ForkSessionButton';
 import {
   buildModelRoundItemGroups,
-  COMPLETED_TOOL_TRANSIENT_MS,
-  isCompletedToolInTransientWindow,
   type ModelRoundItemGroup,
 } from './modelRoundItemGrouping';
-import {
-  MODEL_ROUND_GROUP_RENDER_CHUNK_DELAY_MS,
-  getInitialModelRoundGroupRenderCount,
-  getNextModelRoundGroupRenderCount,
-  getSynchronizedModelRoundGroupRenderCount,
-  getVisibleModelRoundGroupEndIndex,
-  getVisibleModelRoundGroupStartIndex,
-} from './modelRoundProgressiveRender';
 import { Tooltip } from '@/component-library';
+import { notificationService } from '@/shared/notification-system';
 import { createLogger } from '@/shared/utils/logger';
 import {
   isStartupRenderTraceEnabled,
@@ -43,8 +37,10 @@ import {
   startupTrace,
 } from '@/shared/utils/startupTrace';
 import { SubagentProjectionView } from '../subagent/SubagentProjectionView';
-import { formatSessionViewPreviewText } from '../../utils/sessionViewPreview';
 import { buildModelRoundUsageMeta } from '../../utils/tokenUsageDisplay';
+import { buildDialogTurnCopyText } from '../../utils/dialogTurnCopy';
+import type { TranscriptExportScope } from '../../utils/dialogTranscriptExport';
+import { buildTranscriptExportLabels } from '../../utils/transcriptExportLabels';
 import './ModelRoundItem.scss';
 import './SubagentItems.scss';
 
@@ -92,11 +88,7 @@ interface ModelRoundRenderTraceProps {
   round: ModelRound;
   itemCount: number;
   groupCount: number;
-  renderedCount: number;
-  visibleGroupStartIndex: number;
-  visibleGroupEndIndex: number;
-  allGroupSummary: ModelRoundGroupSummary;
-  visibleGroupSummary: ModelRoundGroupSummary;
+  groupSummary: ModelRoundGroupSummary;
 }
 
 const ModelRoundRenderTrace: React.FC<ModelRoundRenderTraceProps> = ({
@@ -105,11 +97,7 @@ const ModelRoundRenderTrace: React.FC<ModelRoundRenderTraceProps> = ({
   round,
   itemCount,
   groupCount,
-  renderedCount,
-  visibleGroupStartIndex,
-  visibleGroupEndIndex,
-  allGroupSummary,
-  visibleGroupSummary,
+  groupSummary,
 }) => {
   useLayoutEffect(() => {
     recordReactRenderProfile(startupTrace, {
@@ -120,15 +108,10 @@ const ModelRoundRenderTrace: React.FC<ModelRoundRenderTraceProps> = ({
       roundId: round.id,
       itemCount,
       groupCount,
-      renderedCount,
-      visibleGroupStartIndex,
-      visibleGroupEndIndex,
-      textItemCount: allGroupSummary.textItemCount,
-      toolItemCount: allGroupSummary.toolItemCount,
-      visibleTextItemCount: visibleGroupSummary.textItemCount,
-      visibleToolItemCount: visibleGroupSummary.toolItemCount,
-      criticalGroupCount: allGroupSummary.criticalGroupCount,
-      exploreGroupCount: allGroupSummary.exploreGroupCount,
+      textItemCount: groupSummary.textItemCount,
+      toolItemCount: groupSummary.toolItemCount,
+      criticalGroupCount: groupSummary.criticalGroupCount,
+      exploreGroupCount: groupSummary.exploreGroupCount,
       isStreaming: round.isStreaming,
     });
   });
@@ -150,6 +133,143 @@ interface ModelRoundItemProps {
 function sortRoundAttempts(attempts: ModelRoundAttempt[]): ModelRoundAttempt[] {
   return [...attempts].sort((left, right) => left.index - right.index);
 }
+
+function attemptDiagnosticCategoryLabel(
+  diagnostic: ModelRoundAttemptDiagnostic,
+  t: (key: string, options?: Record<string, unknown>) => string,
+): string {
+  switch (diagnostic.category) {
+    case 'transient_request_error':
+      return t('modelRound.attemptDiagnostics.categories.transientRequestError');
+    case 'interrupted_tool_arguments':
+      return t('modelRound.attemptDiagnostics.categories.interruptedToolArguments');
+    case 'partial_stream_error':
+      return t('modelRound.attemptDiagnostics.categories.partialStreamError');
+    case 'invalid_tool_arguments':
+      return t('modelRound.attemptDiagnostics.categories.invalidToolArguments');
+    case 'no_effective_output':
+      return t('modelRound.attemptDiagnostics.categories.noEffectiveOutput');
+    case 'transient_stream_error':
+      return t('modelRound.attemptDiagnostics.categories.transientStreamError');
+    default:
+      return t('modelRound.attemptDiagnostics.categories.unknown', { category: diagnostic.category });
+  }
+}
+
+const AttemptDiagnosticDetails: React.FC<{ diagnostic: ModelRoundAttemptDiagnostic }> = ({ diagnostic }) => {
+  const { t } = useTranslation('flow-chat');
+  const [isOpen, setIsOpen] = useState(false);
+  const [copiedValue, setCopiedValue] = useState<string | null>(null);
+
+  const copyValue = useCallback(async (value: string, valueKey: string) => {
+    try {
+      await navigator.clipboard.writeText(value);
+      setCopiedValue(valueKey);
+      window.setTimeout(() => setCopiedValue(current => current === valueKey ? null : current), 2000);
+    } catch (error) {
+      log.error('Failed to copy attempt diagnostic value', error);
+    }
+  }, []);
+
+  const renderCopyButton = (value: string, valueKey: string) => (
+    <Tooltip content={copiedValue === valueKey ? t('modelRound.attemptDiagnostics.copied') : t('modelRound.attemptDiagnostics.copy')} placement="top">
+      <button
+        type="button"
+        className="model-round-item__attempt-diagnostic-copy"
+        data-bf-component="model-round-item"
+        data-bf-part="action"
+        data-bf-state={copiedValue === valueKey ? 'copied' : undefined}
+        onClick={() => void copyValue(value, valueKey)}
+        aria-label={t('modelRound.attemptDiagnostics.copy')}
+      >
+        {copiedValue === valueKey ? <Check size={13} /> : <Copy size={13} />}
+      </button>
+    </Tooltip>
+  );
+
+  const detailsId = `attempt-diagnostic-${diagnostic.attemptId}`;
+
+  return (
+    <>
+      <Tooltip content={isOpen ? t('modelRound.attemptDiagnostics.hide') : t('modelRound.attemptDiagnostics.show')} placement="top">
+        <button
+          type="button"
+          className="model-round-item__attempt-diagnostic-toggle"
+          data-bf-component="model-round-item"
+          data-bf-part="diagnosticToggle"
+          data-bf-state={isOpen ? 'expanded' : undefined}
+          onClick={() => setIsOpen(current => !current)}
+          aria-expanded={isOpen}
+          aria-controls={detailsId}
+          aria-label={isOpen ? t('modelRound.attemptDiagnostics.hide') : t('modelRound.attemptDiagnostics.show')}
+        >
+          <CircleAlert size={13} aria-hidden="true" />
+        </button>
+      </Tooltip>
+
+      {isOpen && (
+        <div
+          id={detailsId}
+          className="model-round-item__attempt-diagnostic-details"
+          data-bf-component="model-round-item"
+          data-bf-part="diagnosticDetails"
+        >
+          <div
+            className="model-round-item__attempt-diagnostic-category"
+            data-bf-component="model-round-item"
+            data-bf-part="diagnosticSection"
+          >
+            {attemptDiagnosticCategoryLabel(diagnostic, t)}
+          </div>
+
+          {diagnostic.rawError && (
+            <div className="model-round-item__attempt-diagnostic-section" data-bf-component="model-round-item" data-bf-part="diagnosticSection">
+              <div className="model-round-item__attempt-diagnostic-section-header">
+                <span>{t('modelRound.attemptDiagnostics.providerError')}</span>
+                {renderCopyButton(diagnostic.rawError, 'raw-error')}
+              </div>
+              <pre>{diagnostic.rawError}</pre>
+            </div>
+          )}
+
+          {(diagnostic.toolCalls ?? []).map((toolCall, index) => {
+            const toolLabel = toolCall.toolName || toolCall.toolId || t('modelRound.attemptDiagnostics.unknownTool');
+            return (
+              <div
+                key={`${toolCall.toolId ?? toolCall.toolName ?? 'tool'}:${index}`}
+                className="model-round-item__attempt-diagnostic-section"
+                data-bf-component="model-round-item"
+                data-bf-part="diagnosticSection"
+              >
+                <div className="model-round-item__attempt-diagnostic-tool-title">
+                  {t('modelRound.attemptDiagnostics.toolArguments', { name: toolLabel })}
+                </div>
+                {toolCall.rawArguments && (
+                  <>
+                    <div className="model-round-item__attempt-diagnostic-section-header">
+                      <span>{t('modelRound.attemptDiagnostics.rawArguments')}</span>
+                      {renderCopyButton(toolCall.rawArguments, `raw-arguments:${index}`)}
+                    </div>
+                    <pre>{toolCall.rawArguments}</pre>
+                  </>
+                )}
+                {toolCall.validationError && (
+                  <>
+                    <div className="model-round-item__attempt-diagnostic-section-header">
+                      <span>{t('modelRound.attemptDiagnostics.validationError')}</span>
+                      {renderCopyButton(toolCall.validationError, `validation-error:${index}`)}
+                    </div>
+                    <pre>{toolCall.validationError}</pre>
+                  </>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </>
+  );
+};
 
 function useTaskCollapsed(toolId: string): boolean {
   const [isCollapsed, setIsCollapsed] = useState(() =>
@@ -179,8 +299,6 @@ interface TaskWithSubagentWrapperProps {
   directSubagentDialogTurnId?: string;
   turnId: string;
   roundId?: string;
-  completedToolExitNowMs: number;
-  allowCompletedToolExit?: boolean;
 }
 
 const TaskWithSubagentWrapper: React.FC<TaskWithSubagentWrapperProps> = React.memo(({
@@ -191,8 +309,6 @@ const TaskWithSubagentWrapper: React.FC<TaskWithSubagentWrapperProps> = React.me
   directSubagentDialogTurnId,
   turnId,
   roundId,
-  completedToolExitNowMs,
-  allowCompletedToolExit = false,
 }) => {
   const isCollapsed = useTaskCollapsed(parentTaskToolId);
   const isTaskRunning =
@@ -208,14 +324,17 @@ const TaskWithSubagentWrapper: React.FC<TaskWithSubagentWrapperProps> = React.me
   ].filter(Boolean).join(' ');
 
   return (
-    <div className={className}>
+    <div
+      className={className}
+      data-bf-component="model-round-item"
+      data-bf-part="subagent"
+      data-bf-state={!isCollapsed ? 'expanded' : undefined}
+    >
       <FlowItemRenderer
         item={taskItem}
         turnId={turnId}
         roundId={roundId}
         isLastItem={false}
-        completedToolExitNowMs={completedToolExitNowMs}
-        allowCompletedToolExit={allowCompletedToolExit}
       />
       <SubagentProjectionView
         parentTaskToolId={parentTaskToolId}
@@ -243,43 +362,64 @@ export const ModelRoundItem = React.memo<ModelRoundItemProps>(
   }) => {
     const { t } = useTranslation('flow-chat');
     const { formatDate, formatNumber } = useI18n('flow-chat');
-    const { sessionId } = useFlowChatContext();
+    const { sessionId, allowTranscriptExport = true } = useFlowChatContext();
+    const typewriterRevealGate = useCreateTypewriterRevealGate();
     const [copied, setCopied] = useState(false);
     const [showRetryHistory, setShowRetryHistory] = useState(false);
     const [showRoundHistory, setShowRoundHistory] = useState(false);
     const [openHistoryRoundAttemptIds, setOpenHistoryRoundAttemptIds] = useState<Record<string, boolean>>({});
+    const [isCopyMenuOpen, setIsCopyMenuOpen] = useState(false);
     const copyButtonRef = useRef<HTMLButtonElement>(null);
+    const copyMenuRef = useRef<HTMLDivElement>(null);
     const renderTraceEnabled = isStartupRenderTraceEnabled();
     const renderTraceStartedAtMs = renderTraceEnabled ? performance.now() : null;
-    
+
     useEffect(() => {
-      if (!copied) return;
-      
+      if (!copied && !isCopyMenuOpen) return;
+
       const handleClickOutside = (event: MouseEvent) => {
-        if (copyButtonRef.current && !copyButtonRef.current.contains(event.target as Node)) {
-          setCopied(false);
+        const target = event.target as Node;
+        if (copyButtonRef.current?.contains(target) || copyMenuRef.current?.contains(target)) {
+          return;
         }
+        setCopied(false);
+        setIsCopyMenuOpen(false);
       };
-      
+
       document.addEventListener('mousedown', handleClickOutside);
       return () => {
         document.removeEventListener('mousedown', handleClickOutside);
       };
-    }, [copied]);
+    }, [copied, isCopyMenuOpen]);
+
+    useEffect(() => {
+      if (!isCopyMenuOpen) return;
+
+      const handleKeyDown = (event: KeyboardEvent) => {
+        if (event.key === 'Escape') {
+          setIsCopyMenuOpen(false);
+        }
+      };
+
+      document.addEventListener('keydown', handleKeyDown);
+      return () => {
+        document.removeEventListener('keydown', handleKeyDown);
+      };
+    }, [isCopyMenuOpen]);
 
     const attempts = useMemo(
       () => sortRoundAttempts(round.attempts ?? []),
       [round.attempts]
     );
-    const olderAttempts = attempts.length > 1 ? attempts.slice(0, -1) : [];
-    const latestAttempt = attempts.length > 0 ? attempts[attempts.length - 1] : undefined;
+    const activeAttempt = [...attempts].reverse().find(attempt => !attempt.diagnostic);
+    const historicalAttempts = attempts.filter(attempt => attempt !== activeAttempt);
     const historyRounds = round.historyRounds ?? [];
 
     useEffect(() => {
-      if (olderAttempts.length === 0 && showRetryHistory) {
+      if (historicalAttempts.length === 0 && showRetryHistory) {
         setShowRetryHistory(false);
       }
-    }, [olderAttempts.length, showRetryHistory]);
+    }, [historicalAttempts.length, showRetryHistory]);
 
     useEffect(() => {
       if (historyRounds.length === 0 && showRoundHistory) {
@@ -296,35 +436,9 @@ export const ModelRoundItem = React.memo<ModelRoundItemProps>(
 
     // Keep the recorded round order; FlowChatStore already applies immutable updates.
     const sortedItems = useMemo(
-      () => latestAttempt?.items ?? round.items,
-      [latestAttempt?.items, round.items]
+      () => activeAttempt?.items ?? (attempts.length === 0 ? round.items : []),
+      [activeAttempt?.items, attempts.length, round.items]
     );
-    
-    const latestCompletedToolEndTime = useMemo(() => {
-      return sortedItems.reduce((latest, item) => {
-        if (item.type !== 'tool' || item.status !== 'completed') return latest;
-        const endTime = (item as FlowToolItem).endTime;
-        return typeof endTime === 'number' ? Math.max(latest, endTime) : latest;
-      }, 0);
-    }, [sortedItems]);
-    const [transientNowMs, setTransientNowMs] = useState(() => Date.now());
-
-    useEffect(() => {
-      if (latestCompletedToolEndTime <= 0) return;
-
-      const remainingMs = latestCompletedToolEndTime + COMPLETED_TOOL_TRANSIENT_MS - Date.now();
-      if (remainingMs <= 0) {
-        setTransientNowMs(Date.now());
-        return;
-      }
-
-      setTransientNowMs(Date.now());
-      const timeoutId = window.setTimeout(() => {
-        setTransientNowMs(Date.now());
-      }, remainingMs);
-
-      return () => window.clearTimeout(timeoutId);
-    }, [latestCompletedToolEndTime]);
 
     // Group items in two passes:
     // 1) group subagent items
@@ -335,93 +449,13 @@ export const ModelRoundItem = React.memo<ModelRoundItemProps>(
         isStreaming: round.isStreaming,
         disableExploreGrouping: round.renderHints?.disableExploreGrouping === true,
         isCollapsibleTool,
-        nowMs: transientNowMs,
       });
-    }, [round.isStreaming, round.renderHints?.disableExploreGrouping, sortedItems, transientNowMs]);
+    }, [round.isStreaming, round.renderHints?.disableExploreGrouping, sortedItems]);
 
-    const initialGroupRenderCount = useMemo(() => (
-      getInitialModelRoundGroupRenderCount({
-        groupCount: groupedItems.length,
-        isStreaming: round.isStreaming,
-      })
-    ), [groupedItems.length, round.isStreaming]);
-
-    const [renderedGroupState, setRenderedGroupState] = useState(() => ({
-      roundId: round.id,
-      count: initialGroupRenderCount,
-    }));
-
-    useEffect(() => {
-      setRenderedGroupState((current) => {
-        if (current.roundId !== round.id) {
-          return { roundId: round.id, count: initialGroupRenderCount };
-        }
-
-        const nextCount = getSynchronizedModelRoundGroupRenderCount({
-          currentCount: current.count,
-          groupCount: groupedItems.length,
-          initialCount: initialGroupRenderCount,
-          isStreaming: round.isStreaming,
-        });
-
-        return current.count === nextCount
-          ? current
-          : { roundId: round.id, count: nextCount };
-      });
-    }, [groupedItems.length, initialGroupRenderCount, round.id, round.isStreaming]);
-
-    const renderedGroupCount = renderedGroupState.roundId === round.id
-      ? renderedGroupState.count
-      : initialGroupRenderCount;
-
-    useEffect(() => {
-      if (round.isStreaming || renderedGroupCount >= groupedItems.length) {
-        return;
-      }
-
-      const timeoutId = window.setTimeout(() => {
-        setRenderedGroupState((current) => {
-          if (current.roundId !== round.id) {
-            return current;
-          }
-
-          return {
-            roundId: round.id,
-            count: getNextModelRoundGroupRenderCount({
-              currentCount: current.count,
-              groupCount: groupedItems.length,
-            }),
-          };
-        });
-      }, MODEL_ROUND_GROUP_RENDER_CHUNK_DELAY_MS);
-
-      return () => window.clearTimeout(timeoutId);
-    }, [groupedItems.length, renderedGroupCount, round.id, round.isStreaming]);
-
-    const visibleGroupStartIndex = getVisibleModelRoundGroupStartIndex({
-      renderedCount: renderedGroupCount,
-      groupCount: groupedItems.length,
-      isStreaming: round.isStreaming,
-    });
-    const visibleGroupEndIndex = getVisibleModelRoundGroupEndIndex({
-      renderedCount: renderedGroupCount,
-      groupCount: groupedItems.length,
-      startIndex: visibleGroupStartIndex,
-    });
-    const visibleGroupedItems = useMemo(
-      () => groupedItems.slice(visibleGroupStartIndex, visibleGroupEndIndex),
-      [groupedItems, visibleGroupEndIndex, visibleGroupStartIndex],
-    );
-    const allGroupSummary = useMemo(
+    const groupSummary = useMemo(
       () => renderTraceEnabled ? summarizeModelRoundItemGroups(groupedItems) : null,
       [groupedItems, renderTraceEnabled],
     );
-    const visibleGroupSummary = useMemo(
-      () => renderTraceEnabled ? summarizeModelRoundItemGroups(visibleGroupedItems) : null,
-      [renderTraceEnabled, visibleGroupedItems],
-    );
-    const hasDeferredEarlierGroups = visibleGroupStartIndex > 0;
-    const hasDeferredLaterGroups = visibleGroupEndIndex < groupedItems.length;
 
     const renderGroupList = useCallback((
       groups: ModelRoundItemGroup[],
@@ -443,13 +477,11 @@ export const ModelRoundItem = React.memo<ModelRoundItemProps>(
                 turnId={turnId}
                 roundId={options.roundId}
                 isLastItem={isLast && itemIdx === group.items.length - 1}
-                completedToolExitNowMs={transientNowMs}
-                allowCompletedToolExit
               />
             ));
 
           case 'critical': {
-            const projectedSubagent = group.item.type === 'tool' && (group.item as FlowToolItem).toolName === 'Task'
+            const projectedSubagent = group.item.type === 'tool' && getEffectiveToolName(group.item as FlowToolItem) === 'Task'
               ? group.item as FlowToolItem
               : undefined;
             if (projectedSubagent) {
@@ -463,8 +495,6 @@ export const ModelRoundItem = React.memo<ModelRoundItemProps>(
                   directSubagentDialogTurnId={projectedSubagent.subagentDialogTurnId}
                   turnId={turnId}
                   roundId={options.roundId}
-                  completedToolExitNowMs={transientNowMs}
-                  allowCompletedToolExit={false}
                 />
               );
             }
@@ -475,8 +505,6 @@ export const ModelRoundItem = React.memo<ModelRoundItemProps>(
                 turnId={turnId}
                 roundId={options.roundId}
                 isLastItem={isLast}
-                completedToolExitNowMs={transientNowMs}
-                allowCompletedToolExit={false}
               />
             );
           }
@@ -485,91 +513,30 @@ export const ModelRoundItem = React.memo<ModelRoundItemProps>(
             return null;
         }
       })
-    ), [sessionId, transientNowMs, turnId]);
+    ), [sessionId, turnId]);
 
-    const extractDialogTurnContent = useCallback(() => {
-      const flowChatStore = FlowChatStore.getInstance();
-      const state = flowChatStore.getState();
-      
-      let targetSession = null;
-      for (const [, session] of state.sessions) {
-        if (session.dialogTurns.some((turn: any) => turn.id === turnId)) {
-          targetSession = session;
-          break;
-        }
-      }
-      
-      if (!targetSession) return '';
-      
-      const dialogTurn = targetSession.dialogTurns.find((turn: any) => turn.id === turnId);
-      if (!dialogTurn) return '';
-      
-      const contentParts: string[] = [];
-      
-      if (dialogTurn.userMessage?.content) {
-        contentParts.push(`${t('modelRound.userLabel')}\n${dialogTurn.userMessage.content}`);
-      }
-      
-      dialogTurn.modelRounds.forEach((modelRound: any) => {
-        const roundContent: string[] = [];
-        
-        modelRound.items.forEach((item: any) => {
-          if (item.type === 'text' && item.content?.trim()) {
-            roundContent.push(item.content.trim());
-          } else if (item.type === 'thinking' && item.content?.trim()) {
-            roundContent.push(`[Thinking]\n${item.content.trim()}`);
-          } else if (item.type === 'tool' && item.toolCall) {
-            const toolName = item.toolName || t('copyOutput.unknownTool');
-            let toolContent = t('modelRound.toolCallLabel', { name: toolName }) + '\n';
-            
-            if (item.toolCall.input) {
-              const inputStr = typeof item.toolCall.input === 'string'
-                ? item.toolCall.input
-                : JSON.stringify(item.toolCall.input, null, 2);
-              toolContent += `\n[Input]\n\`\`\`json\n${inputStr}\n\`\`\`\n`;
-            }
-            
-            if (item.toolResult) {
-              if (item.toolResult.error) {
-                toolContent += `\n[Error]\n${item.toolResult.error}\n`;
-              } else if (item.toolResult.result !== undefined) {
-                const resultStr = typeof item.toolResult.result === 'string'
-                  ? item.toolResult.result
-                  : JSON.stringify(item.toolResult.result, null, 2);
-                toolContent += `\n[Result]\n\`\`\`\n${formatSessionViewPreviewText(resultStr)}\n\`\`\`\n`;
-              }
-            }
-            
-            roundContent.push(toolContent.trim());
-          }
-        });
-        
-        if (roundContent.length > 0) {
-          contentParts.push(roundContent.join('\n\n'));
-        }
-      });
-      
-      return contentParts.join('\n\n---\n\n');
-    }, [t, turnId]);
-    
-    const handleCopy = useCallback(async () => {
+    const handleCopyScope = useCallback(async (scope: TranscriptExportScope) => {
+      setIsCopyMenuOpen(false);
       try {
-        const content = extractDialogTurnContent();
-        
+        const content = buildDialogTurnCopyText(turnId, scope, buildTranscriptExportLabels(t));
+
         if (!content.trim()) {
-          log.warn('No content to copy');
+          // Result-only copy on a turn that produced no prose lands here.
+          log.warn('No content to copy', { turnId, scope });
+          notificationService.warning(t('transcriptExport.copyEmpty'));
           return;
         }
-        
+
         await navigator.clipboard.writeText(content);
         setCopied(true);
         setTimeout(() => setCopied(false), 2000);
       } catch (error) {
         log.error('Failed to copy', error);
+        notificationService.error(t('errors:general.copyFailed'));
       }
-    }, [extractDialogTurnContent]);
-    
-    const hasContent = sortedItems.some(item => 
+    }, [t, turnId]);
+
+    const hasContent = sortedItems.some(item =>
       (item.type === 'text' && (item as FlowTextItem).content.trim()) ||
       (item.type === 'tool' && (item as FlowToolItem).toolCall)
     );
@@ -592,47 +559,53 @@ export const ModelRoundItem = React.memo<ModelRoundItemProps>(
       formatNumber,
       t,
     }), [completedAt, effectiveDurationMs, formatDate, formatNumber, round.status, t, turnTokenUsage]);
-    const shouldRenderFooter = isTurnComplete &&
+    // Wait for typewriter catch-up before revealing footer controls. Reserve
+    // footer layout as soon as the model round completes so the eventual
+    // reveal does not resize the list (that resize flashed the chat pane).
+    const isVisuallyStreaming = round.isStreaming || typewriterRevealGate.isAnyRevealing;
+    const shouldReserveFooter = isTurnComplete &&
       isLastRound &&
       !round.isStreaming &&
       (hasContent || usageMetaItems.length > 0);
-    
+    const shouldRevealFooter = shouldReserveFooter && !typewriterRevealGate.isAnyRevealing;
+
     return (
-      <div 
-        className={`model-round-item model-round-item--${round.isStreaming ? 'streaming' : 'complete'}`}
+      <TypewriterRevealGateProvider value={typewriterRevealGate}>
+      <div
+        className={getModelRoundItemClassName({
+          isVisuallyStreaming,
+        })}
+        data-bf-component="model-round-item"
+        data-bf-part="root"
+        data-bf-status={round.status}
+        data-bf-state={isVisuallyStreaming ? 'streaming' : undefined}
         data-testid="chat-assistant-message"
         data-turn-id={turnId}
         data-round-id={round.id}
         data-status={round.status}
-        data-model-id={round.modelId || ''}
-        data-model-alias={round.modelAlias || ''}
-        data-streaming={round.isStreaming ? 'true' : 'false'}
+        data-model-config-id={round.modelConfigId || ''}
+        data-effective-model-name={round.effectiveModelName || ''}
+        data-streaming={isVisuallyStreaming ? 'true' : 'false'}
       >
-        {renderTraceEnabled && renderTraceStartedAtMs !== null && allGroupSummary && visibleGroupSummary && (
+        {renderTraceEnabled && renderTraceStartedAtMs !== null && groupSummary && (
           <ModelRoundRenderTrace
             startedAtMs={renderTraceStartedAtMs}
             turnId={turnId}
             round={round}
             itemCount={sortedItems.length}
             groupCount={groupedItems.length}
-            renderedCount={renderedGroupCount}
-            visibleGroupStartIndex={visibleGroupStartIndex}
-            visibleGroupEndIndex={visibleGroupEndIndex}
-            allGroupSummary={allGroupSummary}
-            visibleGroupSummary={visibleGroupSummary}
+            groupSummary={groupSummary}
           />
-        )}
-        {hasDeferredEarlierGroups && (
-          <div className="model-round-item__history-loader">
-            {t('modelRound.loadingMoreHistory')}
-          </div>
         )}
 
         {historyRounds.length > 0 && (
-          <div className="model-round-item__retry-history">
+          <div className="model-round-item__retry-history" data-bf-component="model-round-item" data-bf-part="retryHistory">
             <button
               type="button"
               className="model-round-item__retry-toggle"
+              data-bf-component="model-round-item"
+              data-bf-part="retryToggle"
+              data-bf-state={showRoundHistory ? 'expanded' : undefined}
               onClick={() => setShowRoundHistory(current => !current)}
             >
               {showRoundHistory
@@ -654,19 +627,21 @@ export const ModelRoundItem = React.memo<ModelRoundItemProps>(
                 isStreaming: false,
                 disableExploreGrouping: true,
                 isCollapsibleTool,
-                nowMs: transientNowMs,
               });
 
               return (
-                <div key={historyRound.id} className="model-round-item__retry-attempt">
-                  <div className="model-round-item__retry-attempt-label">
+                <div key={historyRound.id} className="model-round-item__retry-attempt" data-bf-component="model-round-item" data-bf-part="retryAttempt">
+                  <div className="model-round-item__retry-attempt-label" data-bf-component="model-round-item" data-bf-part="attemptLabel">
                     {t('modelRound.roundRetryLabel', { index: historyIndex + 1 })}
                   </div>
                   {historyOlderAttempts.length > 0 && (
-                    <div className="model-round-item__retry-history">
+                    <div className="model-round-item__retry-history" data-bf-component="model-round-item" data-bf-part="retryHistory">
                       <button
                         type="button"
                         className="model-round-item__retry-toggle"
+                        data-bf-component="model-round-item"
+                        data-bf-part="retryToggle"
+                        data-bf-state={showHistoryRoundAttempts ? 'expanded' : undefined}
                         onClick={() => toggleHistoryRoundAttempts(historyRound.id)}
                       >
                         {showHistoryRoundAttempts
@@ -680,13 +655,13 @@ export const ModelRoundItem = React.memo<ModelRoundItemProps>(
                           isStreaming: false,
                           disableExploreGrouping: true,
                           isCollapsibleTool,
-                          nowMs: transientNowMs,
                         });
 
                         return (
-                          <div key={attempt.id} className="model-round-item__retry-attempt">
-                            <div className="model-round-item__retry-attempt-label">
-                              {t('modelRound.attemptLabel', { index: attempt.index })}
+                          <div key={attempt.id} className="model-round-item__retry-attempt" data-bf-component="model-round-item" data-bf-part="retryAttempt">
+                            <div className="model-round-item__retry-attempt-label" data-bf-component="model-round-item" data-bf-part="attemptLabel">
+                              <span>{t('modelRound.attemptLabel', { index: attempt.index })}</span>
+                              {attempt.diagnostic && <AttemptDiagnosticDetails diagnostic={attempt.diagnostic} />}
                             </div>
                             {renderGroupList(attemptGroups, {
                               roundId: historyRound.id,
@@ -709,31 +684,34 @@ export const ModelRoundItem = React.memo<ModelRoundItemProps>(
           </div>
         )}
 
-        {olderAttempts.length > 0 && (
-          <div className="model-round-item__retry-history">
+        {historicalAttempts.length > 0 && (
+          <div className="model-round-item__retry-history" data-bf-component="model-round-item" data-bf-part="retryHistory">
             <button
               type="button"
               className="model-round-item__retry-toggle"
+              data-bf-component="model-round-item"
+              data-bf-part="retryToggle"
+              data-bf-state={showRetryHistory ? 'expanded' : undefined}
               onClick={() => setShowRetryHistory(current => !current)}
             >
               {showRetryHistory
                 ? t('modelRound.retryHistoryHide')
-                : t('modelRound.retryHistoryShow', { count: olderAttempts.length })}
+                : t('modelRound.retryHistoryShow', { count: historicalAttempts.length })}
             </button>
 
-            {showRetryHistory && olderAttempts.map((attempt) => {
+            {showRetryHistory && historicalAttempts.map((attempt) => {
               const attemptGroups = buildModelRoundItemGroups({
                 items: attempt.items,
                 isStreaming: false,
                 disableExploreGrouping: true,
                 isCollapsibleTool,
-                nowMs: transientNowMs,
               });
 
               return (
-                <div key={attempt.id} className="model-round-item__retry-attempt">
-                  <div className="model-round-item__retry-attempt-label">
-                    {t('modelRound.attemptLabel', { index: attempt.index })}
+                <div key={attempt.id} className="model-round-item__retry-attempt" data-bf-component="model-round-item" data-bf-part="retryAttempt">
+                  <div className="model-round-item__retry-attempt-label" data-bf-component="model-round-item" data-bf-part="attemptLabel">
+                    <span>{t('modelRound.attemptLabel', { index: attempt.index })}</span>
+                    {attempt.diagnostic && <AttemptDiagnosticDetails diagnostic={attempt.diagnostic} />}
                   </div>
                   {renderGroupList(attemptGroups, {
                     roundId: round.id,
@@ -746,27 +724,29 @@ export const ModelRoundItem = React.memo<ModelRoundItemProps>(
           </div>
         )}
 
-        {renderGroupList(visibleGroupedItems, {
+        {renderGroupList(groupedItems, {
           roundId: round.id,
-          keyPrefix: latestAttempt ? `attempt:${latestAttempt.id}` : 'round',
+          keyPrefix: activeAttempt ? `attempt:${activeAttempt.id}` : 'round',
           isFinalSection: isLastRound,
         })}
 
-        {hasDeferredLaterGroups && (
-          <div className="model-round-item__history-loader">
-            {t('modelRound.loadingMoreHistory')}
-          </div>
-        )}
-
-        {shouldRenderFooter && (
-          <div className="model-round-item__footer">
+        {shouldReserveFooter && (
+          <div
+            className={`model-round-item__footer${shouldRevealFooter ? '' : ' model-round-item__footer--pending'}`}
+            data-bf-component="model-round-item"
+            data-bf-part="footer"
+            data-bf-state={shouldRevealFooter ? undefined : 'pending'}
+            aria-hidden={!shouldRevealFooter}
+          >
             {usageMetaItems.length > 0 && (
               <div
                 className="model-round-item__meta"
+                data-bf-component="model-round-item"
+                data-bf-part="meta"
                 aria-label={t('modelRound.meta.label')}
               >
                 {usageMetaItems.map(item => (
-                  <span key={item.key} className="model-round-item__meta-item">
+                  <span key={item.key} className="model-round-item__meta-item" data-bf-component="model-round-item" data-bf-part="metaItem">
                     <span className="model-round-item__meta-label">{item.label}</span>
                     <span className="model-round-item__meta-value">{item.value}</span>
                   </span>
@@ -776,20 +756,57 @@ export const ModelRoundItem = React.memo<ModelRoundItemProps>(
 
             <ForkSessionButton sessionId={sessionId} turnId={turnId} />
 
-            <Tooltip content={copied ? t('modelRound.copiedDialog') : t('modelRound.copyDialog')} placement="top">
-              <button
-                ref={copyButtonRef}
-                className={`model-round-item__action-btn model-round-item__copy-btn ${copied ? 'copied' : ''}`}
-                onClick={handleCopy}
-              >
-                {copied ? <Check size={14} /> : <Copy size={14} />}
-              </button>
-            </Tooltip>
-            
-            <ExportImageButton turnId={turnId} />
+            {allowTranscriptExport && <div className="model-round-item__copy-menu-anchor">
+              <Tooltip content={copied ? t('modelRound.copiedDialog') : t('modelRound.copyDialog')} placement="top">
+                <button
+                  ref={copyButtonRef}
+                  className={`model-round-item__action-btn model-round-item__copy-btn ${copied ? 'copied' : ''}`}
+                  onClick={() => setIsCopyMenuOpen(current => !current)}
+                  tabIndex={shouldRevealFooter ? 0 : -1}
+                  disabled={!shouldRevealFooter}
+                  aria-haspopup="menu"
+                  aria-expanded={isCopyMenuOpen}
+                  aria-label={copied ? t('modelRound.copiedDialog') : t('modelRound.copyDialog')}
+                  data-testid="model-round-copy-btn"
+                 data-bf-component="model-round-item" data-bf-part="action" data-bf-state={copied ? 'copied' : undefined}>
+                  {copied ? <Check size={14} /> : <Copy size={14} />}
+                </button>
+              </Tooltip>
+
+              {isCopyMenuOpen && (
+                <div
+                  ref={copyMenuRef}
+                  className="model-round-item__copy-menu"
+                  role="menu"
+                  data-testid="model-round-copy-menu"
+                >
+                  <button
+                    type="button"
+                    role="menuitem"
+                    className="model-round-item__copy-menu-item"
+                    onClick={() => void handleCopyScope('full')}
+                    data-testid="model-round-copy-full"
+                  >
+                    {t('transcriptExport.copyFull')}
+                  </button>
+                  <button
+                    type="button"
+                    role="menuitem"
+                    className="model-round-item__copy-menu-item"
+                    onClick={() => void handleCopyScope('result')}
+                    data-testid="model-round-copy-result"
+                  >
+                    {t('transcriptExport.copyResult')}
+                  </button>
+                </div>
+              )}
+            </div>}
+
+            {allowTranscriptExport && <ExportImageButton turnId={turnId} />}
           </div>
         )}
       </div>
+      </TypewriterRevealGateProvider>
     );
   },
   (prev, next) => {
@@ -797,11 +814,13 @@ export const ModelRoundItem = React.memo<ModelRoundItemProps>(
     if (next.round.isStreaming || prev.round.isStreaming) {
       return false;
     }
-    
+
     // In complete state, compare items array reference to detect tool state changes.
     return (
       prev.round.id === next.round.id &&
       prev.round.items === next.round.items &&
+      prev.round.attempts === next.round.attempts &&
+      prev.round.attemptDiagnostics === next.round.attemptDiagnostics &&
       prev.round.historyRounds === next.round.historyRounds &&
       prev.isLastRound === next.isLastRound &&
       prev.isTurnComplete === next.isTurnComplete &&
@@ -823,8 +842,6 @@ interface FlowItemRendererProps {
   turnId: string;
   roundId?: string;
   isLastItem?: boolean;
-  completedToolExitNowMs: number;
-  allowCompletedToolExit?: boolean;
 }
 
 // Do not memoize: streaming content updates frequently.
@@ -833,8 +850,6 @@ const FlowItemRenderer: React.FC<FlowItemRendererProps> = ({
   turnId,
   roundId,
   isLastItem,
-  completedToolExitNowMs,
-  allowCompletedToolExit = false,
 }) => {
   const {
     onToolConfirm,
@@ -843,7 +858,7 @@ const FlowItemRenderer: React.FC<FlowItemRendererProps> = ({
     onTabOpen,
     sessionId,
   } = useFlowChatContext();
-  
+
   switch (item.type) {
     case 'text':
       return (
@@ -862,38 +877,23 @@ const FlowItemRenderer: React.FC<FlowItemRendererProps> = ({
           }}
         />
       );
-    
+
     case 'thinking':
       return (
         <ModelThinkingDisplay thinkingItem={item as FlowThinkingItem} isLastItem={isLastItem} />
       );
-    
+
     case 'tool': {
       const toolItem = item as FlowToolItem;
-      const isCompletedTool = toolItem.status === 'completed';
-      const isCollapsible = isCollapsibleTool(toolItem.toolName);
-      const shouldAnimateCompletedExit =
-        allowCompletedToolExit &&
-        isCollapsible &&
-        isCompletedTool &&
-        isCompletedToolInTransientWindow(toolItem, completedToolExitNowMs);
-      const isSettledCompletedTool =
-        allowCompletedToolExit && isCollapsible && isCompletedTool && !shouldAnimateCompletedExit;
-      const toolClassName = [
-        'flowchat-flow-item',
-        isCollapsible && isCompletedTool ? 'flowchat-flow-item--tool-transition' : null,
-        shouldAnimateCompletedExit ? 'flowchat-flow-item--tool-completed' : null,
-        isSettledCompletedTool ? 'flowchat-flow-item--tool-settled' : null,
-        isCollapsible && !isCompletedTool ? 'flowchat-flow-item--tool-active' : null,
-      ].filter(Boolean).join(' ');
 
       return (
-        <div className={toolClassName} data-flow-item-id={item.id} data-flow-item-type="tool">
+        <div className="flowchat-flow-item" data-flow-item-id={item.id} data-flow-item-type="tool" data-bf-component="model-round-item" data-bf-part="toolItem">
           <FlowToolCard
             toolItem={toolItem}
-            onConfirm={async (toolId: string, updatedInput?: any, permissionOptionId?: string, approve?: boolean) => {
+            isLastItem={isLastItem}
+            onConfirm={async (toolId: string, permissionOptionId?: string, approve?: boolean) => {
               if (onToolConfirm) {
-                await onToolConfirm(toolId, updatedInput, permissionOptionId, approve);
+                await onToolConfirm(toolId, permissionOptionId, approve);
               }
             }}
             onReject={async (_toolId: string, options?: ToolRejectOptions) => {

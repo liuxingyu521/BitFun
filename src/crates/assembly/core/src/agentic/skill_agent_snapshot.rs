@@ -6,6 +6,7 @@ use crate::agentic::tools::implementations::skills::{get_skill_registry, SkillIn
 use crate::agentic::tools::manifest_resolver::{resolve_tool_manifest, ResolvedToolManifest};
 use crate::agentic::tools::product_runtime::GetToolSpecTool;
 use crate::agentic::tools::tool_context_runtime;
+use crate::agentic::tools::ToolRuntimeRestrictions;
 use crate::agentic::workspace::WorkspaceServices;
 use crate::agentic::WorkspaceBinding;
 pub use bitfun_agent_runtime::skill_agent_snapshot::{
@@ -26,6 +27,7 @@ pub async fn resolve_skill_agent_snapshot(
     workspace_services: Option<&WorkspaceServices>,
     enable_tools: bool,
     context_vars: &std::collections::HashMap<String, String>,
+    runtime_tool_restrictions: &ToolRuntimeRestrictions,
 ) -> SkillAgentSnapshotResolution {
     if !enable_tools {
         return SkillAgentSnapshotResolution {
@@ -53,6 +55,7 @@ pub async fn resolve_skill_agent_snapshot(
         workspace_services,
         None,
         context_vars,
+        runtime_tool_restrictions,
     );
     let manifest = resolve_tool_manifest(
         &tool_policy.allowed_tools,
@@ -61,8 +64,14 @@ pub async fn resolve_skill_agent_snapshot(
     )
     .await;
 
-    let snapshot =
-        build_skill_agent_snapshot(workspace, workspace_services, agent_type, &manifest).await;
+    let snapshot = build_skill_agent_snapshot(
+        workspace,
+        workspace_services,
+        agent_type,
+        &manifest,
+        runtime_tool_restrictions,
+    )
+    .await;
     let tool_listing_sections = build_tool_listing_sections(&manifest, &snapshot);
 
     SkillAgentSnapshotResolution {
@@ -76,6 +85,7 @@ async fn build_skill_agent_snapshot(
     workspace_services: Option<&WorkspaceServices>,
     agent_type: &str,
     manifest: &ResolvedToolManifest,
+    runtime_tool_restrictions: &ToolRuntimeRestrictions,
 ) -> TurnSkillAgentSnapshot {
     let has_tool = |tool_name: &str| {
         manifest
@@ -91,7 +101,8 @@ async fn build_skill_agent_snapshot(
     }
 
     if has_tool("Task") {
-        snapshot.subagents = load_subagent_entries(workspace, Some(agent_type)).await;
+        snapshot.subagents =
+            load_subagent_entries(workspace, Some(agent_type), runtime_tool_restrictions).await;
     }
 
     snapshot
@@ -115,10 +126,8 @@ fn build_tool_listing_sections(
         agent_listing: has_tool("Task")
             .then(|| render_full_agent_listing_body(&snapshot.subagents))
             .filter(|body| !body.is_empty()),
-        collapsed_tool_listing: if has_tool("GetToolSpec") {
-            GetToolSpecTool::build_collapsed_tools_context_section(
-                &manifest.collapsed_tool_summaries,
-            )
+        deferred_tool_listing: if has_tool("GetToolSpec") {
+            GetToolSpecTool::build_deferred_tools_context_section(&manifest.deferred_tool_summaries)
         } else {
             None
         },
@@ -135,7 +144,7 @@ async fn load_skill_entries(
         Some(workspace) if workspace.is_remote() => {
             if let Some(services) = workspace_services {
                 registry
-                    .get_resolved_skills_for_remote_workspace(
+                    .get_implicitly_invocable_skills_for_remote_workspace(
                         services.fs.as_ref(),
                         &workspace.root_path_string(),
                         agent_type,
@@ -147,12 +156,15 @@ async fn load_skill_entries(
         }
         Some(workspace) => {
             registry
-                .get_resolved_skills_for_workspace(Some(workspace.root_path()), agent_type)
+                .get_implicitly_invocable_skills_for_workspace(
+                    Some(workspace.root_path()),
+                    agent_type,
+                )
                 .await
         }
         None => {
             registry
-                .get_resolved_skills_for_workspace(None, agent_type)
+                .get_implicitly_invocable_skills_for_workspace(None, agent_type)
                 .await
         }
     };
@@ -174,6 +186,7 @@ fn skill_snapshot_entry_from_skill_info(skill: SkillInfo) -> SkillSnapshotEntry 
 async fn load_subagent_entries(
     workspace: Option<&WorkspaceBinding>,
     agent_type: Option<&str>,
+    runtime_tool_restrictions: &ToolRuntimeRestrictions,
 ) -> Vec<AgentSnapshotEntry> {
     let registry = get_agent_registry();
     let workspace_root = workspace
@@ -185,15 +198,23 @@ async fn load_subagent_entries(
             workspace_root,
             list_scope: SubagentListScope::TaskVisible,
             include_disabled: false,
+            external_sources_supported: false,
         })
         .await;
 
     agents
         .into_iter()
-        .map(|agent| AgentSnapshotEntry {
-            id: agent.id,
-            description: agent.description,
-            default_tools: agent.default_tools,
+        .map(|agent| {
+            let default_tools = agent
+                .default_tools
+                .into_iter()
+                .filter(|tool_name| runtime_tool_restrictions.is_tool_allowed(tool_name))
+                .collect();
+            AgentSnapshotEntry {
+                id: agent.id,
+                description: agent.description,
+                default_tools,
+            }
         })
         .collect()
 }
@@ -218,4 +239,29 @@ pub async fn build_embedded_user_context_reminder(
     PromptBuilder::new(context)
         .build_user_context_reminder(user_context_policy)
         .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::load_subagent_entries;
+    use crate::agentic::tools::ToolRuntimeRestrictions;
+
+    #[tokio::test]
+    async fn subagent_projection_hides_runtime_denied_tools() {
+        let mut restrictions = ToolRuntimeRestrictions::default();
+        restrictions
+            .denied_tool_names
+            .insert("ControlHub".to_string());
+
+        let agents = load_subagent_entries(None, Some("Claw"), &restrictions).await;
+        let computer_use = agents
+            .iter()
+            .find(|agent| agent.id == "ComputerUse")
+            .expect("Claw should advertise the ComputerUse subagent");
+
+        assert!(!computer_use
+            .default_tools
+            .iter()
+            .any(|tool_name| !restrictions.is_tool_allowed(tool_name)));
+    }
 }

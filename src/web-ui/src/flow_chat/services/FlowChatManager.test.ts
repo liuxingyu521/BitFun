@@ -15,9 +15,23 @@ vi.mock('./ProcessingStatusManager', () => ({
   processingStatusManager: {},
 }));
 
+vi.mock('./flow-chat-manager/PeerSessionRefreshModule', () => ({
+  installPeerSessionRefresh: vi.fn(() => () => {}),
+}));
+
+vi.mock('@/features/dispatch/DispatchJobObserver', () => ({
+  installDispatchJobObserver: vi.fn(() => () => {}),
+}));
+
 vi.mock('../store/FlowChatStore', () => ({
   FlowChatStore: {
     getInstance: () => storeMocks.store,
+  },
+  flowChatStore: {
+    getState: () => ({
+      activeSessionId: null,
+      sessions: new Map(),
+    }),
   },
 }));
 
@@ -50,6 +64,10 @@ vi.mock('./EventBatcher', () => ({
   },
 }));
 
+vi.mock('./flow-chat-manager/PeerSessionRefreshModule', () => ({
+  installPeerSessionRefresh: vi.fn(() => () => {}),
+}));
+
 vi.mock('./flow-chat-manager', () => ({
   saveAllInProgressTurns: vi.fn(),
   immediateSaveDialogTurn: vi.fn(),
@@ -58,6 +76,7 @@ vi.mock('./flow-chat-manager', () => ({
   deleteChatSession: vi.fn(),
   archiveChatSession: vi.fn(),
   renameChatSessionTitle: vi.fn(),
+  reloadSessionTitle: vi.fn(),
   forkChatSession: vi.fn(),
   cleanupSaveState: vi.fn(),
   cleanupSessionBuffers: vi.fn(),

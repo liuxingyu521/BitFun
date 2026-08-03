@@ -37,6 +37,7 @@ import {
   type DeepReviewLaunchStep,
   type FailedDeepReviewCleanupResult,
 } from './launchErrors';
+import { sessionProjectWorkspacePath } from '../../utils/sessionWorkspace';
 
 export {
   DEEP_REVIEW_SLASH_COMMAND,
@@ -55,6 +56,7 @@ interface LaunchDeepReviewSessionParams {
   requestedFiles?: string[];
   runManifest?: ReviewTeamRunManifest;
   requestId?: string;
+  presentationKind?: 'review' | 'deep_review';
 }
 
 export interface DeepReviewLaunchBuildOptions {
@@ -70,6 +72,8 @@ export interface DeepReviewLaunchBuildOptions {
   maxCoreReviewers?: number;
   maxExtraReviewers?: number;
   includeQualityGate?: boolean;
+  managedBatching?: boolean;
+  maxFocusedCalls?: number;
 }
 
 export interface DeepReviewLaunchPrompt {
@@ -83,21 +87,23 @@ async function cleanupFailedDeepReviewLaunch(
 ): Promise<FailedDeepReviewCleanupResult> {
   const cleanupIssues: string[] = [];
   const childSession = flowChatStore.getState().sessions.get(childSessionId);
-  const workspacePath = childSession?.workspacePath;
+  const workspacePath = childSession
+    ? sessionProjectWorkspacePath(childSession)
+    : undefined;
   const remoteConnectionId = childSession?.remoteConnectionId;
   const remoteSshHost = childSession?.remoteSshHost;
 
   try {
     closeBtwSessionInAuxPane(childSessionId);
   } catch (error) {
-    const message = `Failed to close the strict review pane during cleanup: ${normalizeErrorMessage(error)}`;
+    const message = `Failed to close the Review pane during cleanup: ${normalizeErrorMessage(error)}`;
     cleanupIssues.push(message);
     log.warn(message, { childSessionId, launchStep, error });
   }
 
   let backendSessionRemoved = false;
   if (!workspacePath) {
-    const message = 'Workspace path is missing, so backend strict review session cleanup could not run.';
+    const message = 'Workspace path is missing, so backend Review session cleanup could not run.';
     cleanupIssues.push(message);
     log.warn(message, { childSessionId, launchStep });
   } else {
@@ -113,7 +119,7 @@ async function cleanupFailedDeepReviewLaunch(
       if (isSessionMissingError(error)) {
         backendSessionRemoved = true;
       } else {
-        const message = `Failed to delete the backend strict review session: ${normalizeErrorMessage(error)}`;
+        const message = `Failed to delete the backend Review session: ${normalizeErrorMessage(error)}`;
         cleanupIssues.push(message);
         log.warn(message, { childSessionId, launchStep, error });
       }
@@ -125,7 +131,7 @@ async function cleanupFailedDeepReviewLaunch(
       const flowChatManager = FlowChatManager.getInstance();
       flowChatManager.discardLocalSession(childSessionId);
     } catch (error) {
-      const message = `Failed to remove the local strict review session state: ${normalizeErrorMessage(error)}`;
+      const message = `Failed to remove the local Review session state: ${normalizeErrorMessage(error)}`;
       cleanupIssues.push(message);
       log.warn(message, { childSessionId, launchStep, error });
     }
@@ -191,6 +197,12 @@ export async function buildDeepReviewLaunchFromSessionFiles(
       : {}),
     ...(options.includeQualityGate !== undefined
       ? { includeQualityGate: options.includeQualityGate }
+      : {}),
+    ...(options.managedBatching !== undefined
+      ? { managedBatching: options.managedBatching }
+      : {}),
+    ...(options.maxFocusedCalls !== undefined
+      ? { maxFocusedCalls: options.maxFocusedCalls }
       : {}),
   });
   const prompt = formatSessionFilesLaunchPrompt({
@@ -261,6 +273,12 @@ export async function buildDeepReviewLaunchFromSlashCommand(
     ...(options.includeQualityGate !== undefined
       ? { includeQualityGate: options.includeQualityGate }
       : {}),
+    ...(options.managedBatching !== undefined
+      ? { managedBatching: options.managedBatching }
+      : {}),
+    ...(options.maxFocusedCalls !== undefined
+      ? { maxFocusedCalls: options.maxFocusedCalls }
+      : {}),
   });
   const prompt = formatSlashCommandLaunchPrompt({
     extraContext,
@@ -302,6 +320,7 @@ export async function launchDeepReviewSession({
   requestedFiles = [],
   runManifest,
   requestId,
+  presentationKind = 'deep_review',
 }: LaunchDeepReviewSessionParams): Promise<{
   childSessionId: string;
   launchStatus: 'started' | 'uncertain';
@@ -312,17 +331,19 @@ export async function launchDeepReviewSession({
   const effectiveRequestId = requestId ?? createBtwRequestId('deep_review');
 
   try {
-    await prepareDefaultReviewTeamForLaunch(workspacePath, {
-      reviewTargetFilePaths: requestedFiles,
-      target: runManifest?.target,
-    });
+    if (!runManifest?.managedReviewPlan) {
+      await prepareDefaultReviewTeamForLaunch(workspacePath, {
+        reviewTargetFilePaths: requestedFiles,
+        target: runManifest?.target,
+      });
+    }
 
     launchStep = 'create_child_session';
     const createParams = {
       parentSessionId,
       workspacePath,
       childSessionName,
-      sessionKind: 'deep_review',
+      sessionKind: presentationKind,
       agentType: 'DeepReview',
       enableTools: true,
       safeMode: true,
@@ -381,7 +402,7 @@ export async function launchDeepReviewSession({
     insertReviewSessionSummaryMarker({
       parentSessionId,
       childSessionId,
-      kind: 'deep_review',
+      kind: presentationKind,
       title: childSessionName,
       requestedFiles,
       parentDialogTurnId,
@@ -397,7 +418,7 @@ export async function launchDeepReviewSession({
       insertReviewSessionSummaryMarker({
         parentSessionId,
         childSessionId,
-        kind: 'deep_review',
+        kind: presentationKind,
         title: childSessionName,
         requestedFiles,
         parentDialogTurnId,
@@ -407,7 +428,7 @@ export async function launchDeepReviewSession({
         parentSessionId,
         workspacePath,
         expand: true,
-        sessionKind: 'deep_review',
+        sessionKind: presentationKind,
         sessionTitle: childSessionName,
         agentType: 'DeepReview',
       });

@@ -4,6 +4,7 @@ import { notificationService } from '@/shared/notification-system';
 import type { DialogTurnData } from '@/shared/types/session-history';
 import { flowChatStore } from '../store/FlowChatStore';
 import type { DialogTurn, Session } from '../types/flow-chat';
+import { sessionProjectWorkspacePath } from '../utils/sessionWorkspace';
 
 const UNKNOWN_MODEL_ID = 'unknown_model';
 const LEGACY_MODEL_LABEL = 'Legacy model not tracked';
@@ -18,6 +19,16 @@ export interface UsageReportCommandParams {
   failedTitle: string;
   unknownErrorMessage: string;
   loadingMarkdown: string;
+  /**
+   * Where the report comes from. Defaults to the local backend; a dispatch
+   * projection supplies the target's `query` verb instead.
+   */
+  fetchReport?: () => Promise<SessionUsageReport>;
+  /**
+   * Persist the rendered turn to the backend session. Observer projections
+   * must not persist locally — their transcript cache captures the turn.
+   */
+  persistTurn?: boolean;
 }
 
 export interface UsageReportCommandResult {
@@ -40,6 +51,11 @@ export async function runUsageReportCommand(
   }
 
   const requestedAt = Date.now();
+  const projectWorkspacePath = sessionProjectWorkspacePath(params.session);
+  if (!projectWorkspacePath) {
+    notificationService.error(params.noWorkspaceMessage);
+    return { inserted: false, reason: 'missing_workspace' };
+  }
   const pendingReportId = `pending-${params.session.sessionId}-${requestedAt}`;
   const pendingTurn = flowChatStore.addLocalUsageReportTurn({
     sessionId: params.session.sessionId,
@@ -52,13 +68,15 @@ export async function runUsageReportCommand(
   let finalizedPendingTurn = false;
 
   try {
-    const rawReport = await sessionAPI.getSessionUsageReport({
-      sessionId: params.session.sessionId,
-      workspacePath: params.session.workspacePath,
-      remoteConnectionId: params.session.remoteConnectionId,
-      remoteSshHost: params.session.remoteSshHost,
-      includeHiddenSubagents: true,
-    });
+    const rawReport = params.fetchReport
+      ? await params.fetchReport()
+      : await sessionAPI.getSessionUsageReport({
+        sessionId: params.session.sessionId,
+        workspacePath: projectWorkspacePath,
+        remoteConnectionId: params.session.remoteConnectionId,
+        remoteSshHost: params.session.remoteSshHost,
+        includeHiddenSubagents: true,
+      });
     const report = enrichUsageReportModelIdentity(rawReport, params.session);
     const markdown = renderUsageReportMarkdown(report);
     const turn = pendingTurn
@@ -78,10 +96,10 @@ export async function runUsageReportCommand(
       });
     finalizedPendingTurn = !!pendingTurn;
 
-    if (turn) {
+    if (turn && params.persistTurn !== false) {
       await sessionAPI.saveSessionTurn(
         toPersistedLocalReportTurn(turn),
-        params.session.workspacePath,
+        projectWorkspacePath,
         params.session.remoteConnectionId,
         params.session.remoteSshHost,
       );

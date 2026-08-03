@@ -5,7 +5,37 @@
 import React, { useEffect, useState, useRef, useCallback, useId } from 'react';
 import { createPortal } from 'react-dom';
 import { useI18n } from '@/infrastructure/i18n';
+import { getAppearanceOverlayHost } from '@/infrastructure/appearance/runtime/AppearanceOverlayHost';
 import './Modal.scss';
+
+// Keep in sync with modal-overlay-exit/modal-dialog-exit in Modal.scss.
+const MODAL_EXIT_DURATION_MS = 180;
+
+/**
+ * Ref-counted `body` scroll lock, shared by every Modal instance.
+ *
+ * Modals stack — a dialog opening a confirmation on top of itself is routine —
+ * and each one clearing `overflow` on its own would unlock the page while the
+ * others are still open. The 180 ms exit delay widens that window: the inner
+ * modal's cleanup lands well after it has visually gone.
+ */
+let bodyScrollLockCount = 0;
+
+function lockBodyScroll(): () => void {
+  bodyScrollLockCount += 1;
+  document.body.style.overflow = 'hidden';
+  let released = false;
+  return () => {
+    if (released) {
+      return;
+    }
+    released = true;
+    bodyScrollLockCount = Math.max(0, bodyScrollLockCount - 1);
+    if (bodyScrollLockCount === 0) {
+      document.body.style.overflow = '';
+    }
+  };
+}
 
 export interface ModalProps {
   isOpen: boolean;
@@ -20,7 +50,7 @@ export interface ModalProps {
   showCloseButton?: boolean;
   /** When false, clicks on the backdrop do not call onClose. Default true. */
   closeOnOverlayClick?: boolean;
-  /** Extra class on `.modal-overlay` (stacking / theme hooks for specific dialogs only). */
+  /** Extra class on `.modal-overlay` for dialog-specific stacking and layout hooks. */
   overlayClassName?: string;
   draggable?: boolean;
   resizable?: boolean;
@@ -54,6 +84,7 @@ export const Modal: React.FC<ModalProps> = ({
   ariaLabelledBy,
 }) => {
   const { t } = useI18n('components');
+  const [isPresent, setIsPresent] = useState(isOpen);
   const [position, setPosition] = useState<{ x: number; y: number } | null>(null);
   const [isDragging, setIsDragging] = useState(false);
   const [dragOffset, setDragOffset] = useState({ x: 0, y: 0 });
@@ -65,18 +96,32 @@ export const Modal: React.FC<ModalProps> = ({
   const headerRef = useRef<HTMLDivElement>(null);
   const previousFocusRef = useRef<HTMLElement | null>(null);
   const generatedTitleId = useId();
-  
+  const isExiting = !isOpen && isPresent;
+
   useEffect(() => {
     if (isOpen) {
-      document.body.style.overflow = 'hidden';
-    } else {
-      document.body.style.overflow = '';
+      setIsPresent(true);
+      return;
     }
 
-    return () => {
-      document.body.style.overflow = '';
-    };
-  }, [isOpen]);
+    if (!isPresent) {
+      return;
+    }
+
+    const exitTimer = window.setTimeout(() => {
+      setIsPresent(false);
+    }, MODAL_EXIT_DURATION_MS);
+
+    return () => window.clearTimeout(exitTimer);
+  }, [isOpen, isPresent]);
+
+  useEffect(() => {
+    if (!isOpen && !isPresent) {
+      return;
+    }
+
+    return lockBodyScroll();
+  }, [isOpen, isPresent]);
 
   useEffect(() => {
     const handleEscape = (e: KeyboardEvent) => {
@@ -202,11 +247,11 @@ export const Modal: React.FC<ModalProps> = ({
           height: modalHeight
         });
       }
-    } else if (!isOpen) {
+    } else if (!isOpen && !isPresent) {
       setPosition(null);
       setDimensions(null);
     }
-  }, [isOpen, draggable, resizable]);
+  }, [isOpen, isPresent, draggable, resizable]);
 
   const handleResizeStart = useCallback((e: React.MouseEvent, direction: string) => {
     if (!resizable || !modalRef.current) return;
@@ -297,7 +342,7 @@ export const Modal: React.FC<ModalProps> = ({
     }
   }, [isResizing, handleResizeMove, handleResizeEnd]);
 
-  if (!isOpen) return null;
+  if (!isOpen && !isPresent) return null;
 
   const appliedStyle = (draggable || resizable) && position ? {
     position: 'fixed' as const,
@@ -307,22 +352,33 @@ export const Modal: React.FC<ModalProps> = ({
     margin: 0,
     ...(dimensions && resizable ? { width: dimensions.width, height: dimensions.height } : {})
   } : {};
+  const dialogAppearanceState = [
+    draggable && 'draggable',
+    isDragging && 'dragging',
+    resizable && 'resizable',
+    isResizing && 'resizing',
+  ].filter(Boolean).join(' ');
 
   return createPortal(
     <div
       className={[
         'modal-overlay',
         placement !== 'center' ? `modal-overlay--${placement}` : '',
+        isExiting ? 'modal-overlay--exiting' : '',
         overlayClassName ?? '',
       ]
         .filter(Boolean)
         .join(' ')}
       onClick={closeOnOverlayClick ? onClose : undefined}
+      data-bf-component="modal"
+      data-bf-part="overlay"
+      data-bf-placement={placement}
     >
       <div
         ref={modalRef}
         role="dialog"
         aria-modal="true"
+        aria-hidden={isExiting || undefined}
         aria-label={ariaLabel}
         aria-labelledby={ariaLabelledBy ?? (title ? generatedTitleId : undefined)}
         tabIndex={-1}
@@ -333,6 +389,7 @@ export const Modal: React.FC<ModalProps> = ({
           isDragging ? 'modal--dragging' : '',
           resizable ? 'modal--resizable' : '',
           isResizing ? 'modal--resizing' : '',
+          isExiting ? 'modal--exiting' : '',
           contentInset ? 'modal--content-inset' : '',
           showCloseButton ? 'modal--with-close' : '',
         ]
@@ -342,6 +399,11 @@ export const Modal: React.FC<ModalProps> = ({
         onMouseDown={handleMouseDown}
         style={appliedStyle}
         data-testid={testId}
+        data-bf-component="modal"
+        data-bf-part="dialog"
+        data-bf-size={size}
+        data-bf-placement={placement}
+        data-bf-state={dialogAppearanceState || undefined}
       >
         {(title || showCloseButton) && (
           <div
@@ -351,6 +413,8 @@ export const Modal: React.FC<ModalProps> = ({
             ]
               .filter(Boolean)
               .join(' ')}
+            data-bf-component="modal"
+            data-bf-part="headerShell"
           >
             {(title || (draggable && showCloseButton)) && (
               <div
@@ -362,11 +426,14 @@ export const Modal: React.FC<ModalProps> = ({
                 ]
                   .filter(Boolean)
                   .join(' ')}
+                data-bf-component="modal"
+                data-bf-part="header"
+                data-bf-state={draggable ? 'draggable' : undefined}
               >
                 {title && (
-                  <div className="modal__title-group">
-                    <h2 id={generatedTitleId} className="modal__title" data-testid={titleTestId}>{title}</h2>
-                    {titleExtra && <span className="modal__title-extra">{titleExtra}</span>}
+                  <div className="modal__title-group" data-bf-component="modal" data-bf-part="titleGroup">
+                    <h2 id={generatedTitleId} className="modal__title" data-testid={titleTestId} data-bf-component="modal" data-bf-part="title">{title}</h2>
+                    {titleExtra && <span className="modal__title-extra" data-bf-component="modal" data-bf-part="titleExtra">{titleExtra}</span>}
                   </div>
                 )}
               </div>
@@ -378,6 +445,8 @@ export const Modal: React.FC<ModalProps> = ({
                 aria-label={t('modal.close')}
                 type="button"
                 data-testid={closeButtonTestId}
+                data-bf-component="modal"
+                data-bf-part="close"
               >
                 <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
                   <line x1="3" y1="3" x2="11" y2="11" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/>
@@ -396,24 +465,30 @@ export const Modal: React.FC<ModalProps> = ({
           ]
             .filter(Boolean)
             .join(' ')}
+          data-bf-component="modal"
+          data-bf-part="content"
+          data-bf-state={contentInset ? 'contentInset' : undefined}
         >
           {children}
         </div>
         
         {resizable && (
           <>
-            <div className="modal__resize-handle modal__resize-handle--n" onMouseDown={(e) => handleResizeStart(e, 'n')} />
-            <div className="modal__resize-handle modal__resize-handle--s" onMouseDown={(e) => handleResizeStart(e, 's')} />
-            <div className="modal__resize-handle modal__resize-handle--w" onMouseDown={(e) => handleResizeStart(e, 'w')} />
-            <div className="modal__resize-handle modal__resize-handle--e" onMouseDown={(e) => handleResizeStart(e, 'e')} />
-            <div className="modal__resize-handle modal__resize-handle--nw" onMouseDown={(e) => handleResizeStart(e, 'nw')} />
-            <div className="modal__resize-handle modal__resize-handle--ne" onMouseDown={(e) => handleResizeStart(e, 'ne')} />
-            <div className="modal__resize-handle modal__resize-handle--sw" onMouseDown={(e) => handleResizeStart(e, 'sw')} />
-            <div className="modal__resize-handle modal__resize-handle--se" onMouseDown={(e) => handleResizeStart(e, 'se')} />
+            {(['n', 's', 'w', 'e', 'nw', 'ne', 'sw', 'se'] as const).map(direction => (
+              <div
+                key={direction}
+                className={`modal__resize-handle modal__resize-handle--${direction}`}
+                onMouseDown={(e) => handleResizeStart(e, direction)}
+                data-bf-component="modal"
+                data-bf-part="resizeHandle"
+                data-bf-resize-direction={direction}
+                data-bf-state={isResizing ? 'resizing' : 'resizable'}
+              />
+            ))}
           </>
         )}
       </div>
     </div>,
-    document.body
+    getAppearanceOverlayHost()
   );
 };

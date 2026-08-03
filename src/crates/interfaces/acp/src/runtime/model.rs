@@ -4,6 +4,7 @@ use agent_client_protocol::schema::{
     SetSessionModelRequest, SetSessionModelResponse,
 };
 use agent_client_protocol::{Error, Result};
+use bitfun_agent_runtime::sdk::AgentSessionModelUpdateRequest;
 use bitfun_core::agentic::agents::get_agent_registry;
 use bitfun_core::service::config::types::AIConfig;
 use bitfun_core::service::config::{GlobalConfig, GlobalConfigManager};
@@ -21,7 +22,9 @@ impl BitfunAcpRuntime {
     ) -> Result<SetSessionModelResponse> {
         let session_id = request.session_id.to_string();
         let model_id = request.model_id.to_string();
-        self.set_session_model_id(&session_id, &model_id).await?;
+        let (session, _lifecycle_guard) = self.lock_active_session(&session_id).await?;
+        self.set_session_model_id_for_active(&session, &model_id)
+            .await?;
         Ok(SetSessionModelResponse::new())
     }
 
@@ -36,13 +39,16 @@ impl BitfunAcpRuntime {
             .as_value_id()
             .ok_or_else(|| Error::invalid_params().data("config option value must be a string"))?
             .to_string();
+        let (session, _lifecycle_guard) = self.lock_active_session(&session_id).await?;
 
         match config_id.as_str() {
             MODEL_CONFIG_ID => {
-                self.set_session_model_id(&session_id, &value).await?;
+                self.set_session_model_id_for_active(&session, &value)
+                    .await?;
             }
             MODE_CONFIG_ID => {
-                self.update_session_mode_inner(&session_id, &value).await?;
+                self.update_session_mode_for_active(&session, &value)
+                    .await?;
             }
             _ => {
                 return Err(Error::invalid_params()
@@ -63,25 +69,26 @@ impl BitfunAcpRuntime {
         ))
     }
 
-    async fn set_session_model_id(&self, session_id: &str, model_id: &str) -> Result<()> {
-        let acp_session = self
-            .sessions
-            .get(session_id)
-            .ok_or_else(|| Error::resource_not_found(Some(session_id.to_string())))?;
-        let bitfun_session_id = acp_session.bitfun_session_id.clone();
-        drop(acp_session);
-
+    async fn set_session_model_id_for_active(
+        &self,
+        session: &super::AcpSessionState,
+        model_id: &str,
+    ) -> Result<()> {
         let normalized_model_id = normalize_model_selection(model_id).await?;
 
-        self.agentic_system
-            .coordinator
-            .update_session_model(&bitfun_session_id, &normalized_model_id)
+        self.agent_runtime
+            .update_session_model(AgentSessionModelUpdateRequest {
+                session_id: session.bitfun_session_id.clone(),
+                model_id: normalized_model_id.clone(),
+            })
             .await
-            .map_err(Self::internal_error)?;
+            .map_err(|error| Self::session_runtime_error(&session.acp_session_id, error))?;
 
-        if let Some(mut state) = self.sessions.get_mut(session_id) {
-            state.model_id = normalized_model_id;
-        }
+        let mut state = self
+            .sessions
+            .get_mut(&session.acp_session_id)
+            .ok_or_else(|| Error::resource_not_found(Some(session.acp_session_id.clone())))?;
+        state.model_id = normalized_model_id;
 
         Ok(())
     }
@@ -230,6 +237,17 @@ mod tests {
     use bitfun_core::service::config::types::{AIConfig, AIModelConfig};
 
     #[test]
+    fn acp_session_model_mutation_uses_the_runtime_sdk() {
+        let source = include_str!("model.rs");
+        let runtime_update = ["agent_runtime", "\n            .update_session_model"].concat();
+        let compatibility_update =
+            ["compatibility", "\n            .update_session_model"].concat();
+
+        assert!(source.contains(&runtime_update));
+        assert!(!source.contains(&compatibility_update));
+    }
+
+    #[test]
     fn normalize_session_model_defaults_to_auto() {
         assert_eq!(normalize_session_model_id(None), AUTO_MODEL_ID);
         assert_eq!(normalize_session_model_id(Some("")), AUTO_MODEL_ID);
@@ -249,18 +267,14 @@ mod tests {
     }
 
     #[test]
-    fn current_model_resolves_name_to_model_id() {
+    fn current_model_accepts_enabled_canonical_model_id() {
         let mut ai_config = AIConfig::default();
         ai_config.models.push(AIModelConfig {
             id: "model-a".to_string(),
-            name: "Readable Model".to_string(),
             enabled: true,
             ..Default::default()
         });
 
-        assert_eq!(
-            current_model_id(&ai_config, Some("Readable Model")),
-            "model-a"
-        );
+        assert_eq!(current_model_id(&ai_config, Some("model-a")), "model-a");
     }
 }

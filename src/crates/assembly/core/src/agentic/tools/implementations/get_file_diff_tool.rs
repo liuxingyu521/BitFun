@@ -1264,7 +1264,7 @@ Usage:
     }
 
     fn default_exposure(&self) -> ToolExposure {
-        ToolExposure::Collapsed
+        ToolExposure::Deferred
     }
 
     fn input_schema(&self) -> Value {
@@ -1301,10 +1301,6 @@ Usage:
 
     fn is_concurrency_safe(&self, _input: Option<&Value>) -> bool {
         true
-    }
-
-    fn needs_permissions(&self, _input: Option<&Value>) -> bool {
-        false
     }
 
     async fn validate_input(
@@ -1511,6 +1507,10 @@ Usage:
 
         let relative_path =
             Self::workspace_relative_path(Path::new(&resolved.resolved_path), context);
+        crate::agentic::deep_review::scope::ensure_focused_review_path_allowed(
+            context,
+            relative_path.as_deref().unwrap_or(file_path),
+        )?;
         let prepared_evidence = Self::target_evidence(context)?;
         if let Some(evidence) = prepared_evidence.as_ref() {
             if resolved.uses_remote_workspace_backend() {

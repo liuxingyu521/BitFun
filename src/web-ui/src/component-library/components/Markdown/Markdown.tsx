@@ -3,7 +3,7 @@
  * Used to render Markdown-formatted text
  */
 
-import React, { useState, useMemo, useCallback, useEffect, useLayoutEffect, Component, type ReactNode } from 'react';
+import React, { useState, useMemo, useCallback, useEffect, useLayoutEffect, useRef, Component, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import { X } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
@@ -19,9 +19,10 @@ import { buildMarkdownPrismStyle } from './markdownPrismTheme';
 import { Tooltip } from '../Tooltip';
 import { globalAPI, systemAPI, workspaceAPI } from '../../../infrastructure/api';
 import { getPrismLanguageFromAlias } from '@/infrastructure/language-detection';
-import { useTheme } from '@/infrastructure/theme';
+import { useAppearance } from '@/infrastructure/appearance';
 import { contextMenuController } from '@/shared/context-menu-system/core/ContextMenuController';
 import { ContextType, type CustomContext, type MenuItem } from '@/shared/context-menu-system/types';
+import { createTab } from '@/shared/utils/tabUtils';
 import { createLogger } from '@/shared/utils/logger';
 import {
   isStartupRenderTraceEnabled,
@@ -176,7 +177,7 @@ class MarkdownErrorBoundary extends Component<
   render() {
     if (this.state.hasError) {
       return (
-        <div className="markdown-renderer markdown-renderer--fallback" style={{ whiteSpace: 'pre-wrap' }}>
+        <div className="markdown-renderer markdown-renderer--fallback" style={{ whiteSpace: 'pre-wrap' }} data-bf-component="markdown" data-bf-part="fallback" data-bf-state="fallback">
           {this.props.fallbackContent}
         </div>
       );
@@ -484,34 +485,47 @@ function getMimeType(filePath: string): string {
   return mimeTypes[ext || ''] || 'image/jpeg';
 }
 
-async function getLocalImageDataUrl(localPath: string): Promise<string> {
-  const cachedDataUrl = localImageDataUrlCache.get(localPath);
+function getLocalImageCacheKey(localPath: string, remoteConnectionId?: string): string {
+  return JSON.stringify([remoteConnectionId || null, localPath]);
+}
+
+async function getLocalImageDataUrl(
+  localPath: string,
+  remoteConnectionId?: string,
+): Promise<string> {
+  const cacheKey = getLocalImageCacheKey(localPath, remoteConnectionId);
+  const cachedDataUrl = localImageDataUrlCache.get(cacheKey);
   if (cachedDataUrl) {
     return cachedDataUrl;
   }
 
-  const pendingRequest = localImageRequestCache.get(localPath);
+  const pendingRequest = localImageRequestCache.get(cacheKey);
   if (pendingRequest) {
     return pendingRequest;
   }
 
   const request = (async () => {
-    const base64Content = await workspaceAPI.readFileContent(localPath);
+    const base64Content = await workspaceAPI.readFileContent(
+      localPath,
+      'base64',
+      remoteConnectionId,
+    );
     const dataUrl = `data:${getMimeType(localPath)};base64,${base64Content}`;
-    localImageDataUrlCache.set(localPath, dataUrl);
-    localImageRequestCache.delete(localPath);
+    localImageDataUrlCache.set(cacheKey, dataUrl);
+    localImageRequestCache.delete(cacheKey);
     return dataUrl;
   })().catch((error) => {
-    localImageRequestCache.delete(localPath);
+    localImageRequestCache.delete(cacheKey);
     throw error;
   });
 
-  localImageRequestCache.set(localPath, request);
+  localImageRequestCache.set(cacheKey, request);
   return request;
 }
 
 interface MarkdownImageProps extends React.ImgHTMLAttributes<HTMLImageElement> {
   basePath?: string;
+  remoteConnectionId?: string;
   dataLocalPath?: string;
   dataOriginalSrc?: string;
 }
@@ -539,6 +553,7 @@ const MarkdownImage = React.memo<MarkdownImageProps>(({
   alt,
   className,
   basePath,
+  remoteConnectionId,
   dataLocalPath,
   dataOriginalSrc,
   ...imgProps
@@ -561,16 +576,19 @@ const MarkdownImage = React.memo<MarkdownImageProps>(({
     resolvedDataOriginalSrc,
     rawSrc,
   );
-  const cachedDataUrl = localPath ? localImageDataUrlCache.get(localPath) : undefined;
+  const cacheKey = localPath
+    ? getLocalImageCacheKey(localPath, remoteConnectionId)
+    : null;
+  const cachedDataUrl = cacheKey ? localImageDataUrlCache.get(cacheKey) : undefined;
   const [asyncDataUrl, setAsyncDataUrl] = useState<string | null>(null);
   const [loadState, setLoadState] = useState<'idle' | 'loading' | 'loaded' | 'error'>(() => {
-    if (!localPath) {
+    if (!localPath || !cacheKey) {
       return 'loaded';
     }
-    if (localImageDataUrlCache.has(localPath)) {
+    if (localImageDataUrlCache.has(cacheKey)) {
       return 'loaded';
     }
-    if (localImageRequestCache.has(localPath)) {
+    if (localImageRequestCache.has(cacheKey)) {
       return 'loading';
     }
     return 'idle';
@@ -578,11 +596,11 @@ const MarkdownImage = React.memo<MarkdownImageProps>(({
   const [lightboxOpen, setLightboxOpen] = useState(false);
 
   useEffect(() => {
-    if (!localPath) {
+    if (!localPath || !cacheKey) {
       return;
     }
 
-    const cached = localImageDataUrlCache.get(localPath);
+    const cached = localImageDataUrlCache.get(cacheKey);
     if (cached) {
       setAsyncDataUrl((current) => (current === cached ? current : cached));
       setLoadState((current) => (current === 'loaded' ? current : 'loaded'));
@@ -592,7 +610,7 @@ const MarkdownImage = React.memo<MarkdownImageProps>(({
     let cancelled = false;
     setLoadState((current) => (current === 'loading' ? current : 'loading'));
 
-    void getLocalImageDataUrl(localPath)
+    void getLocalImageDataUrl(localPath, remoteConnectionId)
       .then((dataUrl) => {
         if (cancelled) {
           return;
@@ -606,7 +624,11 @@ const MarkdownImage = React.memo<MarkdownImageProps>(({
           return;
         }
 
-        log.error('Failed to load local markdown image', { path: localPath, error });
+        log.error('Failed to load local markdown image', {
+          path: localPath,
+          remoteConnectionId,
+          error,
+        });
         setAsyncDataUrl(null);
         setLoadState('error');
       });
@@ -614,7 +636,7 @@ const MarkdownImage = React.memo<MarkdownImageProps>(({
     return () => {
       cancelled = true;
     };
-  }, [localPath]);
+  }, [cacheKey, localPath, remoteConnectionId]);
 
   const resolvedSrc = useMemo(() => {
     if (localPath) {
@@ -797,8 +819,14 @@ const CodeBlockFallback: React.FC<FlowCodeBlockFallbackProps> = ({
     <pre
       className={`language-${language} code-block-fallback code-block-fallback--linenumbers`}
       style={bodyStyle}
+      data-bf-component="markdown"
+      data-bf-part="codePre"
     >
-      <code style={{ ...codeTagStyle, display: 'flex' }}>
+      <code
+        style={{ ...codeTagStyle, display: 'flex' }}
+        data-bf-component="markdown"
+        data-bf-part="codeContent"
+      >
         <span
           aria-hidden="true"
           style={{
@@ -870,6 +898,7 @@ export interface LineRange {
 export interface MarkdownProps {
   content: string;
   basePath?: string;
+  remoteConnectionId?: string;
   className?: string;
   isStreaming?: boolean;
   expandDetailsByDefault?: boolean;
@@ -908,6 +937,7 @@ function markdownPropsAreEqual(prev: MarkdownProps, next: MarkdownProps): boolea
 export const Markdown = React.memo<MarkdownProps>(({ 
   content, 
   basePath,
+  remoteConnectionId,
   className = '',
   isStreaming = false,
   expandDetailsByDefault = false,
@@ -918,8 +948,14 @@ export const Markdown = React.memo<MarkdownProps>(({
   onReproductionProceed,
   traceContext,
 }) => {
-  const { isLight } = useTheme();
+  const { current: appearance } = useAppearance();
+  const isLight = appearance?.mode === 'light';
   const [currentWorkspacePath, setCurrentWorkspacePath] = useState('');
+  // Keep streaming flag out of `components` memo deps so flipping streaming
+  // mode does not rebuild the entire ReactMarkdown component map (that remount
+  // looked like the chat pane refreshed when a turn finished).
+  const isStreamingRef = useRef(isStreaming);
+  isStreamingRef.current = isStreaming;
   
   const syntaxTheme = useMemo(() => buildMarkdownPrismStyle(isLight), [isLight]);
   
@@ -1106,19 +1142,17 @@ export const Markdown = React.memo<MarkdownProps>(({
       return;
     }
 
-    window.dispatchEvent(new CustomEvent('agent-create-tab', {
-      detail: {
-        type: 'browser',
-        title: translateMarkdownLabel('markdown.openInBuiltInBrowser'),
-        data: { url },
-        metadata: {
-          duplicateCheckKey: `browser-panel:${url}`,
-        },
-        checkDuplicate: true,
-        duplicateCheckKey: `browser-panel:${url}`,
-        replaceExisting: false,
-      },
-    }));
+    const duplicateCheckKey = `browser-panel:${url}`;
+    createTab({
+      type: 'browser',
+      title: translateMarkdownLabel('markdown.openInBuiltInBrowser'),
+      data: { url },
+      metadata: { duplicateCheckKey },
+      checkDuplicate: true,
+      duplicateCheckKey,
+      replaceExisting: false,
+      mode: 'agent',
+    });
   }, []);
 
   const handleLocalFileContextMenu = useCallback((
@@ -1149,7 +1183,18 @@ export const Markdown = React.memo<MarkdownProps>(({
 
   const handleWebLinkContextMenu = useCallback((event: React.MouseEvent<HTMLElement>, url: string) => {
     const targetElement = event.currentTarget;
-    const items: MenuItem[] = [
+    const items: MenuItem[] = [];
+
+    if (canOpenInBuiltInBrowser(targetElement)) {
+      items.push({
+        id: 'markdown-open-in-built-in-browser',
+        label: translateMarkdownLabel('markdown.openInBuiltInBrowser'),
+        icon: 'PanelRightOpen',
+        onClick: () => handleOpenBuiltInBrowserLink(url),
+      });
+    }
+
+    items.push(
       {
         id: 'markdown-open-in-browser',
         label: translateMarkdownLabel('markdown.openInBrowser'),
@@ -1162,16 +1207,7 @@ export const Markdown = React.memo<MarkdownProps>(({
         icon: 'Copy',
         onClick: () => void handleCopyLink(url),
       },
-    ];
-
-    if (canOpenInBuiltInBrowser(targetElement)) {
-      items.splice(1, 0, {
-        id: 'markdown-open-in-built-in-browser',
-        label: translateMarkdownLabel('markdown.openInBuiltInBrowser'),
-        icon: 'PanelRightOpen',
-        onClick: () => handleOpenBuiltInBrowserLink(url),
-      });
-    }
+    );
 
     showLinkContextMenu(event, items, 'markdown-web-link', { url });
   }, [
@@ -1199,11 +1235,13 @@ export const Markdown = React.memo<MarkdownProps>(({
         );
       }
       
+      const streaming = isStreamingRef.current;
+
       if (language.toLowerCase().startsWith('mermaid')) {
         return (
           <MermaidBlock
             code={code}
-            isStreaming={isStreaming}
+            isStreaming={streaming}
           />
         );
       }
@@ -1216,36 +1254,25 @@ export const Markdown = React.memo<MarkdownProps>(({
         lineHeight: '1.55',
       };
       const codeTagStyle: React.CSSProperties = {
-        fontFamily: 'var(--font-family-mono)',
+        fontFamily: 'var(--bf-appearance-token-font-family-mono)',
       };
       const gutterColor = isLight
-        ? 'color-mix(in srgb, var(--color-static-black) 40%, var(--color-static-white))'
-        : 'color-mix(in srgb, var(--color-static-white) 40%, var(--color-static-black))';
+        ? 'color-mix(in srgb, var(--bf-appearance-token-color-static-black) 40%, var(--bf-appearance-token-color-static-white))'
+        : 'color-mix(in srgb, var(--bf-appearance-token-color-static-white) 40%, var(--bf-appearance-token-color-static-black))';
 
       return (
-        <div className={`code-block-wrapper${hasMultipleLines ? '' : ' code-block-wrapper--single-line'}`}>
-          <div className="code-block-toolbar">
+        <div className={`code-block-wrapper${hasMultipleLines ? '' : ' code-block-wrapper--single-line'}`} data-bf-component="markdown" data-bf-part="codeBlock" data-bf-state={streaming ? 'streaming' : undefined}>
+          <div className="code-block-toolbar" data-bf-component="markdown" data-bf-part="codeToolbar">
             <span className="code-block-lang">{formatCodeLanguageLabel(normalizedLang)}</span>
             <CopyButton code={code} />
           </div>
-          <div className="code-block-body">
-          {isStreaming ? (
-            // While the text is still streaming, skip the heavy Prism
-            // tokenization on every tick (it re-highlights the entire
-            // code each frame, which is the main source of code-block
-            // jitter in the chat). Render a lightweight, line-numbered
-            // <pre> that matches Prism's `showLineNumbers` layout so the
-            // gutter width and line indentation stay visually stable
-            // across the eventual fallback -> Prism swap when streaming
-            // completes.
-            <CodeBlockFallback
-              code={code}
-              language={normalizedLang}
-              bodyStyle={codeBodyStyle}
-              codeTagStyle={codeTagStyle}
-              gutterColor={gutterColor}
-            />
-          ) : (
+          <div className="code-block-body" data-bf-component="markdown" data-bf-part="codeBody">
+            {/*
+              Always mount AsyncPrismSyntaxHighlighter. While streaming,
+              preferFallback keeps the lightweight line-numbered pre so we do
+              not remount Fallback ↔ Prism when the turn finishes (that remount
+              flashed the chat pane).
+            */}
             <AsyncPrismSyntaxHighlighter
               language={normalizedLang}
               style={syntaxTheme}
@@ -1259,6 +1286,7 @@ export const Markdown = React.memo<MarkdownProps>(({
                 userSelect: 'none',
                 minWidth: '3em'
               }}
+              preferFallback={streaming}
               fallback={CodeBlockFallback}
               fallbackProps={{
                 code,
@@ -1271,7 +1299,6 @@ export const Markdown = React.memo<MarkdownProps>(({
             >
               {code}
             </AsyncPrismSyntaxHighlighter>
-          )}
           </div>
         </div>
       );
@@ -1328,6 +1355,8 @@ export const Markdown = React.memo<MarkdownProps>(({
           const fileLinkButton = (
             <button
               className="file-link"
+              data-bf-component="markdown"
+              data-bf-part="fileLink"
               onClick={(e) => {
                 e.preventDefault();
                 e.stopPropagation();
@@ -1369,6 +1398,8 @@ export const Markdown = React.memo<MarkdownProps>(({
         return (
           <button
             className="visualization-link"
+            data-bf-component="markdown"
+            data-bf-part="visualizationLink"
             onClick={(e) => {
               e.preventDefault();
               e.stopPropagation();
@@ -1392,6 +1423,8 @@ export const Markdown = React.memo<MarkdownProps>(({
         return (
           <button
             className="tab-link"
+            data-bf-component="markdown"
+            data-bf-part="tabLink"
             onClick={(e) => {
               e.preventDefault();
               e.stopPropagation();
@@ -1425,6 +1458,11 @@ export const Markdown = React.memo<MarkdownProps>(({
               e.preventDefault();
               e.stopPropagation();
               if (onHttpLinkClick?.(hrefValue, e)) {
+                return;
+              }
+              const hasExternalOpenModifier = e.metaKey || e.ctrlKey || e.shiftKey || e.altKey;
+              if (canOpenInBuiltInBrowser(e.currentTarget) && !hasExternalOpenModifier) {
+                handleOpenBuiltInBrowserLink(hrefValue);
                 return;
               }
               try {
@@ -1465,7 +1503,7 @@ export const Markdown = React.memo<MarkdownProps>(({
     
     table({ children }: any) {
       return (
-        <div className="table-wrapper">
+        <div className="table-wrapper" data-bf-component="markdown" data-bf-part="table">
           <table>{children}</table>
         </div>
       );
@@ -1480,11 +1518,17 @@ export const Markdown = React.memo<MarkdownProps>(({
     },
 
     img({ node: _node, ...props }: any) {
-      return <MarkdownImage {...props} basePath={markdownImageBasePath} />;
+      return (
+        <MarkdownImage
+          {...props}
+          basePath={markdownImageBasePath}
+          remoteConnectionId={remoteConnectionId}
+        />
+      );
     },
     
     blockquote({ children }: any) {
-      return <blockquote className="custom-blockquote">{children}</blockquote>;
+      return <blockquote className="custom-blockquote" data-bf-component="markdown" data-bf-part="blockquote">{children}</blockquote>;
     },
     
     ul({ children, ...props }: any) {
@@ -1511,13 +1555,15 @@ export const Markdown = React.memo<MarkdownProps>(({
     }
   }), [
     basePath,
+    remoteConnectionId,
     expandDetailsByDefault,
-    isStreaming,
     markdownContent,
     handleFileViewRequest,
     handleRevealInExplorer,
     handleLocalFileContextMenu,
     handleWebLinkContextMenu,
+    canOpenInBuiltInBrowser,
+    handleOpenBuiltInBrowserLink,
     handleOpenVisualization,
     handleTabOpen,
     onHttpLinkClick,
@@ -1541,7 +1587,7 @@ export const Markdown = React.memo<MarkdownProps>(({
   );
 
   return (
-    <div className={wrapperClassName}>
+    <div className={wrapperClassName} data-bf-component="markdown" data-bf-part="root" data-bf-state={isStreaming ? 'streaming' : undefined}>
       {renderTraceEnabled && renderTraceStartedAtMs !== null && (
         <MarkdownRenderTrace
           startedAtMs={renderTraceStartedAtMs}

@@ -20,73 +20,109 @@ type ConfigMigration = (&'static str, &'static str, ConfigMigrationFn);
 fn canonical_config_path(path: &str) -> &str {
     match path {
         "ai.review_teams.rate_limit_status" => "ai.review_team_rate_limit_status",
-        "theme.id" => "themes.current",
         _ => path,
     }
 }
 
-fn normalize_legacy_theme_id(theme_id: &str) -> String {
-    match theme_id.trim() {
-        "dark" => "bitfun-dark".to_string(),
-        "light" => "bitfun-light".to_string(),
-        normalized => normalized.to_string(),
-    }
-}
-
-fn normalize_legacy_theme_value(value: Value) -> Value {
-    match value {
-        Value::String(theme_id) => Value::String(normalize_legacy_theme_id(&theme_id)),
-        value => value,
-    }
-}
-
-pub(crate) fn normalize_legacy_theme_config_value(mut config: Value) -> Value {
-    let legacy_theme_id = config
-        .get("theme")
-        .and_then(|theme| theme.get("id"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|theme_id| !theme_id.is_empty())
-        .map(normalize_legacy_theme_id);
-
-    let Some(config_object) = config.as_object_mut() else {
+/// Moves the only trustworthy legacy mode choice into the new default domain.
+///
+/// Historical global model switching rewrote every `ai.agent_models` entry,
+/// including builtin subagents. Only the `agentic` mode entry is used as a
+/// migration hint when the new defaults are absent. The entire legacy mapping
+/// is removed after normalization.
+pub(crate) fn normalize_legacy_agent_model_defaults_config_value(mut config: Value) -> Value {
+    let Some(root) = config.as_object_mut() else {
         return config;
     };
-
-    config_object.remove("theme");
-
-    let Some(legacy_theme_id) = legacy_theme_id else {
-        return config;
-    };
-
-    let themes_value = config_object
-        .entry("themes".to_string())
+    let ai = root
+        .entry("ai".to_string())
         .or_insert_with(|| serde_json::json!({}));
+    let Some(ai) = ai.as_object_mut() else {
+        return config;
+    };
 
-    if !themes_value.is_object() {
-        *themes_value = serde_json::json!({});
-    }
-
-    if let Some(themes_object) = themes_value.as_object_mut() {
-        let has_current = themes_object
-            .get("current")
+    if !ai.contains_key("agent_model_defaults") {
+        let mode = ai
+            .get("agent_models")
+            .and_then(Value::as_object)
+            .and_then(|models| models.get("agentic"))
             .and_then(Value::as_str)
             .map(str::trim)
-            .is_some_and(|current| !current.is_empty());
+            .filter(|model| !model.is_empty())
+            .unwrap_or("auto")
+            .to_string();
 
-        if !has_current {
-            themes_object.insert("current".to_string(), Value::String(legacy_theme_id));
+        let defaults = AgentModelDefaultsConfig {
+            mode,
+            ..Default::default()
+        };
+        ai.insert(
+            "agent_model_defaults".to_string(),
+            serde_json::to_value(defaults).expect("agent model defaults should always serialize"),
+        );
+    }
+
+    ai.remove("agent_models");
+
+    config
+}
+
+/// Moves the retired global confirmation preference into the permission V2
+/// interaction setting before Serde drops the legacy field.
+pub(crate) fn normalize_legacy_tool_permissions_config_value(mut config: Value) -> Value {
+    let Some(root) = config.as_object_mut() else {
+        return config;
+    };
+
+    let has_tool_permissions = root.contains_key("tool_permissions");
+    let legacy_skip_confirmation = root
+        .get_mut("ai")
+        .and_then(Value::as_object_mut)
+        .and_then(|ai| ai.remove("skip_tool_confirmation"))
+        .and_then(|value| value.as_bool());
+
+    if !has_tool_permissions {
+        if let Some(auto_approve_ask) = legacy_skip_confirmation {
+            root.insert(
+                "tool_permissions".to_string(),
+                serde_json::json!({
+                    "policy": {
+                        "preset": "ask",
+                        "rules": [],
+                    },
+                    "interaction": {
+                        "auto_approve_ask": auto_approve_ask,
+                    },
+                }),
+            );
         }
     }
 
     config
 }
 
+fn normalize_legacy_config_value(config: Value) -> Value {
+    normalize_legacy_tool_permissions_config_value(
+        normalize_legacy_agent_model_defaults_config_value(config),
+    )
+}
+
 fn config_value_for_persistence(config: &GlobalConfig) -> BitFunResult<Value> {
     let mut value = serde_json::to_value(config)
         .map_err(|e| BitFunError::config(format!("Failed to serialize config: {}", e)))?;
+    prune_default_ai_tool_argument_json_repair(&mut value);
     prune_default_memories_config(&mut value)?;
     Ok(value)
+}
+
+fn prune_default_ai_tool_argument_json_repair(config_value: &mut Value) {
+    let Some(ai_config) = config_value.get_mut("ai").and_then(Value::as_object_mut) else {
+        return;
+    };
+
+    if ai_config.get("allow_tool_json_repair") == Some(&Value::Bool(true)) {
+        ai_config.remove("allow_tool_json_repair");
+    }
 }
 
 fn prune_default_memories_config(config_value: &mut Value) -> BitFunResult<()> {
@@ -199,7 +235,6 @@ impl ConfigManager {
 
     /// Creates the first config file using the already initialized defaults.
     async fn create_default_config(&mut self) -> BitFunResult<()> {
-        Self::add_default_agent_models_config(&mut self.config.ai.agent_models);
         Self::add_default_func_agent_models_config(&mut self.config.ai.func_agent_models);
         self.config.version = env!("CARGO_PKG_VERSION").to_string();
         self.save_config().await?;
@@ -216,8 +251,8 @@ impl ConfigManager {
         let mut config_value: Value = serde_json::from_str(&content).map_err(|e| {
             BitFunError::config(format!("Failed to parse config file as JSON: {}", e))
         })?;
-        let normalized_config_value = normalize_legacy_theme_config_value(config_value.clone());
-        let legacy_theme_normalized = normalized_config_value != config_value;
+        let normalized_config_value = normalize_legacy_config_value(config_value.clone());
+        let legacy_config_normalized = normalized_config_value != config_value;
         config_value = normalized_config_value;
 
         let file_version = config_value
@@ -249,12 +284,11 @@ impl ConfigManager {
         match serde_json::from_value::<GlobalConfig>(config_value.clone()) {
             Ok(mut config) => {
                 Self::ensure_models_config(&mut config.ai.models);
-                Self::add_default_agent_models_config(&mut config.ai.agent_models);
                 Self::add_default_func_agent_models_config(&mut config.ai.func_agent_models);
 
                 self.config = config;
 
-                if needs_migration || legacy_theme_normalized {
+                if needs_migration || legacy_config_normalized {
                     self.config.version = current_version;
                     self.save_config().await?;
                     info!("Config normalized and saved");
@@ -277,7 +311,7 @@ impl ConfigManager {
 
     /// Performs a smart merge from a JSON value.
     async fn smart_merge_config_from_value(&mut self, user_value: Value) -> BitFunResult<()> {
-        let user_value = normalize_legacy_theme_config_value(user_value);
+        let user_value = normalize_legacy_config_value(user_value);
         let base_config = self.providers.get_default_config();
 
         let base_value = serde_json::to_value(&base_config).map_err(|e| {
@@ -290,7 +324,6 @@ impl ConfigManager {
         })?;
 
         Self::ensure_models_config(&mut config.ai.models);
-        Self::add_default_agent_models_config(&mut config.ai.agent_models);
         Self::add_default_func_agent_models_config(&mut config.ai.func_agent_models);
 
         self.config = config;
@@ -312,18 +345,6 @@ impl ConfigManager {
             "Auto-completed category and capabilities for {} models",
             models.len()
         );
-    }
-
-    /// Adds default configuration for the primary agents (`agent_models`).
-    fn add_default_agent_models_config(
-        agent_models: &mut std::collections::HashMap<String, String>,
-    ) {
-        let agents_using_fast = vec!["Explore", "FileFinder", "GenerateDoc", "CodeReview"];
-        for key in agents_using_fast {
-            if !agent_models.contains_key(key) {
-                agent_models.insert(key.to_string(), "fast".to_string());
-            }
-        }
     }
 
     /// Adds default configuration for functional agents (`func_agent_models`).
@@ -410,14 +431,10 @@ impl ConfigManager {
         T: serde::Serialize,
     {
         let old_config = self.config.clone();
-        let mut json_value = serde_json::to_value(value)
+        let json_value = serde_json::to_value(value)
             .map_err(|e| BitFunError::config(format!("Failed to serialize config value: {}", e)))?;
 
-        let original_path = path;
         let path = canonical_config_path(path);
-        if original_path == "theme.id" {
-            json_value = normalize_legacy_theme_value(json_value);
-        }
         self.set_value_by_path(path, json_value)?;
         self.config.last_modified = chrono::Utc::now();
 
@@ -482,7 +499,7 @@ impl ConfigManager {
     /// Imports configuration.
     pub async fn import_config(&mut self, config_data: serde_json::Value) -> BitFunResult<()> {
         let old_config = self.config.clone();
-        let config_data = normalize_legacy_theme_config_value(config_data);
+        let config_data = normalize_legacy_config_value(config_data);
 
         let imported_config: GlobalConfig = serde_json::from_value(config_data)
             .map_err(|e| BitFunError::config(format!("Failed to parse imported config: {}", e)))?;
@@ -804,23 +821,6 @@ pub(crate) fn migrate_0_0_0_to_1_0_0(mut config: Value) -> BitFunResult<Value> {
         if !ai.contains_key("sub_agent_models") {
             ai.insert("sub_agent_models".to_string(), serde_json::json!({}));
         }
-        if !ai.contains_key("func_agent_models") {
-            let func_keys = [
-                "compression",
-                "startchat-func-agent",
-                "session-title-func-agent",
-                "git-func-agent",
-            ];
-            let mut fa = serde_json::Map::new();
-            if let Some(am) = ai.get("agent_models").and_then(|v| v.as_object()) {
-                for k in func_keys {
-                    if let Some(v) = am.get(k) {
-                        fa.insert(k.to_string(), v.clone());
-                    }
-                }
-            }
-            ai.insert("func_agent_models".to_string(), Value::Object(fa));
-        }
     }
 
     debug!("Migration 0.0.0 -> 1.0.0 completed");
@@ -830,7 +830,9 @@ pub(crate) fn migrate_0_0_0_to_1_0_0(mut config: Value) -> BitFunResult<Value> {
 #[cfg(test)]
 mod tests {
     use super::{
-        canonical_config_path, config_value_for_persistence, normalize_legacy_theme_config_value,
+        canonical_config_path, config_value_for_persistence,
+        normalize_legacy_agent_model_defaults_config_value,
+        normalize_legacy_tool_permissions_config_value,
     };
     use crate::service::config::types::GlobalConfig;
 
@@ -844,55 +846,137 @@ mod tests {
             canonical_config_path("ai.review_teams.default"),
             "ai.review_teams.default"
         );
-        assert_eq!(canonical_config_path("theme.id"), "themes.current");
     }
 
     #[test]
-    fn legacy_theme_id_moves_to_themes_current_when_missing() {
-        let normalized = normalize_legacy_theme_config_value(serde_json::json!({
-            "theme": {
-                "id": "dark",
-                "colors": {
-                    "background": "#1e1e1e"
+    fn legacy_agent_models_only_seed_the_shared_mode_default() {
+        let normalized = normalize_legacy_agent_model_defaults_config_value(serde_json::json!({
+            "ai": {
+                "agent_models": {
+                    "agentic": "primary",
+                    "Explore": "expensive-model"
                 }
             }
         }));
 
-        assert_eq!(normalized["themes"]["current"], "bitfun-dark");
-        assert!(
-            normalized.get("theme").is_none(),
-            "legacy GUI theme payload should not survive normalization"
+        assert_eq!(normalized["ai"]["agent_model_defaults"]["mode"], "primary");
+        assert_eq!(
+            normalized["ai"]["agent_model_defaults"]["subagents"]["default"],
+            serde_json::json!({ "kind": "fixed", "model_id": "fast" })
+        );
+        assert_eq!(
+            normalized["ai"]["agent_model_defaults"]["subagents"]["builtin"],
+            serde_json::json!({
+                "GeneralPurpose": { "kind": "fixed", "model_id": "primary" }
+            })
+        );
+        assert_eq!(
+            normalized["ai"]["agent_model_defaults"]["subagents"]["fork"],
+            serde_json::json!({ "kind": "inherit" })
+        );
+        assert!(normalized["ai"].get("agent_models").is_none());
+    }
+
+    #[test]
+    fn current_agent_model_defaults_win_before_legacy_mapping_is_removed() {
+        let normalized = normalize_legacy_agent_model_defaults_config_value(serde_json::json!({
+            "ai": {
+                "agent_models": {
+                    "agentic": "legacy-model"
+                },
+                "agent_model_defaults": {
+                    "mode": "current-model",
+                    "subagents": {
+                        "default": { "kind": "fixed", "model_id": "fast" },
+                        "builtin": {
+                            "GeneralPurpose": { "kind": "fixed", "model_id": "primary" }
+                        },
+                        "fork": { "kind": "inherit" }
+                    }
+                }
+            }
+        }));
+
+        assert_eq!(
+            normalized["ai"]["agent_model_defaults"]["mode"],
+            "current-model"
+        );
+        assert!(normalized["ai"].get("agent_models").is_none());
+    }
+
+    #[test]
+    fn current_config_without_legacy_mapping_is_unchanged() {
+        let config = serde_json::json!({
+            "ai": {
+                "agent_model_defaults": {
+                    "mode": "current-model"
+                }
+            }
+        });
+
+        assert_eq!(
+            normalize_legacy_agent_model_defaults_config_value(config.clone()),
+            config
         );
     }
 
     #[test]
-    fn legacy_theme_id_does_not_override_existing_theme_selection() {
-        let normalized = normalize_legacy_theme_config_value(serde_json::json!({
-            "theme": {
-                "id": "bitfun-dark"
-            },
-            "themes": {
-                "current": "bitfun-cyber"
-            }
-        }));
+    fn legacy_skip_confirmation_migrates_to_auto_approve_and_is_removed() {
+        for (skip_tool_confirmation, auto_approve_ask) in [(false, false), (true, true)] {
+            let normalized = normalize_legacy_tool_permissions_config_value(serde_json::json!({
+                "ai": {
+                    "skip_tool_confirmation": skip_tool_confirmation,
+                },
+            }));
 
-        assert_eq!(normalized["themes"]["current"], "bitfun-cyber");
-        assert!(normalized.get("theme").is_none());
+            assert_eq!(
+                normalized["tool_permissions"],
+                serde_json::json!({
+                    "policy": {
+                        "preset": "ask",
+                        "rules": [],
+                    },
+                    "interaction": {
+                        "auto_approve_ask": auto_approve_ask,
+                    },
+                })
+            );
+            assert!(normalized["ai"].get("skip_tool_confirmation").is_none());
+        }
     }
 
     #[test]
-    fn legacy_theme_id_fills_empty_existing_theme_selection() {
-        let normalized = normalize_legacy_theme_config_value(serde_json::json!({
-            "theme": {
-                "id": "light"
+    fn current_tool_permissions_win_and_legacy_skip_confirmation_is_removed() {
+        let tool_permissions = serde_json::json!({
+            "policy": {
+                "preset": "full_access",
+                "rules": [],
             },
-            "themes": {
-                "current": ""
-            }
+            "interaction": {
+                "auto_approve_ask": false,
+            },
+        });
+        let normalized = normalize_legacy_tool_permissions_config_value(serde_json::json!({
+            "tool_permissions": tool_permissions.clone(),
+            "ai": {
+                "skip_tool_confirmation": true,
+            },
         }));
 
-        assert_eq!(normalized["themes"]["current"], "bitfun-light");
-        assert!(normalized.get("theme").is_none());
+        assert_eq!(normalized["tool_permissions"], tool_permissions);
+        assert!(normalized["ai"].get("skip_tool_confirmation").is_none());
+    }
+
+    #[test]
+    fn malformed_legacy_skip_confirmation_is_removed_without_granting_access() {
+        let normalized = normalize_legacy_tool_permissions_config_value(serde_json::json!({
+            "ai": {
+                "skip_tool_confirmation": "true",
+            },
+        }));
+
+        assert!(normalized.get("tool_permissions").is_none());
+        assert!(normalized["ai"].get("skip_tool_confirmation").is_none());
     }
 
     #[test]
@@ -902,12 +986,29 @@ mod tests {
             config_value_for_persistence(&config).expect("config should serialize for persistence");
 
         assert!(value.get("memories").is_none());
+        assert!(value["ai"].get("agent_models").is_none());
+        assert!(value["ai"].get("allow_tool_json_repair").is_none());
+    }
+
+    #[test]
+    fn persistence_keeps_disabled_tool_argument_json_repair() {
+        let mut config = GlobalConfig::default();
+        config.ai.allow_tool_json_repair = false;
+
+        let value =
+            config_value_for_persistence(&config).expect("config should serialize for persistence");
+
+        assert_eq!(
+            value["ai"].get("allow_tool_json_repair"),
+            Some(&serde_json::json!(false))
+        );
     }
 
     #[test]
     fn persistence_keeps_only_non_default_memories_fields() {
         let mut config = GlobalConfig::default();
         config.memories.generate_memories = false;
+        config.memories.generate_for_btw_sessions = true;
         config.memories.max_rollouts_per_startup = 12;
 
         let value =
@@ -921,6 +1022,7 @@ mod tests {
         assert_eq!(
             value.get("memories"),
             Some(&serde_json::json!({
+                "generate_for_btw_sessions": true,
                 "max_rollouts_per_startup": 12
             }))
         );

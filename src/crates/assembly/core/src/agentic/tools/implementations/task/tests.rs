@@ -9,10 +9,13 @@ use crate::agentic::deep_review_policy::{
 };
 use crate::agentic::tools::framework::{Tool, ToolResult, ToolUseContext};
 use crate::agentic::tools::ToolRuntimeRestrictions;
+use crate::agentic::WorkspaceBinding;
+use crate::service::remote_ssh::workspace_state::WorkspaceSessionIdentity;
 use async_trait::async_trait;
 use bitfun_runtime_ports::DelegationPolicy;
 use serde_json::json;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 struct PromptOrderTestAgent {
@@ -62,6 +65,7 @@ fn register_prompt_order_test_subagent(
             SubAgentSource::Builtin => crate::agentic::agents::AgentSource::Builtin,
             SubAgentSource::Project => crate::agentic::agents::AgentSource::Project,
             SubAgentSource::User => crate::agentic::agents::AgentSource::User,
+            SubAgentSource::External => crate::agentic::agents::AgentSource::External,
         },
         Some(source),
         custom_config,
@@ -75,7 +79,7 @@ fn test_tool_context(agent_type: &str) -> ToolUseContext {
         session_id: Some("session-1".to_string()),
         dialog_turn_id: Some("turn-1".to_string()),
         workspace: None,
-        unlocked_collapsed_tools: Vec::new(),
+        loaded_deferred_tool_specs: Vec::new(),
         primary_model_facts: tool_runtime::context::PrimaryModelFacts::default(),
         custom_data: HashMap::new(),
         computer_use_host: None,
@@ -114,6 +118,8 @@ fn task_schema_accepts_optional_model_id() {
     let schema = TaskTool::new().input_schema();
 
     assert_eq!(schema["properties"]["action"]["type"], "string");
+    assert_eq!(schema["properties"]["agent_id"]["type"], "string");
+    assert!(schema["properties"].get("session_id").is_none());
     assert_eq!(schema["properties"]["model_id"]["type"], "string");
     assert!(schema["required"]
         .as_array()
@@ -125,6 +131,125 @@ fn task_schema_accepts_optional_model_id() {
         .unwrap()
         .iter()
         .any(|value| value.as_str() == Some("model_id")));
+}
+
+#[test]
+fn task_model_id_inherit_requests_parent_model_inheritance() {
+    let invocation = TaskTool::parse_invocation(
+        &json!({
+            "action": "spawn",
+            "description": "Inspect parser",
+            "prompt": "Inspect the parser flow.",
+            "subagent_type": "Explore",
+            "model_id": "inherit"
+        }),
+        false,
+    )
+    .expect("inherit should be accepted as a Task model selection");
+
+    assert_eq!(invocation.model_id, None);
+    assert!(invocation.inherit_parent_model);
+}
+
+#[tokio::test]
+async fn validate_input_accepts_review_background_for_agent_wait() {
+    let validation = TaskTool::new()
+        .validate_input(
+            &json!({
+                "action": "spawn",
+                "description": "Review changes",
+                "prompt": "Review the current diff",
+                "subagent_type": "CodeReview",
+                "run_in_background": true
+            }),
+            None,
+        )
+        .await;
+
+    assert!(validation.result, "{:?}", validation.message);
+}
+
+#[tokio::test]
+async fn validate_input_preserves_non_review_background_tasks() {
+    let validation = TaskTool::new()
+        .validate_input(
+            &json!({
+                "action": "spawn",
+                "description": "Investigate logs",
+                "prompt": "Inspect the logs and report later",
+                "subagent_type": "GeneralPurpose",
+                "run_in_background": true
+            }),
+            None,
+        )
+        .await;
+
+    assert!(validation.result, "{:?}", validation.message);
+}
+
+#[test]
+fn code_review_tasks_are_serial_even_though_the_agent_is_readonly() {
+    let input = json!({
+        "action": "spawn",
+        "description": "Review changes",
+        "prompt": "Review the current diff",
+        "subagent_type": "CodeReview"
+    });
+
+    assert!(!TaskTool::new().is_concurrency_safe(Some(&input)));
+}
+
+#[test]
+fn only_scoped_review_workers_are_concurrency_safe() {
+    let specialist = json!({
+        "description": "Check trust boundary",
+        "prompt": "Use the security lens for this exact boundary",
+        "subagent_type": "ReviewWorker"
+    });
+    let managed_packet = json!({
+        "description": "Review batch 1",
+        "prompt": "Review only the files assigned to this packet",
+        "subagent_type": "ReviewWorker",
+        "packet_id": "managed-review:batch-1"
+    });
+    let focused_check = json!({
+        "description": "Check trust boundary",
+        "prompt": "Use the selected guidance for this exact boundary",
+        "subagent_type": "ReviewWorker",
+        "focused_assignment": { "question": "Can this boundary be bypassed?" }
+    });
+    let judge_packet = json!({
+        "description": "Validate disputed finding",
+        "prompt": "Validate only the disputed finding after reviewers finish",
+        "subagent_type": "ReviewJudge",
+        "packet_id": "judge:ReviewJudge"
+    });
+
+    let tool = LaunchReviewAgentTool::new();
+    assert!(!tool.is_concurrency_safe(Some(&specialist)));
+    assert!(tool.is_concurrency_safe(Some(&managed_packet)));
+    assert!(tool.is_concurrency_safe(Some(&focused_check)));
+    assert!(!tool.is_concurrency_safe(Some(&judge_packet)));
+}
+
+#[tokio::test]
+async fn launch_review_agent_describes_one_dynamic_worker_instead_of_fixed_reviewers() {
+    let description = LaunchReviewAgentTool::new()
+        .description()
+        .await
+        .expect("LaunchReviewAgent description should render");
+
+    assert!(description.contains("`ReviewWorker`"));
+    for legacy_reviewer in [
+        "ReviewBusinessLogic",
+        "ReviewArchitecture",
+        "ReviewPerformance",
+        "ReviewSecurity",
+        "ReviewFrontend",
+        "ReviewGeneral",
+    ] {
+        assert!(!description.contains(legacy_reviewer));
+    }
 }
 
 #[test]
@@ -146,7 +271,7 @@ fn task_schema_describes_spawn_context_modes_as_exclusive() {
 }
 
 #[tokio::test]
-async fn launch_review_agent_schema_exposes_retry_without_session_or_fork_controls() {
+async fn launch_review_agent_schema_exposes_retry_without_agent_or_fork_controls() {
     let context = test_tool_context("DeepReview");
     let schema = LaunchReviewAgentTool::new()
         .input_schema_for_model_with_context(Some(&context))
@@ -158,8 +283,25 @@ async fn launch_review_agent_schema_exposes_retry_without_session_or_fork_contro
     assert_eq!(schema["properties"]["retry"]["type"], "boolean");
     assert_eq!(schema["properties"]["auto_retry"]["type"], "boolean");
     assert_eq!(schema["properties"]["retry_coverage"]["type"], "object");
+    assert_eq!(schema["properties"]["packet_id"]["type"], "string");
+    assert_eq!(schema["properties"]["focused_assignment"]["type"], "object");
+    assert_eq!(
+        schema["properties"]["focused_assignment"]["properties"]["display_label"]["type"],
+        "string"
+    );
+    let display_label_description = schema["properties"]["focused_assignment"]["properties"]
+        ["display_label"]["description"]
+        .as_str()
+        .expect("display_label description should be a string");
+    assert!(display_label_description.contains("file paths"));
+    assert!(!display_label_description.contains("packet, path, model"));
+    assert!(!schema["properties"]["focused_assignment"]["required"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|value| value.as_str() == Some("display_label")));
     assert!(schema["properties"].get("fork_context").is_none());
-    assert!(schema["properties"].get("session_id").is_none());
+    assert!(schema["properties"].get("agent_id").is_none());
     assert!(schema["properties"].get("run_in_background").is_none());
     assert!(schema["required"]
         .as_array()
@@ -168,17 +310,177 @@ async fn launch_review_agent_schema_exposes_retry_without_session_or_fork_contro
         .any(|value| value.as_str() == Some("subagent_type")));
 }
 
+#[tokio::test]
+async fn code_review_delegation_requires_an_explicit_adaptive_manifest() {
+    let tool = LaunchReviewAgentTool::new();
+    let direct_context = test_tool_context("CodeReview");
+    assert!(!tool.is_available_in_context(Some(&direct_context)).await);
+
+    let mut prepared_context = test_tool_context("CodeReview");
+    prepared_context.custom_data.insert(
+        "deep_review_run_manifest".to_string(),
+        json!({
+            "reviewMode": "deep",
+            "adaptiveReview": { "version": 1, "maxFocusedCalls": 2 }
+        }),
+    );
+    assert!(tool.is_available_in_context(Some(&prepared_context)).await);
+}
+
+#[tokio::test]
+async fn adaptive_code_review_worker_is_admitted_by_the_task_runtime() {
+    let direct_context = test_tool_context("CodeReview");
+    let direct_types = TaskTool::new()
+        .get_agents_types(Some(&direct_context))
+        .await;
+    assert!(!direct_types.iter().any(|agent| agent == "ReviewWorker"));
+
+    let mut prepared_context = test_tool_context("CodeReview");
+    prepared_context.custom_data.insert(
+        "deep_review_run_manifest".to_string(),
+        json!({
+            "reviewMode": "deep",
+            "adaptiveReview": { "version": 1, "maxFocusedCalls": 2 }
+        }),
+    );
+    let prepared_types = TaskTool::new()
+        .get_agents_types(Some(&prepared_context))
+        .await;
+    assert!(prepared_types.iter().any(|agent| agent == "ReviewWorker"));
+}
+
+#[tokio::test]
+async fn adaptive_review_delegation_is_hidden_for_remote_workspaces() {
+    let tool = LaunchReviewAgentTool::new();
+    let mut context = test_tool_context("CodeReview");
+    context.workspace = Some(WorkspaceBinding::new_remote(
+        None,
+        PathBuf::from("/workspace/project"),
+        "connection-1".to_string(),
+        "remote".to_string(),
+        WorkspaceSessionIdentity {
+            hostname: "remote.example".to_string(),
+            logical_workspace_path: "/workspace/project".to_string(),
+            remote_connection_id: Some("connection-1".to_string()),
+        },
+    ));
+    context.custom_data.insert(
+        "deep_review_run_manifest".to_string(),
+        json!({
+            "reviewMode": "deep",
+            "adaptiveReview": { "version": 1, "maxFocusedCalls": 2 }
+        }),
+    );
+
+    assert!(!tool.is_available_in_context(Some(&context)).await);
+
+    context.custom_data.insert(
+        "deep_review_run_manifest".to_string(),
+        json!({
+            "reviewMode": "deep",
+            "adaptiveReview": { "version": 1, "maxFocusedCalls": 2 },
+            "managedReviewPlan": { "version": 1, "maxBatches": 2 }
+        }),
+    );
+    assert!(tool.is_available_in_context(Some(&context)).await);
+    let description = tool
+        .description_with_context(Some(&context))
+        .await
+        .expect("managed remote description should render");
+    assert!(!description.contains("<review_capabilities>"));
+}
+
+fn managed_review_tool_context() -> ToolUseContext {
+    let mut context = test_tool_context("DeepReview");
+    context.custom_data.insert(
+        "deep_review_run_manifest".to_string(),
+        json!({
+            "reviewMode": "deep",
+            "managedReviewPlan": { "version": 1 },
+            "workPackets": [{
+                "packetId": "managed-1",
+                "subagentId": "ReviewGeneral",
+                "launchBatch": 1
+            }]
+        }),
+    );
+    context
+}
+
+#[tokio::test]
+async fn managed_review_agent_requires_an_exact_packet_id() {
+    let context = managed_review_tool_context();
+    let tool = LaunchReviewAgentTool::new();
+    let without_packet = tool
+        .validate_input(
+            &json!({
+                "description": "Review managed batch",
+                "prompt": "Review the assigned files",
+                "subagent_type": "ReviewGeneral"
+            }),
+            Some(&context),
+        )
+        .await;
+    let unknown_packet = tool
+        .validate_input(
+            &json!({
+                "description": "Review managed batch",
+                "prompt": "Review the assigned files",
+                "subagent_type": "ReviewGeneral",
+                "packet_id": "missing"
+            }),
+            Some(&context),
+        )
+        .await;
+    let valid_packet = tool
+        .validate_input(
+            &json!({
+                "description": "Review managed batch",
+                "prompt": "Review the assigned files",
+                "subagent_type": "ReviewGeneral",
+                "packet_id": "managed-1"
+            }),
+            Some(&context),
+        )
+        .await;
+
+    assert!(!without_packet.result);
+    assert!(!unknown_packet.result);
+    assert!(valid_packet.result);
+}
+
+#[tokio::test]
+async fn non_managed_review_agent_rejects_an_untrusted_packet_id() {
+    let context = test_tool_context("DeepReview");
+    let validation = LaunchReviewAgentTool::new()
+        .validate_input(
+            &json!({
+                "description": "Check one trust boundary",
+                "prompt": "Apply the security lens to the exact boundary",
+                "subagent_type": "ReviewWorker",
+                "packet_id": "reviewer:forged"
+            }),
+            Some(&context),
+        )
+        .await;
+
+    assert!(!validation.result);
+    assert!(validation
+        .message
+        .as_deref()
+        .is_some_and(|message| message.contains("only valid for managed Review packets")));
+}
+
 #[test]
-fn background_subagent_start_acknowledgement_uses_session_id_only() {
-    let message = TaskTool::background_subagent_started_assistant_message("subagent-session-123");
+fn background_subagent_start_acknowledgement_exposes_agent_wait_task_id() {
+    let message = TaskTool::background_subagent_started_assistant_message("a1", "bg1");
 
     assert!(message.starts_with("Background subagent started successfully."));
-    assert!(message.contains("session_id: \"subagent-session-123\""));
-    assert!(message.contains("Avoid polling for status updates."));
+    assert!(message.contains("agent_id: \"a1\""));
+    assert!(message.contains("bg_task_id: \"bg1\""));
+    assert!(message.contains("Use AgentWait"));
     assert!(!message.contains("GeneralPurpose"));
     assert!(!message.contains("<background_task"));
-    assert!(!message.contains("bg-subagent-123"));
-    assert!(!message.contains("background_task_id="));
 }
 
 #[tokio::test]
@@ -252,6 +554,48 @@ async fn validate_input_accepts_fork_context_with_model_id() {
 }
 
 #[tokio::test]
+async fn validate_input_accepts_fork_spawn_with_neutral_flat_schema_placeholders() {
+    let validation = TaskTool::new()
+        .validate_input(
+            &json!({
+                "action": "spawn",
+                "agent_id": "",
+                "description": "delegate",
+                "fork_context": true,
+                "model_id": "inherit",
+                "prompt": "Inspect the repo",
+                "run_in_background": true,
+                "subagent_type": ""
+            }),
+            None,
+        )
+        .await;
+
+    assert!(validation.result, "{:?}", validation.message);
+}
+
+#[tokio::test]
+async fn validate_input_accepts_fresh_spawn_with_neutral_flat_schema_placeholders() {
+    let validation = TaskTool::new()
+        .validate_input(
+            &json!({
+                "action": "spawn",
+                "agent_id": "",
+                "description": "delegate",
+                "fork_context": false,
+                "model_id": "inherit",
+                "prompt": "Inspect the repo",
+                "run_in_background": true,
+                "subagent_type": "Explore"
+            }),
+            None,
+        )
+        .await;
+
+    assert!(validation.result, "{:?}", validation.message);
+}
+
+#[tokio::test]
 async fn validate_input_rejects_fork_context_with_subagent_type_as_mode_conflict() {
     let validation = TaskTool::new()
         .validate_input(
@@ -276,14 +620,14 @@ async fn validate_input_rejects_fork_context_with_subagent_type_as_mode_conflict
 }
 
 #[tokio::test]
-async fn validate_input_accepts_send_input_session_id_without_subagent_type() {
+async fn validate_input_accepts_send_input_agent_id_without_subagent_type() {
     let validation = TaskTool::new()
         .validate_input(
             &json!({
                 "action": "send_input",
                 "description": "continue",
                 "prompt": "Continue the previous analysis",
-                "session_id": "subagent-session-1"
+                "agent_id": "a1"
             }),
             None,
         )
@@ -300,7 +644,7 @@ async fn validate_input_accepts_send_input_with_model_id() {
                 "action": "send_input",
                 "description": "continue",
                 "prompt": "Continue the previous analysis",
-                "session_id": "subagent-session-1",
+                "agent_id": "a1",
                 "model_id": "fast"
             }),
             None,
@@ -311,19 +655,59 @@ async fn validate_input_accepts_send_input_with_model_id() {
 }
 
 #[tokio::test]
-async fn validate_input_infers_send_input_without_action_when_session_id_present() {
+async fn validate_input_accepts_send_input_with_neutral_spawn_placeholders() {
+    let validation = TaskTool::new()
+        .validate_input(
+            &json!({
+                "action": "send_input",
+                "agent_id": "a1",
+                "description": "continue",
+                "fork_context": false,
+                "prompt": "Continue the previous analysis",
+                "subagent_type": ""
+            }),
+            None,
+        )
+        .await;
+
+    assert!(validation.result, "{:?}", validation.message);
+}
+
+#[tokio::test]
+async fn validate_input_infers_send_input_without_action_when_agent_id_present() {
     let validation = TaskTool::new()
         .validate_input(
             &json!({
                 "description": "continue",
                 "prompt": "Continue the previous analysis",
-                "session_id": "subagent-session-1"
+                "agent_id": "a1"
             }),
             None,
         )
         .await;
 
     assert!(validation.result);
+}
+
+#[test]
+fn permission_intents_follow_the_agent_id_contract() {
+    let tool = TaskTool::new();
+    let context = test_tool_context("agentic");
+
+    for (action, expected_resource) in [("send_input", "send_input:a1"), ("cancel", "cancel:a1")] {
+        let intents = tool
+            .permission_intents(&json!({ "action": action, "agent_id": "a1" }), &context)
+            .expect("agent_id should produce a permission intent");
+
+        assert_eq!(intents.len(), 1);
+        assert_eq!(intents[0].action, "task");
+        assert_eq!(intents[0].resources, vec![expected_resource]);
+    }
+
+    let error = tool
+        .permission_intents(&json!({ "action": "send_input" }), &context)
+        .expect_err("send_input without agent_id should be rejected");
+    assert!(error.to_string().contains("agent_id is required"));
 }
 
 #[tokio::test]
@@ -334,7 +718,7 @@ async fn validate_input_rejects_send_input_with_subagent_type() {
                 "action": "send_input",
                 "description": "continue",
                 "prompt": "Continue the previous analysis",
-                "session_id": "subagent-session-1",
+                "agent_id": "a1",
                 "subagent_type": "Explore"
             }),
             None,
@@ -397,7 +781,7 @@ async fn validate_input_rejects_timeout_for_regular_parent() {
 #[tokio::test]
 async fn launch_review_agent_rejects_task_context_controls() {
     let context = test_tool_context("DeepReview");
-    for field in ["action", "fork_context", "session_id", "run_in_background"] {
+    for field in ["action", "fork_context", "agent_id", "run_in_background"] {
         let mut input = json!({
             "description": "delegate",
             "prompt": "Review security-sensitive files",
@@ -405,7 +789,7 @@ async fn launch_review_agent_rejects_task_context_controls() {
         });
         input[field] = match field {
             "action" => json!("spawn"),
-            "session_id" => json!("subagent-session-1"),
+            "agent_id" => json!("a1"),
             _ => json!(false),
         };
 
@@ -465,12 +849,12 @@ async fn launch_review_agent_rejects_non_string_model_id() {
 }
 
 #[tokio::test]
-async fn validate_input_accepts_cancel_with_session_id_only() {
+async fn validate_input_accepts_cancel_with_agent_id_only() {
     let validation = TaskTool::new()
         .validate_input(
             &json!({
                 "action": "cancel",
-                "session_id": "subagent-session-1"
+                "agent_id": "a1"
             }),
             None,
         )
@@ -485,7 +869,7 @@ async fn validate_input_accepts_cancel_with_description() {
         .validate_input(
             &json!({
                 "action": "cancel",
-                "session_id": "subagent-session-1",
+                "agent_id": "a1",
                 "description": "cancel task"
             }),
             None,
@@ -501,7 +885,7 @@ async fn validate_input_rejects_cancel_with_prompt() {
         .validate_input(
             &json!({
                 "action": "cancel",
-                "session_id": "subagent-session-1",
+                "agent_id": "a1",
                 "prompt": "Stop this work"
             }),
             None,
@@ -513,6 +897,26 @@ async fn validate_input_rejects_cancel_with_prompt() {
         .message
         .as_deref()
         .is_some_and(|message| message.contains("prompt is not allowed")));
+}
+
+#[tokio::test]
+async fn validate_input_accepts_cancel_with_neutral_optional_placeholders() {
+    let validation = TaskTool::new()
+        .validate_input(
+            &json!({
+                "action": "cancel",
+                "agent_id": "a1",
+                "fork_context": false,
+                "model_id": "",
+                "prompt": "",
+                "run_in_background": false,
+                "subagent_type": ""
+            }),
+            None,
+        )
+        .await;
+
+    assert!(validation.result, "{:?}", validation.message);
 }
 
 #[tokio::test]
@@ -532,7 +936,7 @@ async fn validate_input_rejects_fork_context_conflicting_fields() {
                 "description": "delegate",
                 "prompt": "Continue with inherited context",
                 "fork_context": true,
-                "session_id": "subagent-session-1"
+                "agent_id": "a1"
             }),
             None,
         )
@@ -542,7 +946,7 @@ async fn validate_input_rejects_fork_context_conflicting_fields() {
     assert!(validation
         .message
         .as_deref()
-        .is_some_and(|message| message.contains("session_id is not allowed")));
+        .is_some_and(|message| message.contains("agent_id is not allowed")));
 }
 
 #[tokio::test]
@@ -554,7 +958,7 @@ async fn call_impl_rejects_nested_subagent_delegation() {
         session_id: Some("session-1".to_string()),
         dialog_turn_id: Some("turn-1".to_string()),
         workspace: None,
-        unlocked_collapsed_tools: Vec::new(),
+        loaded_deferred_tool_specs: Vec::new(),
         primary_model_facts: tool_runtime::context::PrimaryModelFacts::default(),
         custom_data: HashMap::from([
             (
@@ -603,6 +1007,10 @@ fn deep_review_policy_allows_only_configured_team_members() {
 
     assert_eq!(
         policy.classify_subagent("ReviewBusinessLogic").unwrap(),
+        DeepReviewSubagentRole::Reviewer
+    );
+    assert_eq!(
+        policy.classify_subagent("ReviewGeneral").unwrap(),
         DeepReviewSubagentRole::Reviewer
     );
     assert_eq!(
@@ -695,7 +1103,7 @@ async fn description_with_context_filters_restricted_subagents_by_parent_agent()
         session_id: None,
         dialog_turn_id: None,
         workspace: None,
-        unlocked_collapsed_tools: Vec::new(),
+        loaded_deferred_tool_specs: Vec::new(),
         primary_model_facts: tool_runtime::context::PrimaryModelFacts::default(),
         custom_data: HashMap::new(),
         computer_use_host: None,
@@ -712,14 +1120,15 @@ async fn description_with_context_filters_restricted_subagents_by_parent_agent()
             .await
             .expect("agentic available agents should render");
     assert!(agentic_description.contains("<agent type=\"Explore\">"));
-    assert!(!agentic_description.contains("<agent type=\"ReviewSecurity\">"));
+    assert!(!agentic_description.contains("<agent type=\"ReviewWorker\">"));
     assert!(!agentic_description.contains("<agent type=\"ResearchSpecialist\">"));
 
     let deep_review_description =
         TaskTool::build_available_agents_context_section(Some(&deep_review_context))
             .await
             .expect("deep review available agents should render");
-    assert!(deep_review_description.contains("<agent type=\"ReviewSecurity\">"));
+    assert!(deep_review_description.contains("<agent type=\"ReviewWorker\">"));
+    assert!(!deep_review_description.contains("<agent type=\"ReviewSecurity\">"));
     assert!(!deep_review_description.contains("<agent type=\"ResearchSpecialist\">"));
 }
 
@@ -731,7 +1140,7 @@ async fn prompt_stability_description_with_context_renders_available_agents_in_s
         session_id: None,
         dialog_turn_id: None,
         workspace: None,
-        unlocked_collapsed_tools: Vec::new(),
+        loaded_deferred_tool_specs: Vec::new(),
         primary_model_facts: tool_runtime::context::PrimaryModelFacts::default(),
         custom_data: HashMap::new(),
         computer_use_host: None,
@@ -750,6 +1159,7 @@ async fn prompt_stability_description_with_context_renders_available_agents_in_s
         SubAgentSource::Project,
         Some(CustomSubagentConfig {
             model: "fast".to_string(),
+            model_is_explicit: true,
         }),
     );
     register_prompt_order_test_subagent(
@@ -757,6 +1167,7 @@ async fn prompt_stability_description_with_context_renders_available_agents_in_s
         SubAgentSource::Project,
         Some(CustomSubagentConfig {
             model: "fast".to_string(),
+            model_is_explicit: true,
         }),
     );
 
@@ -970,7 +1381,7 @@ async fn deep_review_capacity_queue_starts_later_batch_when_reviewer_capacity_fr
         auto_retry_elapsed_guard_seconds: 180,
     };
     let launch_batch_info = DeepReviewLaunchBatchInfo {
-        packet_id: Some("packet-b".to_string()),
+        packet_id: Some("packet-c".to_string()),
         launch_batch: 2,
     };
     let turn_id_owned = turn_id.to_string();

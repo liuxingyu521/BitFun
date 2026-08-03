@@ -18,13 +18,15 @@
 
 ---
 
-## 以 Code Agent 为核心的本地 AI 工作台
+## 融合多种 Agent 形态的新一代 AI 应用底座
 
-BitFun 基于一个面向长程任务、强调工程执行与 Token 经济性的 Code Agent 打造本地 AI 工作台。
+BitFun 以 Code Agent 的工程能力为核心，融合 Co-work 与 Claw（助手式 Agent），面向编码、办公和更多真实工作场景，打造本地优先的新一代 Agent 应用底座（含Rust构建的Agent Runtime 和完善的桌面端应用体验）。
 
-它能理解复杂上下文、调用工具、等待结果、修正偏差，把长程任务持续推进到可交付状态；编码、调研、办公、文档、桌面操作和可扩展工作流，都在同一个本地桌面环境里展开。
-
-核心目标：让 AI 从“Agent Loop 的迭代执行”进化成“可自主完成长期工作”的生产力系统。
+- **黑灯工厂**（正在构建中）：白天设计，夜间任务流转到服务器持续执行，早上直接验收成果。
+- **无限半径**（正在构建中）：从桌面、浏览器持续延伸到移动端、可穿戴等更多设备，让工作随时接入、连续协作。
+- **应用进化**：支持自定义 Agent、MCP、Skills、Mini App 乃至源码级改造，组合专属工作流；**社区伙伴已拓展出短剧、媒体等丰富版本**。
+- **多快好省**：追求更高效率、更优效果与更低成本。
+- **极致桌面**：持续打磨更易用、更好用、更漂亮的桌面体验。
 
 ![readme_hero_CN](./png/readme_hero_CN.png)
 
@@ -48,13 +50,13 @@ BitFun 在 **SWE-Bench-Pro** 和 **SWE-Bench-Verified** 上均领先 Open Code �
 
 Agent 执行是否经济，需要综合评估端到端 Token 消耗、执行耗时和 KV Cache 复用。当前先展示同一轮 SWE-Bench-Pro 中的 KV Cache 观察：BitFun 的平均 KV Cache 命中率为 **98.67%**。后续完整评测会继续补充更完整的成本与耗时指标。
 
-![KV Cache hit rate distribution](./png/kv_cache_hit_rate.svg)
+![KV Cache hit rate distribution](./png/kv_cache_hit_rate.png)
 
 ### 3. 其他体验指标
 
 成本之外，Agent 体验还取决于它能否在超大工程里快速找回上下文。面对 Chromium 这类千万行级代码仓库，BitFun 通过 **flashgrep** 最高降低约 **94.6%** 搜索耗时，平均加速约 **36.1x**。
 
-![flashgrep search speed](./png/flashgrep_search_speed.svg)
+![flashgrep search speed](./png/flashgrep_search_speed.png)
 
 ---
 
@@ -109,7 +111,7 @@ BitFun 的扩展路径从轻到重连续展开：
 | 层级 | 方式 | 适合场景 |
 | --- | --- | --- |
 | **L1** | Agent 自定义 | 定义角色、流程、约束和工具组合。 |
-| **L2** | MCP / Skills | 接入外部工具、专业能力和工作流。 |
+| **L2** | MCP / Skills / [Hooks](docs/features/agent-hooks.zh-CN.md) | 接入外部工具和专业能力，并在 Agent 生命周期节点运行你自己的命令 —— 完全兼容 Codex Hooks，已有脚本无需适配。 |
 | **L3** | Mini App | 为任务生成专属界面、表单、面板或可视化。 |
 | **L4** | 源码级改造 | 修改工具、适配器、UI、Runtime 或产品形态。 |
 

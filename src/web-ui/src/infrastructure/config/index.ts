@@ -7,10 +7,12 @@ export * from './core';
 
 // Types
 export * from './types';
+export * from './hooks';
 
 // Services
 export * from './services/ConfigManager';
 export * from './services/modelConfigs';
+export * from './services/PermissionConfigService';
 
 // Components
 export { default as AIModelConfig } from './components/AIModelConfig';
@@ -55,7 +57,7 @@ export const ConfigInfrastructureMetadata = {
   dependencies: ['event-bus'],
   capabilities: [
     'configuration-management',
-    'theme-switching',
+    'appearance-selection',
     'ai-model-configuration',
     'editor-settings',
     'import-export'

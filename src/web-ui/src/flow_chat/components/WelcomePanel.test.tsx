@@ -117,5 +117,7 @@ describe('WelcomePanel Git summary loading', () => {
     });
 
     expect(gitApiMock.getStatus).toHaveBeenCalledWith('D:/workspace/BitFun', 'welcome_panel');
+    expect(container.querySelector('[data-bf-part="workspaceAction"]')).not.toBeNull();
+    expect(container.querySelector('[data-bf-part="gitAction"]')).not.toBeNull();
   });
 });

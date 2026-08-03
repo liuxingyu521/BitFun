@@ -6,35 +6,45 @@
  * driven by settingsStore.activeTab.
  */
 
-import React, { lazy, Suspense, useEffect } from 'react';
+import React, {
+  Suspense,
+  useEffect,
+  useState,
+} from 'react';
 import { useSettingsStore } from './settingsStore';
+import type { ConfigTab } from './settingsConfig';
+import {
+  AcpAgentsConfig,
+  AIModelConfig,
+  AppearanceConfig,
+  ArchivedSessionsConfig,
+  BasicsConfig,
+  EditorConfig,
+  ExternalSourcesConfig,
+  HooksConfig,
+  KeyboardShortcutsTab,
+  McpToolsConfig,
+  MemoriesConfig,
+  QuickActionsConfig,
+  ReviewConfig,
+  SessionPermissionsConfig,
+  SessionPersonalizationConfig,
+  VoiceInputConfig,
+  WorktreesConfig,
+  isSettingsTabContentReady,
+  preloadSettingsTabContent,
+} from './settingsContentRegistry';
 import './SettingsScene.scss';
-
-const AIModelConfig = lazy(() => import('../../../infrastructure/config/components/AIModelConfig'));
-const McpToolsConfig = lazy(() => import('../../../infrastructure/config/components/McpToolsConfig'));
-const AcpAgentsConfig = lazy(() => import('../../../infrastructure/config/components/AcpAgentsConfig'));
-const EditorConfig = lazy(() => import('../../../infrastructure/config/components/EditorConfig'));
-const BasicsConfig = lazy(() => import('../../../infrastructure/config/components/BasicsConfig'));
-const AppearanceConfig = lazy(() => import('../../../infrastructure/config/components/AppearanceConfig'));
-const ReviewConfig = lazy(() => import('../../../infrastructure/config/components/ReviewConfig'));
-const MemoriesConfig = lazy(() => import('../../../infrastructure/config/components/MemoriesConfig'));
-const QuickActionsConfig = lazy(() => import('../../../infrastructure/config/components/QuickActionsConfig'));
-const ArchivedSessionsConfig = lazy(() => import('./components/ArchivedSessionsConfig'));
-const KeyboardShortcutsTab = lazy(() => import('./components/KeyboardShortcutsTab'));
-const SessionPersonalizationConfig = lazy(() =>
-  import('../../../infrastructure/config/components/SessionConfig').then((module) => ({
-    default: module.SessionPersonalizationConfig,
-  }))
-);
-const SessionPermissionsConfig = lazy(() =>
-  import('../../../infrastructure/config/components/SessionConfig').then((module) => ({
-    default: module.SessionPermissionsConfig,
-  }))
-);
 
 function SettingsSceneLoading() {
   return (
-    <div className="bitfun-settings-scene__loading" aria-busy="true" aria-hidden="true">
+    <div
+      className="bitfun-settings-scene__loading"
+      aria-busy="true"
+      aria-hidden="true"
+      data-bf-scene="settings"
+      data-bf-part="loading"
+    >
       <div className="bitfun-settings-scene__loading-line bitfun-settings-scene__loading-line--title" />
       <div className="bitfun-settings-scene__loading-line" />
       <div className="bitfun-settings-scene__loading-line" />
@@ -43,11 +53,34 @@ function SettingsSceneLoading() {
   );
 }
 
+function resolveSettingsContent(tab: ConfigTab): React.ComponentType | null {
+  switch (tab) {
+    case 'basics':                  return BasicsConfig;
+    case 'appearance':              return AppearanceConfig;
+    case 'models':                  return AIModelConfig;
+    case 'archived-sessions':       return ArchivedSessionsConfig;
+    case 'worktrees':               return WorktreesConfig;
+    case 'session-personalization': return SessionPersonalizationConfig;
+    case 'session-permissions':     return SessionPermissionsConfig;
+    case 'quick-actions':           return QuickActionsConfig;
+    case 'voice-input':             return VoiceInputConfig;
+    case 'review':                  return ReviewConfig;
+    case 'memories':                return MemoriesConfig;
+    case 'mcp-tools':               return McpToolsConfig;
+    case 'external-sources':        return ExternalSourcesConfig;
+    case 'hooks':                   return HooksConfig;
+    case 'acp-agents':              return AcpAgentsConfig;
+    case 'editor':                  return EditorConfig;
+    case 'keyboard':                return KeyboardShortcutsTab;
+    default:                        return null;
+  }
+}
+
 const SettingsScene: React.FC = () => {
   const activeTab = useSettingsStore(s => s.activeTab);
   const setActiveTab = useSettingsStore(s => s.setActiveTab);
 
-  const resolvedTab: typeof activeTab =
+  const resolvedTab: ConfigTab =
     (activeTab as string) === 'session-config' ? 'session-personalization' : activeTab;
 
   useEffect(() => {
@@ -57,31 +90,51 @@ const SettingsScene: React.FC = () => {
     }
   }, [activeTab, setActiveTab]);
 
-  let Content: React.ComponentType | null = null;
+  /**
+   * Cold entries into the scene (first open after launch, deep links) mount a
+   * panel whose chunk and i18n namespaces are still in flight, which paints the
+   * skeleton and then a frame of raw i18n keys. Hold the first paint until those
+   * resources land — an empty content area for a few ms reads as instant, a
+   * three-stage flash does not. SettingsNav preloads before it flips the active
+   * tab, so tab switches are never gated here.
+   */
+  const [firstPaintReady, setFirstPaintReady] = useState(() =>
+    isSettingsTabContentReady(resolvedTab)
+  );
 
-  switch (resolvedTab) {
-    case 'basics':           Content = BasicsConfig;         break;
-    case 'appearance':       Content = AppearanceConfig;     break;
-    case 'models':           Content = AIModelConfig;        break;
-    case 'archived-sessions': Content = ArchivedSessionsConfig; break;
-    case 'session-personalization': Content = SessionPersonalizationConfig; break;
-    case 'session-permissions':     Content = SessionPermissionsConfig;     break;
-    case 'quick-actions':    Content = QuickActionsConfig;   break;
-    case 'review':           Content = ReviewConfig;         break;
-    case 'memories':         Content = MemoriesConfig;       break;
-    case 'mcp-tools':        Content = McpToolsConfig;      break;
-    case 'acp-agents':       Content = AcpAgentsConfig;     break;
-    case 'editor':           Content = EditorConfig;         break;
-    case 'keyboard':         Content = KeyboardShortcutsTab; break;
-  }
+  useEffect(() => {
+    if (firstPaintReady) return;
+
+    let cancelled = false;
+    const commit = () => {
+      if (!cancelled) setFirstPaintReady(true);
+    };
+    void preloadSettingsTabContent(resolvedTab).then(commit, commit);
+
+    return () => {
+      cancelled = true;
+    };
+  }, [firstPaintReady, resolvedTab]);
+
+  const Content = firstPaintReady ? resolveSettingsContent(resolvedTab) : null;
 
   return (
-    <div className="bitfun-settings-scene" data-testid="settings-scene" data-settings-tab={resolvedTab}>
+    <div
+      className="bitfun-settings-scene"
+      data-testid="settings-scene"
+      data-settings-tab={resolvedTab}
+      data-bf-scene="settings"
+      data-bf-part="root"
+      data-bf-tab={resolvedTab}
+    >
       {Content && (
         <div
           key={resolvedTab}
           className="bitfun-settings-scene__content-wrapper"
           data-testid="settings-scene-content"
+          data-bf-scene="settings"
+          data-bf-part="content"
+          data-bf-tab={resolvedTab}
         >
           <Suspense fallback={<SettingsSceneLoading />}>
             <Content />

@@ -102,6 +102,7 @@ impl AgentRegistry {
                 .then(|| subagent_source_from_custom_kind(definition.level));
             let custom_config = CustomAgentConfig {
                 model: definition.model.clone(),
+                model_is_explicit: definition.model_is_explicit,
             };
             let entry = AgentEntry {
                 category: match definition.kind {
@@ -125,6 +126,9 @@ impl AgentRegistry {
                 }
                 AgentSource::Project => {
                     project_entries.entry(id).or_insert(entry);
+                }
+                AgentSource::External => {
+                    debug_assert!(false, "file-backed discovery cannot create external agents");
                 }
             }
         }
@@ -185,6 +189,7 @@ impl AgentRegistry {
         valid_models.push("primary".to_string());
         valid_models.push("fast".to_string());
         valid_models.push("auto".to_string());
+        valid_models.push("inherit".to_string());
         valid_models
     }
 
@@ -308,11 +313,12 @@ impl AgentRegistry {
         &self,
         agent_id: &str,
         model: Option<String>,
+        clear_model_override: bool,
         workspace_root: Option<&Path>,
     ) -> BitFunResult<()> {
         let mut map = self.write_agents();
         if let Some(entry) = map.get_mut(agent_id) {
-            return Self::update_custom_entry_config(agent_id, entry, model);
+            return Self::update_custom_entry_config(agent_id, entry, model, clear_model_override);
         }
         drop(map);
 
@@ -333,22 +339,29 @@ impl AgentRegistry {
             .get_mut(agent_id)
             .ok_or_else(|| BitFunError::agent(format!("Agent not found: {}", agent_id)))?;
 
-        Self::update_custom_entry_config(agent_id, entry, model)
+        Self::update_custom_entry_config(agent_id, entry, model, clear_model_override)
     }
 
     pub fn update_and_save_custom_subagent_config(
         &self,
         agent_id: &str,
         model: Option<String>,
+        clear_model_override: bool,
         workspace_root: Option<&Path>,
     ) -> BitFunResult<()> {
-        self.update_and_save_custom_agent_config(agent_id, model, workspace_root)
+        self.update_and_save_custom_agent_config(
+            agent_id,
+            model,
+            clear_model_override,
+            workspace_root,
+        )
     }
 
     fn update_custom_entry_config(
         agent_id: &str,
         entry: &mut AgentEntry,
         model: Option<String>,
+        clear_model_override: bool,
     ) -> BitFunResult<()> {
         let config = entry.custom_config.as_mut().ok_or_else(|| {
             BitFunError::agent(format!(
@@ -357,11 +370,24 @@ impl AgentRegistry {
             ))
         })?;
 
+        if model.is_none() && !clear_model_override {
+            return Err(BitFunError::agent(
+                "A model or clear_model_override is required".to_string(),
+            ));
+        }
+
         let new_model = model.unwrap_or_else(|| config.model.clone());
 
         if let Some(custom_mode) = entry.agent.as_any().downcast_ref::<CustomMode>() {
+            if clear_model_override {
+                return Err(BitFunError::agent(
+                    "Clearing the model override is only supported for custom subagents"
+                        .to_string(),
+                ));
+            }
             custom_mode.save_to_file(Some(&new_model))?;
             config.model = new_model;
+            config.model_is_explicit = true;
             return Ok(());
         }
 
@@ -376,8 +402,10 @@ impl AgentRegistry {
                 ))
             })?;
 
-        custom_subagent.save_to_file(Some(&new_model))?;
+        custom_subagent
+            .save_to_file_with_model_override(Some(&new_model), !clear_model_override)?;
         config.model = new_model;
+        config.model_is_explicit = !clear_model_override;
         Ok(())
     }
 
@@ -410,6 +438,25 @@ impl AgentRegistry {
         Ok(detail)
     }
 
+    pub async fn get_custom_subagent_detail_by_key(
+        &self,
+        agent_key: &str,
+        workspace_root: Option<&Path>,
+    ) -> BitFunResult<CustomAgentDetail> {
+        self.ensure_user_custom_agents_loaded().await;
+        if let Some(root) = workspace_root {
+            self.load_custom_agents(Some(root)).await;
+        }
+        let detail = self.get_custom_agent_detail_by_key_inner(agent_key, workspace_root)?;
+        if detail.kind != "subagent" {
+            return Err(BitFunError::agent(format!(
+                "Agent '{}' is not a subagent",
+                agent_key
+            )));
+        }
+        Ok(detail)
+    }
+
     fn get_custom_agent_detail_inner(
         &self,
         agent_id: &str,
@@ -418,6 +465,44 @@ impl AgentRegistry {
         let entry = self
             .find_agent_entry(agent_id, workspace_root)
             .ok_or_else(|| BitFunError::agent(format!("Agent not found: {}", agent_id)))?;
+        Self::custom_agent_detail_from_entry(agent_id, entry)
+    }
+
+    pub(super) fn get_custom_agent_detail_by_key_inner(
+        &self,
+        agent_key: &str,
+        workspace_root: Option<&Path>,
+    ) -> BitFunResult<CustomAgentDetail> {
+        let entry = {
+            let agents = self.read_agents();
+            agents
+                .values()
+                .find(|entry| {
+                    subagent_key_for(entry.subagent_source, entry.agent.as_ref()).as_deref()
+                        == Some(agent_key)
+                })
+                .cloned()
+        }
+        .or_else(|| {
+            let root = workspace_root?;
+            self.read_project_subagents()
+                .get(root)
+                .and_then(|entries| {
+                    entries.values().find(|entry| {
+                        subagent_key_for(entry.subagent_source, entry.agent.as_ref()).as_deref()
+                            == Some(agent_key)
+                    })
+                })
+                .cloned()
+        })
+        .ok_or_else(|| BitFunError::agent(format!("Agent not found: {}", agent_key)))?;
+        Self::custom_agent_detail_from_entry(agent_key, entry)
+    }
+
+    fn custom_agent_detail_from_entry(
+        agent_id: &str,
+        entry: AgentEntry,
+    ) -> BitFunResult<CustomAgentDetail> {
         if entry.source == AgentSource::Builtin {
             return Err(BitFunError::agent(
                 "Built-in agents cannot be edited here".to_string(),
@@ -521,13 +606,26 @@ impl AgentRegistry {
                 "Built-in agents cannot be edited".to_string(),
             ));
         }
+        let current_model_config = entry.custom_config.as_ref().ok_or_else(|| {
+            BitFunError::agent(format!(
+                "Agent '{}' is not a custom file-backed agent",
+                agent_id
+            ))
+        })?;
+        let definition_model = model
+            .as_deref()
+            .unwrap_or(current_model_config.model.as_str());
+        let definition_model_is_explicit =
+            model.is_some() || current_model_config.model_is_explicit;
 
         let readonly_tools = get_readonly_registered_tool_names().await;
         let valid_tools = get_all_registered_tool_names().await;
         let valid_models = Self::get_valid_model_ids().await;
 
         let replacement = if let Some(old) = entry.agent.as_any().downcast_ref::<CustomMode>() {
-            let mut definition = old.data.to_definition(model.as_deref());
+            let mut definition = old
+                .data
+                .to_definition(Some(definition_model), Some(definition_model_is_explicit));
             let used_default_tools = tools.is_none();
             definition.name = name;
             definition.description = description;
@@ -564,7 +662,9 @@ impl AgentRegistry {
             if review {
                 Self::ensure_review_tools_are_readonly(agent_id, &tools, &readonly_tools)?;
             }
-            let mut definition = old.data.to_definition(model.as_deref());
+            let mut definition = old
+                .data
+                .to_definition(Some(definition_model), Some(definition_model_is_explicit));
             definition.name = name;
             definition.description = description;
             definition.prompt = prompt;
@@ -590,7 +690,7 @@ impl AgentRegistry {
             custom_agent_from_definition(old.data.path.clone(), definition)
         };
 
-        save_runtime_custom_agent(&replacement, model.as_deref())?;
+        save_runtime_custom_agent(&replacement)?;
         self.replace_custom_agent_entry(agent_id, workspace_root, replacement)
     }
 
@@ -813,6 +913,10 @@ impl AgentRegistry {
                 .await?;
                 Ok(())
             }
+            Some(SubAgentSource::External) => Err(BitFunError::agent(format!(
+                "External subagent '{}' is read-only; manage it in External AI Apps",
+                agent_id
+            ))),
             None => Err(BitFunError::agent(format!(
                 "Agent '{}' has no subagent source",
                 agent_id
@@ -836,21 +940,22 @@ fn custom_agent_from_definition(path: String, definition: CustomAgentDefinition)
     }
 }
 
-fn save_runtime_custom_agent(agent: &Arc<dyn Agent>, model: Option<&str>) -> BitFunResult<()> {
+fn save_runtime_custom_agent(agent: &Arc<dyn Agent>) -> BitFunResult<()> {
     if let Some(custom_mode) = agent.as_any().downcast_ref::<CustomMode>() {
-        return custom_mode.save_to_file(model);
+        return custom_mode.save_to_file(None);
     }
     let custom_subagent = agent
         .as_any()
         .downcast_ref::<CustomSubagent>()
         .ok_or_else(|| BitFunError::agent("Failed to save custom agent".to_string()))?;
-    custom_subagent.save_to_file(model)
+    custom_subagent.save_to_file(None)
 }
 
 fn custom_config_from_agent(agent: &dyn Agent) -> BitFunResult<CustomAgentConfig> {
     if let Some(custom_mode) = agent.as_any().downcast_ref::<CustomMode>() {
         return Ok(CustomAgentConfig {
             model: custom_mode.data.model.clone(),
+            model_is_explicit: custom_mode.data.model_is_explicit,
         });
     }
     let custom_subagent = agent
@@ -859,6 +964,7 @@ fn custom_config_from_agent(agent: &dyn Agent) -> BitFunResult<CustomAgentConfig
         .ok_or_else(|| BitFunError::agent("Failed to read custom agent config".to_string()))?;
     Ok(CustomAgentConfig {
         model: custom_subagent.data.model.clone(),
+        model_is_explicit: custom_subagent.data.model_is_explicit,
     })
 }
 

@@ -1,8 +1,95 @@
 impl ChatView {
+    pub(crate) fn show_prompt_command_shell_review(
+        &mut self,
+        plan: bitfun_core::external_sources::PromptCommandShellReviewPlan,
+    ) {
+        self.prompt_command_shell_review =
+            Some(crate::ui::prompt_command_shell_review::PromptCommandShellReviewPrompt::new(plan));
+    }
+
+    pub(crate) fn prompt_command_shell_review_visible(&self) -> bool {
+        self.prompt_command_shell_review.is_some()
+    }
+
+    pub(crate) fn prompt_command_shell_review_handle_key(
+        &mut self,
+        key: crossterm::event::KeyEvent,
+    ) -> crate::ui::prompt_command_shell_review::PromptCommandShellReviewAction {
+        self.prompt_command_shell_review.as_mut().map_or(
+            crate::ui::prompt_command_shell_review::PromptCommandShellReviewAction::None,
+            |prompt| prompt.handle_key_event(key),
+        )
+    }
+
+    pub(crate) fn hide_prompt_command_shell_review(&mut self) {
+        self.prompt_command_shell_review = None;
+    }
+
+    pub(crate) fn show_export_dialog(&mut self, filename: String) {
+        self.export_dialog.show(filename);
+        self.popup_stack.push(PopupType::ExportDialog);
+    }
+
+    pub(crate) fn export_dialog_visible(&self) -> bool {
+        self.export_dialog.is_visible()
+    }
+
+    pub(crate) fn hide_export_dialog(&mut self) {
+        self.export_dialog.hide();
+    }
+
+    pub(crate) fn export_dialog_handle_key(
+        &mut self,
+        key: crossterm::event::KeyEvent,
+    ) -> crate::ui::export_dialog::ExportDialogAction {
+        self.export_dialog.handle_key_event(key)
+    }
+
+    pub(crate) fn export_dialog_handle_paste(&mut self, text: &str) {
+        self.export_dialog.insert_text(text);
+    }
+
+    pub(crate) fn export_dialog_confirm_overwrite(&mut self, target: String) {
+        self.export_dialog.request_overwrite_confirmation(target);
+    }
+
+    pub(crate) fn export_dialog_set_error(&mut self, error: String) {
+        self.export_dialog.set_error(error);
+    }
+
+    pub(crate) fn show_workspace_diff(
+        &mut self,
+        snapshot: bitfun_agent_runtime::sdk::WorkspaceDiffSnapshot,
+    ) {
+        self.workspace_diff.show(snapshot);
+        self.popup_stack.push(PopupType::WorkspaceDiff);
+    }
+
+    pub(crate) fn workspace_diff_visible(&self) -> bool {
+        self.workspace_diff.is_visible()
+    }
+
+    pub(crate) fn hide_workspace_diff(&mut self) {
+        self.workspace_diff.hide();
+    }
+
+    pub(crate) fn reshow_workspace_diff(&mut self) {
+        self.workspace_diff.reshow();
+    }
+
+    pub(crate) fn workspace_diff_handle_key(
+        &mut self,
+        key: crossterm::event::KeyEvent,
+    ) -> super::workspace_diff::WorkspaceDiffAction {
+        self.workspace_diff.handle_key_event(key)
+    }
+
     // ============ Info popup methods ============
 
     pub(crate) fn show_info_popup(&mut self, message: String) {
         self.info_popup = Some(message);
+        self.info_popup_scroll = 0;
+        self.info_popup_max_scroll = 0;
         self.popup_stack.push(PopupType::InfoPopup);
     }
 
@@ -12,12 +99,33 @@ impl ChatView {
 
     pub(crate) fn dismiss_info_popup(&mut self) {
         self.info_popup = None;
+        self.info_popup_scroll = 0;
+        self.info_popup_max_scroll = 0;
+    }
+
+    pub(crate) fn info_popup_scroll_up(&mut self, amount: u16) {
+        self.info_popup_scroll = self.info_popup_scroll.saturating_sub(amount);
+    }
+
+    pub(crate) fn info_popup_scroll_down(&mut self, amount: u16) {
+        self.info_popup_scroll = self
+            .info_popup_scroll
+            .saturating_add(amount)
+            .min(self.info_popup_max_scroll);
+    }
+
+    pub(crate) fn info_popup_scroll_to_start(&mut self) {
+        self.info_popup_scroll = 0;
+    }
+
+    pub(crate) fn info_popup_scroll_to_end(&mut self) {
+        self.info_popup_scroll = self.info_popup_max_scroll;
     }
 
     // ============ Command palette methods ============
 
-    pub(crate) fn show_command_palette(&mut self) {
-        self.command_palette.show();
+    pub(crate) fn show_command_palette(&mut self, action_state: crate::actions::ActionState) {
+        self.command_palette.show(action_state);
         self.popup_stack.push(PopupType::CommandPalette);
     }
 
@@ -26,14 +134,17 @@ impl ChatView {
     }
 
     pub(crate) fn reshow_command_palette(&mut self) {
-        self.command_palette.show();
+        self.command_palette.reshow();
     }
 
     pub(crate) fn command_palette_visible(&self) -> bool {
         self.command_palette.is_visible()
     }
 
-    pub(crate) fn command_palette_handle_key(&mut self, key: crossterm::event::KeyEvent) -> PaletteAction {
+    pub(crate) fn command_palette_handle_key(
+        &mut self,
+        key: crossterm::event::KeyEvent,
+    ) -> PaletteAction {
         self.command_palette.handle_key_event(key)
     }
 
@@ -44,7 +155,10 @@ impl ChatView {
         self.command_palette.handle_mouse_event(mouse)
     }
 
-    pub(crate) fn command_palette_captures_mouse(&self, mouse: &crossterm::event::MouseEvent) -> bool {
+    pub(crate) fn command_palette_captures_mouse(
+        &self,
+        mouse: &crossterm::event::MouseEvent,
+    ) -> bool {
         self.command_palette.captures_mouse(mouse)
     }
 
@@ -54,8 +168,15 @@ impl ChatView {
         &mut self,
         models: Vec<ModelItem>,
         current_model_id: Option<String>,
+        allow_edit: bool,
+        current_session_selection: bool,
     ) {
-        self.model_selector.show(models, current_model_id);
+        self.model_selector.show(
+            models,
+            current_model_id,
+            allow_edit,
+            current_session_selection,
+        );
         self.popup_stack.push(PopupType::ModelSelector);
     }
 
@@ -81,6 +202,10 @@ impl ChatView {
 
     pub(crate) fn model_selector_confirm(&self) -> Option<ModelItem> {
         self.model_selector.confirm_selection()
+    }
+
+    pub(crate) fn model_selector_allows_edit(&self) -> bool {
+        self.model_selector.allows_edit()
     }
 
     // ============ Theme selector methods ============
@@ -128,8 +253,26 @@ impl ChatView {
         &mut self,
         agents: Vec<AgentItem>,
         current_agent_id: Option<String>,
+        include_external_sources: bool,
+        allow_mode_switch: bool,
     ) {
-        self.agent_selector.show(agents, current_agent_id);
+        self.agent_selector.show(
+            agents,
+            current_agent_id,
+            include_external_sources,
+            allow_mode_switch,
+        );
+        self.popup_stack.push(PopupType::AgentSelector);
+    }
+
+    pub(crate) fn show_agent_modes_only(
+        &mut self,
+        agents: Vec<AgentItem>,
+        current_agent_id: Option<String>,
+        allow_mode_switch: bool,
+    ) {
+        self.agent_selector
+            .show_modes_only(agents, current_agent_id, allow_mode_switch);
         self.popup_stack.push(PopupType::AgentSelector);
     }
 
@@ -153,8 +296,12 @@ impl ChatView {
         self.agent_selector.move_down();
     }
 
-    pub(crate) fn agent_selector_confirm(&self) -> Option<AgentItem> {
+    pub(crate) fn agent_selector_confirm(&self) -> Option<AgentSelectorAction> {
         self.agent_selector.confirm_selection()
+    }
+
+    pub(crate) fn set_agent_mode_switch_allowed(&mut self, allowed: bool) {
+        self.agent_selector.set_mode_switch_allowed(allowed);
     }
 
     // ============ Skill selector methods ============
@@ -201,6 +348,7 @@ impl ChatView {
     // ============ Subagent selector methods ============
 
     pub(crate) fn show_subagent_menu(&mut self) {
+        self.agent_selector.hide();
         self.subagent_selector.show_menu();
         self.popup_stack.push(PopupType::SubagentSelector);
     }
@@ -279,7 +427,7 @@ impl ChatView {
     }
 
     /// Take the pending MCP toggle (set by mouse click)
-    pub(crate) fn take_pending_mcp_toggle(&mut self) -> Option<String> {
+    pub(crate) fn take_pending_mcp_toggle(&mut self) -> Option<McpItem> {
         self.pending_mcp_toggle.take()
     }
 
@@ -295,6 +443,18 @@ impl ChatView {
         self.mcp_selector.is_confirm_delete(server_id)
     }
 
+    pub(crate) fn mcp_selector_start_confirm_external(&mut self, server_id: String) {
+        self.mcp_selector.start_confirm_external(server_id);
+    }
+
+    pub(crate) fn mcp_selector_is_confirm_external(&self, server_id: &str) -> bool {
+        self.mcp_selector.is_confirm_external(server_id)
+    }
+
+    pub(crate) fn mcp_selector_cancel_confirm_external(&mut self) {
+        self.mcp_selector.cancel_confirm_external();
+    }
+
     // ============ MCP add dialog methods ============
 
     pub(crate) fn show_mcp_add_dialog(&mut self) {
@@ -306,7 +466,10 @@ impl ChatView {
         self.mcp_add_dialog.is_visible()
     }
 
-    pub(crate) fn mcp_add_dialog_handle_key(&mut self, key: crossterm::event::KeyEvent) -> McpAddAction {
+    pub(crate) fn mcp_add_dialog_handle_key(
+        &mut self,
+        key: crossterm::event::KeyEvent,
+    ) -> McpAddAction {
         self.mcp_add_dialog.handle_key_event(key)
     }
 
@@ -328,8 +491,10 @@ impl ChatView {
         &mut self,
         sessions: Vec<SessionItem>,
         current_session_id: Option<String>,
+        can_delete: bool,
     ) {
-        self.session_selector.show(sessions, current_session_id);
+        self.session_selector
+            .show(sessions, current_session_id, can_delete);
         self.popup_stack.push(PopupType::SessionSelector);
     }
 
@@ -354,6 +519,92 @@ impl ChatView {
 
     pub(crate) fn session_selector_remove_item(&mut self, session_id: &str) {
         self.session_selector.remove_item(session_id);
+    }
+
+    // ============ Fork selector methods ============
+
+    pub(crate) fn show_fork_selector(&mut self, points: Vec<crate::chat_state::SessionForkPoint>) {
+        self.clear_committed_message_anchor();
+        self.fork_selector.show(points);
+        self.popup_stack.push(PopupType::ForkSelector);
+    }
+
+    pub(crate) fn fork_selector_visible(&self) -> bool {
+        self.fork_selector.is_visible()
+    }
+
+    pub(crate) fn hide_fork_selector(&mut self) {
+        self.fork_selector.hide();
+    }
+
+    pub(crate) fn reshow_fork_selector(&mut self) {
+        self.fork_selector.reshow();
+    }
+
+    pub(crate) fn fork_selector_handle_key(
+        &mut self,
+        key: crossterm::event::KeyEvent,
+    ) -> ForkAction {
+        self.fork_selector.handle_key_event(key)
+    }
+
+    // ============ Timeline selector methods ============
+
+    pub(crate) fn show_timeline_selector(
+        &mut self,
+        points: Vec<crate::chat_state::SessionTimelinePoint>,
+    ) {
+        self.clear_committed_message_anchor();
+        self.timeline_selector.show(points);
+        self.popup_stack.push(PopupType::TimelineSelector);
+    }
+
+    pub(crate) fn timeline_selector_visible(&self) -> bool {
+        self.timeline_selector.is_visible()
+    }
+
+    pub(crate) fn hide_timeline_selector(&mut self) {
+        self.timeline_selector.hide();
+    }
+
+    pub(crate) fn reshow_timeline_selector(&mut self) {
+        self.timeline_selector.reshow();
+    }
+
+    pub(crate) fn timeline_selector_handle_key(
+        &mut self,
+        key: crossterm::event::KeyEvent,
+    ) -> TimelineAction {
+        self.timeline_selector.handle_key_event(key)
+    }
+
+    // ============ Prompt stash selector methods ============
+
+    pub(crate) fn show_prompt_stash_selector(
+        &mut self,
+        entries: Vec<crate::prompt_stash::PromptStashEntry>,
+    ) {
+        self.prompt_stash_selector.show(entries);
+        self.popup_stack.push(PopupType::PromptStashSelector);
+    }
+
+    pub(crate) fn prompt_stash_selector_visible(&self) -> bool {
+        self.prompt_stash_selector.is_visible()
+    }
+
+    pub(crate) fn hide_prompt_stash_selector(&mut self) {
+        self.prompt_stash_selector.hide();
+    }
+
+    pub(crate) fn reshow_prompt_stash_selector(&mut self) {
+        self.prompt_stash_selector.reshow();
+    }
+
+    pub(crate) fn prompt_stash_selector_handle_key(
+        &mut self,
+        key: crossterm::event::KeyEvent,
+    ) -> crate::ui::prompt_stash_selector::PromptStashAction {
+        self.prompt_stash_selector.handle_key_event(key)
     }
 
     // ============ Provider selector methods (add model step 1) ============
@@ -389,7 +640,10 @@ impl ChatView {
         self.provider_selector.handle_mouse_event(mouse)
     }
 
-    pub(crate) fn provider_selector_captures_mouse(&self, mouse: &crossterm::event::MouseEvent) -> bool {
+    pub(crate) fn provider_selector_captures_mouse(
+        &self,
+        mouse: &crossterm::event::MouseEvent,
+    ) -> bool {
         self.provider_selector.captures_mouse(mouse)
     }
 
@@ -438,5 +692,128 @@ impl ChatView {
         key: crossterm::event::KeyEvent,
     ) -> ModelFormAction {
         self.model_config_form.handle_key_event(key)
+    }
+
+    // ============ Account login form ============
+
+    pub(crate) fn show_login_form(&mut self) {
+        self.login_form.show();
+        self.popup_stack.push(PopupType::LoginForm);
+    }
+
+    pub(crate) fn login_form_visible(&self) -> bool {
+        self.login_form.is_visible()
+    }
+
+    pub(crate) fn hide_login_form(&mut self) {
+        self.login_form.hide();
+    }
+
+    pub(crate) fn reshow_login_form(&mut self) {
+        self.login_form.show();
+    }
+
+    pub(crate) fn login_form_handle_key(
+        &mut self,
+        key: crossterm::event::KeyEvent,
+    ) -> LoginFormAction {
+        self.login_form.handle_key_event(key)
+    }
+
+    pub(crate) fn login_form_set_error(&mut self, message: impl Into<String>) {
+        self.login_form.set_error(message);
+    }
+
+    pub(crate) fn login_form_insert_paste(&mut self, text: &str) {
+        self.login_form.insert_paste(text);
+    }
+
+    pub(crate) fn show_account_panel(
+        &mut self,
+        info: crate::account::AccountInfo,
+        devices: Vec<crate::account::AccountDevice>,
+        sync_progress: crate::account_sync::SyncProgress,
+    ) {
+        self.login_form.show_account(info, devices, sync_progress);
+        self.popup_stack.push(PopupType::LoginForm);
+    }
+
+    pub(crate) fn show_sync_choice_panel(&mut self, user_id: &str, relay_url: &str) {
+        self.login_form.show_sync_choice(user_id, relay_url);
+        self.popup_stack.push(PopupType::LoginForm);
+    }
+
+    pub(crate) fn update_account_panel_progress(
+        &mut self,
+        devices: Option<Vec<crate::account::AccountDevice>>,
+        sync_progress: crate::account_sync::SyncProgress,
+    ) {
+        self.login_form
+            .update_account_progress(devices, sync_progress);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ChatView;
+    use crate::chat_state::ChatState;
+    use crate::ui::agent_selector::AgentItem;
+    use crate::ui::theme::Theme;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    #[test]
+    fn opening_subagent_management_hides_the_parent_agent_selector() {
+        let mut view = ChatView::new(Theme::dark(), Vec::new());
+        view.show_agent_selector(
+            vec![AgentItem {
+                id: "agentic".to_string(),
+                description: "General purpose".to_string(),
+            }],
+            Some("agentic".to_string()),
+            true,
+            true,
+        );
+
+        view.show_subagent_menu();
+
+        assert!(!view.agent_selector_visible());
+        assert!(view.subagent_selector_visible());
+    }
+
+    #[test]
+    fn pending_mode_update_keeps_an_open_selector_disabled() {
+        let mut view = ChatView::new(Theme::dark(), Vec::new());
+        view.show_agent_modes_only(
+            vec![AgentItem {
+                id: "agentic".to_string(),
+                description: "General purpose".to_string(),
+            }],
+            Some("agentic".to_string()),
+            true,
+        );
+
+        view.set_agent_mode_switch_allowed(false);
+
+        let state = ChatState::new(
+            "session".to_string(),
+            "Session".to_string(),
+            "agentic".to_string(),
+            Some("D:/workspace/current".to_string()),
+        );
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).expect("test terminal");
+        terminal
+            .draw(|frame| view.render(frame, &state))
+            .expect("render disabled mode selector");
+        let buffer = terminal.backend().buffer();
+        let rendered = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("Please wait"), "{rendered:?}");
     }
 }

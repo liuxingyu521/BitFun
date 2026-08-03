@@ -27,12 +27,12 @@
   /* Room for descenders (g, y, p) */
   /* Collapsed capsule uses 18px horizontal padding on `.bitfun-chat-input__box`; match so strip text lines up with pill content */
   padding: 3px 18px 4px;
-  font-family: var(--font-family-sans);
-  font-size: var(--flowchat-font-size-xxs);
-  line-height: var(--flowchat-support-line-height);
+  font-family: var(--bf-appearance-token-font-family-sans);
+  font-size: var(--bf-appearance-token-flowchat-font-size-xxs);
+  line-height: var(--bf-appearance-token-flowchat-support-line-height);
   font-weight: 400;
   letter-spacing: 0.01em;
-  color: var(--color-text-primary);
+  color: var(--bf-appearance-token-color-text-primary);
   user-select: text;
   pointer-events: auto;
 
@@ -55,7 +55,7 @@
 
   &--split &__main {
     flex: 1 1 auto;
-    max-width: calc(100% - 24px);
+    max-width: 100%;
   }
 
   &__actions {
@@ -64,6 +64,279 @@
     align-items: center;
     justify-content: flex-end;
     gap: 4px;
+  }
+
+  &__permission {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    flex: none;
+  }
+
+  // One-click branch sync is a primary recovery/review path for remote work,
+  // so it gets accent treatment rather than the muted default of other controls.
+  &__dispatch-result {
+    box-sizing: border-box;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 3px;
+    height: 18px;
+    max-width: 140px;
+    padding: 0 5px;
+    border: 1px solid color-mix(in srgb, var(--bf-appearance-token-color-accent-500) 45%, transparent);
+    border-radius: $size-radius-sm;
+    background: color-mix(in srgb, var(--bf-appearance-token-color-accent-500) 14%, transparent);
+    color: var(--bf-appearance-token-color-accent-500);
+    font: inherit;
+    font-size: var(--bf-appearance-token-flowchat-font-size-xxs);
+    line-height: 1;
+    cursor: pointer;
+    transition:
+      background-color $motion-fast $easing-standard,
+      border-color $motion-fast $easing-standard;
+
+    &:hover {
+      border-color: var(--bf-appearance-token-color-accent-500);
+      background: color-mix(in srgb, var(--bf-appearance-token-color-accent-500) 22%, transparent);
+    }
+
+    &:focus-visible {
+      outline: 2px solid var(--bf-appearance-token-color-accent-500);
+      outline-offset: 1px;
+    }
+
+    > span {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+  }
+
+  &__permission-trigger {
+    box-sizing: border-box;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 3px;
+    height: 18px;
+    min-width: 18px;
+    max-width: 124px;
+    padding: 0 5px;
+    border: 1px solid transparent;
+    border-radius: $size-radius-sm;
+    background: transparent;
+    color: var(--bf-appearance-token-color-text-muted);
+    font: inherit;
+    font-size: var(--bf-appearance-token-flowchat-font-size-xxs);
+    line-height: 1;
+    letter-spacing: 0;
+    cursor: pointer;
+    transition:
+      background-color $motion-fast $easing-standard,
+      border-color $motion-fast $easing-standard,
+      color $motion-fast $easing-standard;
+
+    &:hover:not(:disabled),
+    &--open:not(:disabled) {
+      background: var(--bf-appearance-token-element-bg-medium);
+      color: var(--bf-appearance-token-color-text-secondary);
+    }
+
+    &:focus-visible {
+      outline: 2px solid var(--bf-appearance-token-color-accent-500);
+      outline-offset: 1px;
+    }
+
+    &:disabled {
+      cursor: default;
+      opacity: 0.62;
+    }
+
+    &--acp {
+      width: 18px;
+      padding: 0;
+    }
+
+    &--ask {
+      border-color: var(--bf-appearance-token-color-success-border);
+      background: var(--bf-appearance-token-color-success-bg);
+      color: var(--bf-appearance-token-color-success);
+
+      &:hover:not(:disabled),
+      &.bitfun-chat-input-workspace-strip__permission-trigger--open {
+        border-color: color-mix(in srgb, var(--bf-appearance-token-color-success) 62%, transparent);
+        background: color-mix(in srgb, var(--bf-appearance-token-color-success) 17%, transparent);
+        color: var(--bf-appearance-token-color-success);
+      }
+    }
+
+    &--auto {
+      border-color: color-mix(in srgb, var(--bf-appearance-token-color-warning) 42%, transparent);
+      background: color-mix(in srgb, var(--bf-appearance-token-color-warning) 11%, transparent);
+      color: var(--bf-appearance-token-color-warning);
+
+      &:hover:not(:disabled),
+      &.bitfun-chat-input-workspace-strip__permission-trigger--open {
+        border-color: color-mix(in srgb, var(--bf-appearance-token-color-warning) 62%, transparent);
+        background: color-mix(in srgb, var(--bf-appearance-token-color-warning) 17%, transparent);
+        color: var(--bf-appearance-token-color-warning);
+      }
+    }
+
+    &--full_access {
+      border-color: var(--bf-appearance-token-color-error-border);
+      background: var(--bf-appearance-token-color-error-bg);
+      color: var(--bf-appearance-token-color-error);
+
+      &:hover:not(:disabled),
+      &.bitfun-chat-input-workspace-strip__permission-trigger--open {
+        border-color: color-mix(in srgb, var(--bf-appearance-token-color-error) 56%, transparent);
+        background: color-mix(in srgb, var(--bf-appearance-token-color-error) 15%, transparent);
+        color: var(--bf-appearance-token-color-error);
+      }
+    }
+
+    svg {
+      flex: none;
+    }
+  }
+
+  &__permission-label {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  &__permission-menu {
+    position: absolute;
+    right: 0;
+    bottom: calc(100% + 7px);
+    z-index: 10;
+    box-sizing: border-box;
+    width: min(286px, calc(100vw - 24px));
+    padding: 6px;
+    border: 1px solid var(--bf-appearance-token-border-subtle);
+    border-radius: $size-radius-base;
+    background: var(--bf-appearance-token-color-bg-elevated);
+    box-shadow: var(--bf-appearance-token-shadow-lg);
+    color: var(--bf-appearance-token-color-text-primary);
+    user-select: none;
+  }
+
+  &__permission-menu-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    min-height: 24px;
+    padding: 0 7px 4px;
+    color: var(--bf-appearance-token-color-text-secondary);
+    font-size: var(--bf-appearance-token-flowchat-font-size-xxs);
+    font-weight: 600;
+    letter-spacing: 0;
+
+    span:last-child {
+      color: var(--bf-appearance-token-color-text-muted);
+      font-weight: 400;
+    }
+  }
+
+  &__permission-options {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  &__permission-menu-divider {
+    height: 1px;
+    margin: 6px 2px;
+    background: var(--bf-appearance-token-border-subtle);
+  }
+
+  &__permission-option {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 16px;
+    align-items: center;
+    gap: 10px;
+    width: 100%;
+    min-height: 48px;
+    padding: 7px 8px;
+    border: 0;
+    border-radius: $size-radius-sm;
+    background: transparent;
+    color: var(--bf-appearance-token-color-text-primary);
+    font: inherit;
+    letter-spacing: 0;
+    text-align: left;
+    cursor: pointer;
+
+    &:hover:not(:disabled),
+    &:focus-visible {
+      background: var(--bf-appearance-token-element-bg-medium);
+      outline: none;
+    }
+
+    &--selected {
+      background: color-mix(in srgb, var(--bf-appearance-token-color-accent-500) 9%, transparent);
+
+      > svg {
+        color: var(--bf-appearance-token-color-accent-500);
+      }
+    }
+
+    &:disabled {
+      cursor: wait;
+      opacity: 0.6;
+    }
+  }
+
+  &__permission-option-copy {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+  }
+
+  &__permission-option-label {
+    color: var(--bf-appearance-token-color-text-primary);
+    font-size: var(--bf-appearance-token-flowchat-font-size-xs);
+    font-weight: 500;
+    line-height: 1.25;
+  }
+
+  &__permission-option-description {
+    color: var(--bf-appearance-token-color-text-muted);
+    font-size: var(--bf-appearance-token-flowchat-font-size-xxs);
+    font-weight: 400;
+    line-height: 1.35;
+    white-space: normal;
+  }
+
+  &__permission-visibility-action {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    width: 100%;
+    min-height: 32px;
+    padding: 6px 8px;
+    border: 0;
+    border-radius: $size-radius-sm;
+    background: transparent;
+    color: var(--bf-appearance-token-color-text-secondary);
+    font: inherit;
+    font-size: var(--bf-appearance-token-flowchat-font-size-xs);
+    letter-spacing: 0;
+    text-align: left;
+    cursor: pointer;
+
+    &:hover,
+    &:focus-visible {
+      background: var(--bf-appearance-token-element-bg-medium);
+      color: var(--bf-appearance-token-color-text-primary);
+      outline: none;
+    }
   }
 
   &__goal-btn.icon-btn {
@@ -79,38 +352,38 @@
   }
 
   &__goal-btn--none.icon-btn {
-    color: var(--color-text-muted);
+    color: var(--bf-appearance-token-color-text-muted);
     opacity: 0.72;
 
     &:hover:not(:disabled) {
       transform: none;
       border-radius: 50%;
-      background: color-mix(in srgb, var(--color-text-muted) 12%, var(--element-bg-medium));
-      color: var(--color-text-secondary);
+      background: color-mix(in srgb, var(--bf-appearance-token-color-text-muted) 12%, var(--bf-appearance-token-element-bg-medium));
+      color: var(--bf-appearance-token-color-text-secondary);
       opacity: 1;
     }
   }
 
   &__goal-btn--active.icon-btn {
-    color: var(--color-warning);
+    color: var(--bf-appearance-token-color-warning);
 
     &:hover:not(:disabled) {
       transform: none;
       border-radius: 50%;
-      background: color-mix(in srgb, var(--color-warning) 12%, var(--element-bg-medium));
-      color: var(--color-warning);
+      background: color-mix(in srgb, var(--bf-appearance-token-color-warning) 12%, var(--bf-appearance-token-element-bg-medium));
+      color: var(--bf-appearance-token-color-warning);
       opacity: 1;
     }
   }
 
   &__goal-btn--complete.icon-btn {
-    color: var(--color-success);
+    color: var(--bf-appearance-token-color-success);
 
     &:hover:not(:disabled) {
       transform: none;
       border-radius: 50%;
-      background: color-mix(in srgb, var(--color-success) 12%, var(--element-bg-medium));
-      color: var(--color-success);
+      background: color-mix(in srgb, var(--bf-appearance-token-color-success) 12%, var(--bf-appearance-token-element-bg-medium));
+      color: var(--bf-appearance-token-color-success);
       opacity: 1;
     }
   }
@@ -122,13 +395,13 @@
     min-width: 16px;
     border-radius: 50%;
     opacity: 0.86;
-    color: color-mix(in srgb, var(--color-accent-500) 62%, var(--color-text-secondary));
+    color: color-mix(in srgb, var(--bf-appearance-token-color-accent-500) 62%, var(--bf-appearance-token-color-text-secondary));
 
     &:hover:not(:disabled) {
       transform: none;
       border-radius: 50%;
-      background: color-mix(in srgb, var(--color-accent-500) 10%, var(--element-bg-medium));
-      color: color-mix(in srgb, var(--color-accent-500) 86%, var(--color-text-primary));
+      background: color-mix(in srgb, var(--bf-appearance-token-color-accent-500) 10%, var(--bf-appearance-token-element-bg-medium));
+      color: color-mix(in srgb, var(--bf-appearance-token-color-accent-500) 86%, var(--bf-appearance-token-color-text-primary));
       opacity: 1;
     }
 
@@ -154,7 +427,7 @@
     cursor: default;
 
     &:hover {
-      background: var(--element-bg-medium);
+      background: var(--bf-appearance-token-element-bg-medium);
     }
 
     &--workspace {
@@ -169,6 +442,57 @@
       max-width: 35%;
       gap: 3px;
     }
+
+    /* Checkbox-style chip: reads as a control without competing with the branch. */
+    &--worktree {
+      align-items: center;
+      flex: none;
+      gap: 4px;
+      margin-left: 4px;
+      border: 1px solid var(--bf-appearance-token-border-subtle);
+      background: transparent;
+      color: var(--bf-appearance-token-color-text-muted);
+      font: inherit;
+      font-size: var(--bf-appearance-token-flowchat-font-size-xxs);
+      line-height: 1;
+      white-space: nowrap;
+      cursor: pointer;
+
+      &:hover:not(:disabled) {
+        background: var(--bf-appearance-token-element-bg-medium);
+        color: var(--bf-appearance-token-color-text-secondary);
+      }
+
+      &:focus-visible {
+        outline: 2px solid var(--bf-appearance-token-color-accent-500);
+        outline-offset: 1px;
+      }
+
+      &:disabled {
+        cursor: default;
+        opacity: 0.55;
+      }
+    }
+
+    &--worktree-on {
+      border-color: var(--bf-appearance-token-color-accent-500);
+      color: var(--bf-appearance-token-color-accent-500);
+
+      &:hover:not(:disabled) {
+        color: var(--bf-appearance-token-color-accent-500);
+      }
+    }
+  }
+
+  &__worktree-icon {
+    flex-shrink: 0;
+    width: 11px;
+    height: 11px;
+    color: inherit;
+
+    &.is-spinning {
+      animation: bitfun-chat-input-workspace-strip-spin 0.9s linear infinite;
+    }
   }
 
   &__workspace {
@@ -180,14 +504,14 @@
     text-overflow: ellipsis;
     padding-bottom: 1px;
     max-width: 100%;
-    color: var(--color-text-primary);
+    color: var(--bf-appearance-token-color-text-primary);
   }
 
   &__branch-icon {
     flex-shrink: 0;
     width: 11px;
     height: 11px;
-    color: var(--color-text-muted);
+    color: var(--bf-appearance-token-color-text-muted);
     opacity: 0.9;
   }
 
@@ -200,13 +524,33 @@
     overflow: hidden;
     text-overflow: ellipsis;
     padding-bottom: 1px;
-    color: var(--color-text-primary);
+    color: var(--bf-appearance-token-color-text-primary);
   }
 
   &__sep {
     flex: none;
     padding: 0 3px;
-    color: var(--color-text-muted);
+    color: var(--bf-appearance-token-color-text-muted);
     font-weight: 400;
+  }
+}
+
+@media (max-width: 560px) {
+  .bitfun-chat-input-workspace-strip {
+    &__permission-trigger--auto,
+    &__permission-trigger--full_access {
+      width: 18px;
+      padding: 0;
+    }
+
+    &__permission-label {
+      display: none;
+    }
+  }
+}
+
+@keyframes bitfun-chat-input-workspace-strip-spin {
+  to {
+    transform: rotate(360deg);
   }
 }

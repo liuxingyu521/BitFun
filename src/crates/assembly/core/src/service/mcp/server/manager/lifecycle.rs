@@ -1,6 +1,7 @@
 use super::*;
 use bitfun_services_integrations::mcp::server::{
-    mcp_server_is_running, mcp_should_start_after_config_update, resolve_mcp_local_command,
+    mcp_server_is_running, mcp_should_start_after_config_update, MCPProcessStartContext,
+    MCPProcessStartOutcome,
 };
 
 impl MCPServerManager {
@@ -17,23 +18,30 @@ impl MCPServerManager {
             })
     }
 
-    fn resolve_local_command(command: &str) -> BitFunResult<(String, &'static str)> {
-        let runtime_root = crate::infrastructure::get_path_manager_arc().managed_runtimes_dir();
-        let resolved = resolve_mcp_local_command(command, runtime_root)?;
-        Ok((resolved.command, resolved.source_label))
-    }
-
     /// Initializes all servers.
     pub async fn initialize_all(&self) -> BitFunResult<()> {
         info!("Initializing all MCP servers");
+        let _lifecycle_guard = self.ephemeral_lifecycle.lock().await;
 
         let existing_server_ids = self.runtime.get_all_server_ids().await;
         if !existing_server_ids.is_empty() {
+            let external_ids = self.ephemeral_workspace_scopes.read().await;
+            let refresh_ids = existing_server_ids
+                .iter()
+                .filter(|server_id| !external_ids.contains_key(*server_id))
+                .cloned()
+                .collect::<Vec<_>>();
+            drop(external_ids);
             info!(
-                "Refreshing MCP servers: shutting down existing servers before applying config: count={}",
-                existing_server_ids.len()
+                "Refreshing persisted MCP servers while preserving external workspace runtimes: count={}",
+                refresh_ids.len()
             );
-            self.shutdown().await?;
+            for server_id in refresh_ids {
+                let _ = self.stop_server(&server_id).await;
+                let _ = self.runtime.unregister(&server_id).await;
+                self.runtime.remove_catalog(&server_id).await;
+                self.clear_reconnect_state(&server_id).await;
+            }
         }
 
         let configs = self.config_service.load_all_configs().await?;
@@ -166,6 +174,14 @@ impl MCPServerManager {
 
     /// Starts a server.
     pub async fn start_server(&self, server_id: &str) -> BitFunResult<()> {
+        self.start_server_with_external_token(server_id, None).await
+    }
+
+    pub(super) async fn start_server_with_external_token(
+        &self,
+        server_id: &str,
+        expected_external_start_token: Option<Arc<()>>,
+    ) -> BitFunResult<()> {
         self.start_reconnect_monitor_if_needed();
         info!("Starting MCP server: id={}", server_id);
 
@@ -185,109 +201,108 @@ impl MCPServerManager {
         }
 
         self.runtime.ensure_registered(&config).await?;
-
-        let process = self.runtime.get_process(server_id).await.ok_or_else(|| {
-            error!("MCP server not registered: id={}", server_id);
-            BitFunError::NotFound(format!("MCP server not registered: {}", server_id))
-        })?;
-
-        let mut proc = process.write().await;
-
-        let status = proc.status().await;
-        if mcp_server_is_running(status) {
+        if mcp_server_is_running(self.runtime.process_status(server_id).await?) {
             warn!("MCP server already running: id={}", server_id);
             return Ok(());
         }
 
-        match config.server_type {
-            super::super::MCPServerType::Local => {
-                let command = config.command.as_ref().ok_or_else(|| {
-                    error!("Missing command for local MCP server: id={}", server_id);
-                    BitFunError::Configuration("Missing command for local MCP server".to_string())
-                })?;
-
-                let (resolved_command, source_label) = Self::resolve_local_command(command)?;
-
-                info!(
-                    "Starting local MCP server: command={} source={} id={}",
-                    resolved_command, source_label, server_id
+        let start_context = match config.server_type {
+            super::super::MCPServerType::Local => MCPProcessStartContext::Local {
+                managed_runtimes_dir: crate::infrastructure::get_path_manager_arc()
+                    .managed_runtimes_dir(),
+            },
+            super::super::MCPServerType::Remote => MCPProcessStartContext::Remote {
+                data_dir: crate::infrastructure::try_get_path_manager_arc()?.user_data_dir(),
+            },
+        };
+        let connection = match self
+            .runtime
+            .start_process(&config, start_context)
+            .await
+            .inspect_err(|error| {
+                error!(
+                    "Failed to start MCP server runtime: id={} error={}",
+                    server_id, error
                 );
-
-                proc.start(&resolved_command, &config.args, &config.env)
-                    .await
-                    .map_err(|e| {
-                        error!(
-                            "Failed to start local MCP server process: id={} command={} source={} error={}",
-                            server_id, resolved_command, source_label, e
-                    );
-                    e
-                })?;
+            })? {
+            MCPProcessStartOutcome::AlreadyRunning => {
+                warn!("MCP server already running: id={}", server_id);
+                return Ok(());
             }
-            super::super::MCPServerType::Remote => {
-                let transport = config.resolved_transport();
-                if transport != crate::service::mcp::server::MCPServerTransport::StreamableHttp {
-                    error!(
-                        "Remote MCP transport not supported yet: id={} transport={}",
-                        server_id,
-                        transport.as_str()
-                    );
-                    return Err(BitFunError::NotImplemented(format!(
-                        "Remote MCP transport '{}' is not yet supported",
-                        transport.as_str()
-                    )));
-                }
-
-                let url = config.url.as_ref().ok_or_else(|| {
-                    error!("Missing URL for remote MCP server: id={}", server_id);
-                    BitFunError::Configuration("Missing URL for remote MCP server".to_string())
-                })?;
-
-                info!(
-                    "Connecting to remote MCP server: transport={} url={} id={}",
-                    transport.as_str(),
-                    url,
+            MCPProcessStartOutcome::Started { connection } => connection,
+        };
+        let external_workspace_scope = self
+            .ephemeral_workspace_scopes
+            .read()
+            .await
+            .get(server_id)
+            .cloned();
+        let _external_publication_guard = if external_workspace_scope.is_some() {
+            Some(self.ephemeral_lifecycle.lock().await)
+        } else {
+            None
+        };
+        if !external_start_publication_allowed(
+            external_workspace_scope.is_some(),
+            self.ephemeral_retirements
+                .read()
+                .await
+                .contains_key(server_id),
+        ) {
+            return Err(BitFunError::Configuration(format!(
+                "External MCP server was retired during startup: {}",
+                server_id
+            )));
+        }
+        if let Some(expected_token) = expected_external_start_token.as_ref() {
+            let start_tokens = self.ephemeral_start_tokens.read().await;
+            if !external_start_token_is_current(start_tokens.get(server_id), expected_token) {
+                return Err(BitFunError::Configuration(format!(
+                    "External MCP server startup was superseded: {}",
                     server_id
-                );
-
-                let data_dir = crate::infrastructure::try_get_path_manager_arc()?.user_data_dir();
-                proc.start_remote(data_dir, &config).await.map_err(|e| {
-                    error!(
-                        "Failed to connect to remote MCP server: url={} id={} error={}",
-                        url, server_id, e
-                    );
-                    e
-                })?;
+                )));
             }
         }
 
-        if let Some(connection) = proc.connection() {
-            self.runtime
-                .add_connection(server_id.to_string(), connection.clone())
-                .await;
+        self.runtime
+            .add_connection(server_id.to_string(), connection.clone())
+            .await;
 
-            match Self::register_mcp_tools(server_id, &config.name, connection.clone()).await {
-                Ok(count) => {
-                    info!(
-                        "Registered {} MCP tools: server_name={} server_id={}",
-                        count, config.name, server_id
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to register MCP tools: server_name={} server_id={} error={}",
-                        config.name, server_id, e
-                    );
+        match self
+            .register_mcp_tools(server_id, &config.name, connection.clone())
+            .await
+        {
+            Ok(count) => {
+                info!(
+                    "Registered {} MCP tools: server_name={} server_id={}",
+                    count, config.name, server_id
+                );
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to register MCP tools: server_name={} server_id={} error={}",
+                    config.name, server_id, e
+                );
+                if external_workspace_scope.is_some() {
+                    self.runtime.remove_connection(server_id).await;
+                    return Err(e);
                 }
             }
+        }
 
-            self.start_connection_event_listener(server_id, &config.name, connection.clone())
-                .await;
+        self.start_connection_event_listener(server_id, &config.name, connection.clone())
+            .await;
+        // Runtime-only external MCP currently publishes workspace-routed Tools
+        // only. Resources and Prompts have no external ownership/routing path,
+        // so their best-effort warmup must not delay external tool readiness.
+        if external_workspace_scope.is_none() {
             self.warm_catalog_caches(server_id, connection).await;
-        } else {
-            warn!(
-                "Connection not available, server may not have started correctly: id={}",
-                server_id
-            );
+        }
+        if external_workspace_scope.is_some() {
+            self.ephemeral_ready_servers
+                .write()
+                .await
+                .insert(server_id.to_string());
         }
 
         info!("MCP server started successfully: id={}", server_id);
@@ -301,16 +316,7 @@ impl MCPServerManager {
 
         self.stop_connection_event_listener(server_id).await;
 
-        let process =
-            self.runtime.get_process(server_id).await.ok_or_else(|| {
-                BitFunError::NotFound(format!("MCP server not found: {}", server_id))
-            })?;
-
-        let mut proc = process.write().await;
-        let stop_result = proc.stop().await;
-
-        self.runtime.remove_connection(server_id).await;
-        self.runtime.remove_catalog(server_id).await;
+        let stop_result = self.runtime.stop_process(server_id).await;
 
         Self::unregister_mcp_tools(server_id).await;
 
@@ -320,32 +326,10 @@ impl MCPServerManager {
     /// Restarts a server.
     pub async fn restart_server(&self, server_id: &str) -> BitFunResult<()> {
         info!("Restarting MCP server: id={}", server_id);
-
-        let config = self.runtime_server_config(server_id).await?;
-
-        match config.server_type {
-            super::super::MCPServerType::Local => {
-                self.ensure_registered(server_id).await?;
-
-                let process = self.runtime.get_process(server_id).await.ok_or_else(|| {
-                    BitFunError::NotFound(format!("MCP server not found: {}", server_id))
-                })?;
-                let mut proc = process.write().await;
-
-                let command = config
-                    .command
-                    .as_ref()
-                    .ok_or_else(|| BitFunError::Configuration("Missing command".to_string()))?;
-                proc.restart(command, &config.args, &config.env).await?;
-            }
-            super::super::MCPServerType::Remote => {
-                self.ensure_registered(server_id).await?;
-                let _ = self.stop_server(server_id).await;
-                self.start_server(server_id).await?;
-            }
-        }
-
-        Ok(())
+        self.runtime_server_config(server_id).await?;
+        self.ensure_registered(server_id).await?;
+        self.stop_server(server_id).await?;
+        self.start_server(server_id).await
     }
 
     /// Returns server status.
@@ -354,13 +338,10 @@ impl MCPServerManager {
             let _ = self.ensure_registered(server_id).await;
         }
 
-        let process =
-            self.runtime.get_process(server_id).await.ok_or_else(|| {
-                BitFunError::NotFound(format!("MCP server not found: {}", server_id))
-            })?;
-
-        let proc = process.read().await;
-        Ok(proc.status().await)
+        self.runtime
+            .process_status(server_id)
+            .await
+            .map_err(Into::into)
     }
 
     /// Returns the current status detail/message for one server.
@@ -369,13 +350,10 @@ impl MCPServerManager {
             let _ = self.ensure_registered(server_id).await;
         }
 
-        let process =
-            self.runtime.get_process(server_id).await.ok_or_else(|| {
-                BitFunError::NotFound(format!("MCP server not found: {}", server_id))
-            })?;
-
-        let proc = process.read().await;
-        Ok(proc.status_message().await)
+        self.runtime
+            .process_status_message(server_id)
+            .await
+            .map_err(Into::into)
     }
 
     /// Returns statuses of all servers.
@@ -418,54 +396,6 @@ impl MCPServerManager {
         if config.enabled && config.auto_start {
             self.start_server(&config.id).await?;
         }
-
-        Ok(())
-    }
-
-    /// Adds a runtime-only MCP server without saving it to user or project config.
-    pub async fn add_ephemeral_server(&self, config: MCPServerConfig) -> BitFunResult<()> {
-        config.validate()?;
-
-        let server_id = config.id.clone();
-        if self.runtime.contains(&server_id).await {
-            let _ = self.remove_ephemeral_server(&server_id).await;
-        }
-
-        self.runtime.insert_runtime_config(config.clone()).await?;
-        self.runtime.register(&config).await?;
-
-        if config.enabled && config.auto_start {
-            if let Err(error) = self.start_server(&server_id).await {
-                let _ = self.remove_ephemeral_server(&server_id).await;
-                return Err(error);
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Removes a runtime-only MCP server and its registered tools without touching persisted config.
-    pub async fn remove_ephemeral_server(&self, server_id: &str) -> BitFunResult<()> {
-        info!("Removing ephemeral MCP server: id={}", server_id);
-
-        let _ = self.stop_server(server_id).await;
-        self.stop_connection_event_listener(server_id).await;
-
-        match self.runtime.unregister(server_id).await {
-            Ok(_) => {
-                info!("Unregistered ephemeral MCP server: id={}", server_id);
-            }
-            Err(e) => {
-                warn!(
-                    "Ephemeral MCP server was not registered, skipping unregister: id={} error={}",
-                    server_id, e
-                );
-            }
-        }
-
-        self.runtime.remove_runtime_config(server_id).await;
-        self.clear_reconnect_state(server_id).await;
-        self.runtime.remove_catalog(server_id).await;
 
         Ok(())
     }
@@ -557,6 +487,12 @@ impl MCPServerManager {
     /// Shuts down all servers.
     pub async fn shutdown(&self) -> BitFunResult<()> {
         info!("Shutting down all MCP servers");
+
+        for (_, cancelled) in self.ephemeral_retirements.write().await.drain() {
+            cancelled.store(true, Ordering::Release);
+        }
+        self.ephemeral_ready_servers.write().await.clear();
+        self.ephemeral_start_tokens.write().await.clear();
 
         let server_ids = self.runtime.get_all_server_ids().await;
         for server_id in server_ids {
