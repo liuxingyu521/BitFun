@@ -19,7 +19,7 @@ import { buildMarkdownPrismStyle } from './markdownPrismTheme';
 import { Tooltip } from '../Tooltip';
 import { globalAPI, systemAPI, workspaceAPI } from '../../../infrastructure/api';
 import { getPrismLanguageFromAlias } from '@/infrastructure/language-detection';
-import { useAppearance } from '@/infrastructure/appearance';
+import { getAppearanceOverlayHost, useAppearance } from '@/infrastructure/appearance';
 import { contextMenuController } from '@/shared/context-menu-system/core/ContextMenuController';
 import { ContextType, type CustomContext, type MenuItem } from '@/shared/context-menu-system/types';
 import { createTab } from '@/shared/utils/tabUtils';
@@ -704,7 +704,7 @@ const MarkdownImage = React.memo<MarkdownImageProps>(({
             onClick={(event) => event.stopPropagation()}
           />
         </div>,
-        document.body,
+        getAppearanceOverlayHost(),
       )}
     </>
   );

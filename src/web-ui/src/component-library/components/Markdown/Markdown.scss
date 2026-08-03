@@ -460,7 +460,7 @@
   object-fit: contain;
   margin: 0.35rem 0.25rem;
   vertical-align: middle;
-  border-radius: var(--flowchat-card-radius);
+  border-radius: var(--bf-appearance-token-flowchat-card-radius);
 }
 
 /* README-style centered badge rows: each badge is often its own <p> inside a div */
@@ -485,7 +485,7 @@
 
 .markdown-renderer .markdown-image--loading {
   opacity: 0.75;
-  background: color-mix(in srgb, var(--color-text-muted) 10%, transparent);
+  background: color-mix(in srgb, var(--bf-appearance-token-color-text-muted) 10%, transparent);
 }
 
 .markdown-renderer .markdown-image--error {
@@ -500,7 +500,7 @@
   position: fixed;
   inset: 0;
   z-index: 10000;
-  background: var(--color-overlay-black-80);
+  background: var(--bf-appearance-token-color-overlay-black-80);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -510,7 +510,7 @@
     max-width: 90vw;
     max-height: 85vh;
     border-radius: 8px;
-    box-shadow: 0 8px 32px var(--color-overlay-black-50);
+    box-shadow: 0 8px 32px var(--bf-appearance-token-color-overlay-black-50);
     object-fit: contain;
   }
 }
@@ -519,7 +519,7 @@
   position: absolute;
   top: 16px;
   right: 16px;
-  background: var(--color-overlay-white-15);
+  background: var(--bf-appearance-token-color-overlay-white-15);
   border: none;
   border-radius: 50%;
   width: 36px;
@@ -527,11 +527,11 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  color: var(--color-static-white);
+  color: var(--bf-appearance-token-color-static-white);
   cursor: pointer;
 
   &:hover {
-    background: rgba(var(--color-static-white-rgb), 0.3);
+    background: rgba(var(--bf-appearance-token-color-static-white-rgb), 0.3);
   }
 }
 
